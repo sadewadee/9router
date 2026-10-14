@@ -5,6 +5,7 @@ import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/sha
 import { getDefaultModel } from "open-sse/config/providerModels.js";
 import { resolveOllamaLocalHost, PROVIDERS } from "open-sse/config/providers.js";
 import { CODEX_CLI_VERSION } from "open-sse/config/appConstants.js";
+import { probeFreebuffToken } from "open-sse/executors/freebuff.js";
 import {
   refreshProviderCredentials,
   shouldRefreshCredentials,
@@ -126,6 +127,8 @@ const OAUTH_TEST_CONFIG = {
       402: "Connected, but Grok Build credits are exhausted (spending limit). Add credits or upgrade SuperGrok.",
     },
   },
+  // Freebuff: probed through probeFreebuffToken (direct egress, no free session consumed).
+  freebuff: { refreshable: false },
 };
 
 /**
@@ -390,6 +393,11 @@ async function testOAuthConnection(connection, effectiveProxy = null) {
     newTokens = tokens;
     accessToken = tokens.accessToken;
     return await tryProbe(accessToken);
+  }
+
+  if (connection.provider === "freebuff") {
+    const probe = await probeFreebuffToken(accessToken, effectiveProxy);
+    return { valid: probe.valid, error: probe.error, warning: probe.warning || null, refreshed: false, newTokens: null };
   }
 
   try {
@@ -807,6 +815,11 @@ case "llm7": {
           headers: { Authorization: `Bearer ${connection.apiKey}` },
         }, effectiveProxy);
         return { valid: res.ok, error: res.ok ? null : "Invalid API key or base URL" };
+      }
+      case "freebuff": {
+        // Dual-auth: a pasted Codebuff authToken is checked like the OAuth access token.
+        const probe = await probeFreebuffToken(connection.apiKey, effectiveProxy);
+        return { valid: probe.valid, error: probe.error, warning: probe.warning || null, refreshed: false };
       }
       case "kimchi": {
         // Dual-auth: same validation endpoint as the OAuth flow — the token (API key
