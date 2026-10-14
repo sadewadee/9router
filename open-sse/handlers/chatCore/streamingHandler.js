@@ -3,7 +3,7 @@ import { needsTranslation } from "../../translator/index.js";
 import { createSSETransformStreamWithLogger, createPassthroughStreamWithLogger } from "../../utils/stream.js";
 import { pipeWithDisconnect } from "../../utils/streamHandler.js";
 import { PROVIDERS } from "../../config/providers.js";
-import { HTTP_STATUS, STREAM_STALL_TIMEOUT_MS } from "../../config/runtimeConfig.js";
+import { HTTP_STATUS, STREAM_STALL_TIMEOUT_MS, SSE_HEARTBEAT_INTERVAL_MS } from "../../config/runtimeConfig.js";
 import { buildAbortedResponsesTerminalBytes } from "../../utils/responsesStreamHelpers.js";
 import { buildStreamErrorBytes } from "../../utils/streamHelpers.js";
 import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLine } from "./requestDetail.js";
@@ -44,6 +44,42 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
 /**
  * Handle streaming response — pipe provider SSE through transform stream to client.
  */
+/**
+ * SSE keepalive passthrough: emits `: keepalive` comment frames to the client
+ * while the upstream has not produced its first byte yet. Comment frames are
+ * ignored by every SSE parser, but they reset client-side idle timeouts so
+ * slow prefill (huge agentic contexts can take 50-90s to first token) no
+ * longer surfaces as 499 Client Closed Request. Fully transparent after the
+ * first real chunk passes through.
+ */
+function createSSEHeartbeatStream(intervalMs = SSE_HEARTBEAT_INTERVAL_MS) {
+  const encoder = new TextEncoder();
+  let timer = null;
+  let gotFirstByte = false;
+  return new TransformStream({
+    start(controller) {
+      if (!intervalMs || intervalMs <= 0) return;
+      timer = setInterval(() => {
+        if (gotFirstByte) return;
+        try {
+          controller.enqueue(encoder.encode(": keepalive\n\n"));
+        } catch {
+          if (timer) clearInterval(timer);
+        }
+      }, intervalMs);
+      if (timer.unref) timer.unref();
+    },
+    transform(chunk, controller) {
+      gotFirstByte = true;
+      if (timer) clearInterval(timer);
+      controller.enqueue(chunk);
+    },
+    flush() {
+      if (timer) clearInterval(timer);
+    }
+  });
+}
+
 export async function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, pxpipe, reqTag, log, credentials }) {
   if (onRequestSuccess) {
     Promise.resolve()
@@ -91,7 +127,8 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
     ? buildAbortedResponsesTerminalBytes
     : (message) => buildStreamErrorBytes(HTTP_STATUS.GATEWAY_TIMEOUT, message, sourceFormat);
   const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
-  const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs);
+  const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs)
+    .pipeThrough(createSSEHeartbeatStream());
 
   saveRequestDetail(buildRequestDetail({
     provider, model, connectionId,
