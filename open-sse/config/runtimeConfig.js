@@ -55,6 +55,13 @@ export const STREAM_STALL_TIMEOUT_MS = envMs("STREAM_STALL_TIMEOUT_MS", 360 * 10
 // Time-to-first-token timeout (prompt prefill). Env: STREAM_FIRST_CHUNK_TIMEOUT_MS.
 export const STREAM_FIRST_CHUNK_TIMEOUT_MS = envMs("STREAM_FIRST_CHUNK_TIMEOUT_MS", 200 * 1000);
 
+// SSE heartbeat: emit `: keepalive` comment frames to the client while the
+// upstream has not produced its first byte yet. Comment frames are ignored by
+// every SSE parser but reset client-side idle timeouts, so slow prompt prefill
+// on huge agentic contexts (50-90s to first token) no longer surfaces as 499
+// Client Closed Request. Set 0 to disable.
+export const SSE_HEARTBEAT_INTERVAL_MS = envMs("SSE_HEARTBEAT_INTERVAL_MS", 10 * 1000);
+
 // Fetch connect timeout: abort if upstream doesn't return response headers within this duration
 export const FETCH_CONNECT_TIMEOUT_MS = envMs("FETCH_CONNECT_TIMEOUT_MS", 60 * 1000);
 

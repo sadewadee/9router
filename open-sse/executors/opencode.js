@@ -6,7 +6,7 @@ import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
-import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
+import { ANTHROPIC_API_VERSION, OPENCODE_UA } from "../providers/shared.js";
 import {
   normalizeResponsesInput,
   clampResponsesCallId,
@@ -14,7 +14,6 @@ import {
   coerceResponsesOutput,
 } from "../translator/formats/responsesApi.js";
 
-const OPENCODE_UA = "opencode/1.18.31";
 const MAX_SESSION_LENGTH = 256;
 const MAX_TOOL_NAME_LEN = 128;
 const SESSION_HEADER = "x-opencode-session";
@@ -24,76 +23,136 @@ export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 export const OPENCODE_REQUEST_RE = /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-// OpenCode free tier requires both 'bash' and 'read' in tools payload.
-// Injected as cloaked decoy tools so external CLI tools (e.g. Claude Code's Bash/Read)
-// take precedence while satisfying upstream verification.
-const OPENCODE_DECOY_CHAT_TOOLS = [
-  {
-    type: "function",
-    function: {
-      name: "bash",
-      description: "This tool is currently unavailable and must not be used.",
-      parameters: { type: "object", properties: {} },
+// OpenCode free tier requires the lowercase tool quartet 'bash', 'glob',
+// 'grep' and 'read' in the tools payload (verified by live bisection 2026-09-18:
+// tools without the full quartet get 403 FreeTierError even when bash/read exist).
+// Live bisection 2026-10-14 on /inference/v1 tightened it: each of the four must
+// ALSO carry OpenCode's own description sentence (`sig`) and its required
+// parameter. Placeholder descriptions or empty schemas 403 as well, and so does a
+// second tool with the same lowercase name. A tool that differs only by case
+// (Claude Code's Bash/Read/Glob/Grep) coexists fine.
+// Injected as cloaked decoys so external CLI tools take precedence while
+// satisfying upstream verification.
+const OPENCODE_GATE_TOOLS = {
+  bash: {
+    sig: "IMPORTANT: This tool is for terminal operations",
+    description: "Executes a given bash command in a persistent shell session with optional timeout, ensuring proper handling and security measures.\n\nIMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO NOT use it for file operations (reading, writing, editing, searching, finding files) - use the specialized tools for this instead.",
+    properties: {
+      command: { type: "string", description: "The command to execute" },
+      timeout: { type: "integer", description: "Optional timeout in milliseconds" },
+      workdir: { type: "string", description: "The working directory to run the command in. Defaults to the current directory. Use this instead of 'cd' commands." },
     },
+    required: ["command"],
   },
-  {
-    type: "function",
-    function: {
-      name: "read",
-      description: "This tool is currently unavailable and must not be used.",
-      parameters: { type: "object", properties: {} },
+  glob: {
+    sig: "Fast file pattern matching tool",
+    description: "- Fast file pattern matching tool that works with any codebase size\n- Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\"\n- Returns matching file paths",
+    properties: {
+      pattern: { type: "string", description: "The glob pattern to match files against" },
+      path: { type: "string", description: "The directory to search in. If not specified, the current working directory will be used." },
     },
+    required: ["pattern"],
   },
-];
+  grep: {
+    sig: "Fast content search tool",
+    description: "- Fast content search tool that works with any codebase size\n- Searches file contents using regular expressions\n- Returns file paths and line numbers with matching lines",
+    properties: {
+      pattern: { type: "string", description: "The regex pattern to search for in file contents" },
+      path: { type: "string", description: "The directory to search in. Defaults to the current working directory." },
+      include: { type: "string", description: "File pattern to include in the search (e.g. \"*.js\", \"*.{ts,tsx}\")" },
+    },
+    required: ["pattern"],
+  },
+  read: {
+    sig: "Read a file or directory from the local filesystem",
+    description: "Read a file or directory from the local filesystem. If the path does not exist, an error is returned.",
+    properties: {
+      filePath: { type: "string", description: "The absolute path to the file or directory to read" },
+      offset: { type: "integer", description: "The line number to start reading from (1-indexed)" },
+      limit: { type: "integer", description: "The maximum number of lines to read (defaults to 2000)" },
+    },
+    required: ["filePath"],
+  },
+};
+const OPENCODE_GATE_NAMES = Object.keys(OPENCODE_GATE_TOOLS);
+const OPENCODE_DECOY_NOTE = " This tool is currently unavailable and must not be used.";
 
-const OPENCODE_DECOY_RESPONSES_TOOLS = [
-  {
-    type: "function",
-    name: "bash",
-    description: "This tool is currently unavailable and must not be used.",
-    parameters: { type: "object", properties: {} },
-  },
-  {
-    type: "function",
-    name: "read",
-    description: "This tool is currently unavailable and must not be used.",
-    parameters: { type: "object", properties: {} },
-  },
-];
-
-function cloakOpencodeTools(body, isResponses) {
-  if (!body || typeof body !== "object") return;
-  if (isResponses) {
-    if (!Array.isArray(body.tools)) body.tools = [];
-    const names = new Set(body.tools.map((t) => t.name || t.function?.name));
-    for (const tool of OPENCODE_DECOY_RESPONSES_TOOLS) {
-      if (!names.has(tool.name)) body.tools.push({ ...tool });
-    }
-    if (!body.tool_choice) body.tool_choice = "auto";
-  } else {
-    const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
-    if (!hasTools) {
-      body.tools = OPENCODE_DECOY_CHAT_TOOLS.map((t) => ({ ...t, function: { ...t.function } }));
-      if (!body.tool_choice) body.tool_choice = "none";
-    } else {
-      const names = new Set(body.tools.map((t) => t.function?.name || t.name));
-      for (const tool of OPENCODE_DECOY_CHAT_TOOLS) {
-        if (!names.has(tool.function.name)) {
-          body.tools.push({ ...tool, function: { ...tool.function } });
-        }
-      }
-    }
-  }
+function opencodeDecoy(name, isResponses) {
+  const { description, properties, required } = OPENCODE_GATE_TOOLS[name];
+  const def = {
+    name,
+    description: description + OPENCODE_DECOY_NOTE,
+    parameters: { type: "object", properties: structuredClone(properties), required: [...required] },
+  };
+  return isResponses ? { type: "function", ...def } : { type: "function", function: def };
 }
 
-function hasValidOpencodeVersion(ua) {
-  const m = String(ua || "").match(/opencode\/(\d+)\.(\d+)(?:\.(\d+))?/i);
-  if (!m) return false;
+// Does a caller tool that owns a quartet name already pass the upstream gate
+// (i.e. it is OpenCode's own definition)? Case-sensitive on purpose: a false
+// negative only costs an alias, a false positive costs a 403.
+function meetsOpencodeGate(name, def) {
+  const { sig, required } = OPENCODE_GATE_TOOLS[name];
+  const params = def.parameters;
+  return typeof def.description === "string" && def.description.includes(sig)
+    && Array.isArray(params?.required)
+    && required.every((k) => params.required.includes(k) && params.properties?.[k]);
+}
+
+function cloakOpencodeTools(body, isResponses, credentials) {
+  if (!body || typeof body !== "object") return;
+  const toolNameMap = credentials?._opencodeToolNameMap || new Map();
+  if (credentials) credentials._opencodeToolNameMap = toolNameMap;
+  if (!Array.isArray(body.tools)) body.tools = [];
+
+  const satisfied = new Set();
+  for (const tool of body.tools) {
+    if (!tool || typeof tool !== "object") continue;
+    const def = tool.function && typeof tool.function === "object" ? tool.function : tool;
+    const name = typeof def.name === "string" ? def.name : "";
+    const lower = name.trim().toLowerCase();
+    if (!OPENCODE_GATE_TOOLS[lower]) continue;
+    if (name !== lower) {
+      // Differently-cased caller tool (Claude Code's Bash): it coexists with the
+      // lowercase decoy. Should the model call the decoy anyway, hand the call
+      // back to the caller's real tool.
+      toolNameMap.set(lower, name);
+      continue;
+    }
+    if (meetsOpencodeGate(name, def)) {
+      satisfied.add(name);
+      continue;
+    }
+    // A caller tool that owns the exact lowercase name without being OpenCode's
+    // would duplicate it (403): move it aside under an alias, map the model's
+    // calls back to the original name, and let the decoy take the quartet slot.
+    const alias = `${name}_ext`;
+    def.name = alias;
+    toolNameMap.set(alias, name);
+    const choice = body.tool_choice;
+    const chosen = isResponses ? choice : choice?.function;
+    if (chosen && typeof chosen === "object" && chosen.name === name) chosen.name = alias;
+  }
+
+  for (const name of OPENCODE_GATE_NAMES) {
+    if (!satisfied.has(name)) body.tools.push(opencodeDecoy(name, isResponses));
+  }
+  // tool_choice "none" 403s too (live 2026-10-14): the gate wants tools enabled,
+  // so the decoys stay callable in principle and rely on their "unavailable" note.
+  if (!body.tool_choice || body.tool_choice === "none") body.tool_choice = "auto";
+}
+
+// /inference 403s a bare "opencode/<ver>" UA and 426s anything older than 1.18
+// (live 2026-10-14), so a downstream UA is forwarded only when it is a genuine
+// full official one ("opencode/<ver> ai-sdk/... runtime/...", >= 1.18).
+function isOfficialOpencodeUa(ua) {
+  const text = String(ua || "");
+  const m = text.match(/opencode\/(\d+)\.(\d+)(?:\.(\d+))?/i);
+  if (!m || !text.includes(" ai-sdk/")) return false;
   const major = parseInt(m[1], 10);
   const minor = parseInt(m[2], 10);
-  return major > 1 || (major === 1 && minor >= 17);
+  return major > 1 || (major === 1 && minor >= 18);
 }
-// Models served by /zen/v1/responses; every other model stays on /chat/completions.
+// Models served by /responses; every other model stays on /chat/completions.
 const RESPONSES_MODELS = new Set([
   "muse-spark-1.2-contributor-free",
   "muse-spark-1.3-contributor-free",
@@ -140,20 +199,52 @@ export function generateRequestId(timestamp = Date.now()) {
   return `msg_${time}${unstableRandom()}`;
 }
 
-export function translateSessionId(sessionId, clientTool = "") {
+// Upstream validates that the 12-hex prefix of ses_/msg_ ids is a real
+// timestamp-encoded value (48 bits = ms << 12 | counter), not random hash
+// bytes (decolua/9router#4780; 403 FreeTierError otherwise).
+function encodeTimeHex(value) {
+  return Array.from({ length: 6 }, (_, index) =>
+    Number((value >> BigInt(40 - 8 * index)) & 0xffn)
+      .toString(16)
+      .padStart(2, "0")
+  ).join("");
+}
+
+export function translateSessionId(sessionId, clientTool = "", timestamp = Date.now()) {
   if (typeof sessionId === "string" && OPENCODE_SESSION_RE.test(sessionId.trim())) {
     return sessionId.trim();
   }
+  // A downstream session keeps ONE stable ses_ id (like a real OpenCode
+  // session), so cache the translation per (clientTool, sessionId).
+  const cacheKey = `opencode:tr:${clientTool || "generic"}:${sessionId || ""}`;
+  const existing = stableOpencodeSessions.get(cacheKey);
+  if (existing) {
+    existing.lastUsed = Date.now();
+    stableOpencodeSessions.delete(cacheKey);
+    stableOpencodeSessions.set(cacheKey, existing);
+    return existing.sessionId;
+  }
+  if (timestamp !== lastTimestamp) {
+    lastTimestamp = timestamp;
+    counter = 0;
+  }
+  counter++;
+  // Session ids are descending (inverted), same as generateSessionId().
+  const timeHex = encodeTimeHex(~(BigInt(timestamp) * 0x1000n + BigInt(counter)));
   const digest = crypto
     .createHash("sha256")
     .update(`opencode\0${clientTool || "generic"}\0${sessionId || ""}`)
     .digest();
-  const timeHex = digest.subarray(0, 6).toString("hex");
   let randomPart = "";
   for (let i = 6; i < 20; i++) {
     randomPart += BASE62_CHARS[digest[i] % 62];
   }
-  return `ses_${timeHex}${randomPart}`;
+  const id = `ses_${timeHex}${randomPart}`;
+  if (stableOpencodeSessions.size >= MAX_STABLE_SESSIONS) {
+    stableOpencodeSessions.delete(stableOpencodeSessions.keys().next().value);
+  }
+  stableOpencodeSessions.set(cacheKey, { sessionId: id, lastUsed: Date.now() });
+  return id;
 }
 
 function normalizeSession(value) {
@@ -253,20 +344,44 @@ function lastUserText(body) {
 // The real CLI sends the current user message id (stable per turn, same on
 // retries) as x-opencode-request. Derive it deterministically from the
 // session plus the last user message so retries share the id.
-export function deriveRequestId(sessionId, body) {
+// Upstream (zen) caches by request id: a deterministic id that repeats after a
+// failed attempt gets the CACHED failure re-served forever (observed live
+// 2026-09-18 — one conversation 500'd for ~40 min on identical retries while
+// any fresh id succeeded). Keep the deterministic id for the FIRST occurrence
+// (preserves quota-friendly idempotency for silent client retries) but mint a
+// fresh id for every repeat so a cached failure can never stick.
+const seenOpencodeRequestIds = new Map(); // id -> firstSeen
+const REQUEST_ID_MEMORY_TTL_MS = 10 * 60 * 1000;
+
+function rememberOpencodeRequestId(id) {
+  const now = Date.now();
+  if (seenOpencodeRequestIds.size > 5000) {
+    for (const [k, v] of seenOpencodeRequestIds) {
+      if (now - v > REQUEST_ID_MEMORY_TTL_MS) seenOpencodeRequestIds.delete(k);
+    }
+  }
+  const seen = seenOpencodeRequestIds.get(id);
+  seenOpencodeRequestIds.set(id, now);
+  return !!seen;
+}
+
+export function deriveRequestId(sessionId, body, timestamp = Date.now()) {
   const text = lastUserText(body);
-  if (!text) return generateRequestId();
+  if (!text) return generateRequestId(timestamp);
   const digest = crypto
     .createHash("sha256")
     .update(`opencode-req\0${sessionId || ""}\0${text}`)
     .digest();
-  const timeHex = digest.subarray(0, 6).toString("hex");
+  // Request ids are ascending, same as generateRequestId().
+  const timeHex = encodeTimeHex(BigInt(timestamp) * 0x1000n + 1n);
   let randomPart = "";
   for (let i = 6; i < 20; i++) {
     randomPart += BASE62_CHARS[digest[i] % 62];
   }
   const id = `msg_${timeHex}${randomPart}`;
-  return OPENCODE_REQUEST_RE.test(id) ? id : generateRequestId();
+  if (!OPENCODE_REQUEST_RE.test(id)) return generateRequestId(timestamp);
+  if (rememberOpencodeRequestId(id)) return generateRequestId(timestamp);
+  return id;
 }
 
 function normalizeRequestId(value) {
@@ -326,6 +441,13 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
   const headers = credentials?.rawHeaders || {};
   const native = nativeSession(headers);
   if (native) return native;
+
+  // rotated override (set after upstream 500s) wins over any derived session
+  const overrideIdentity = identityKey(credentials)
+    ? identityKey(credentials) + ":" + baseModelId(String(body?.model || ""))
+    : null;
+  const overridden = overrideIdentity ? opencodeSessionOverrides.get(overrideIdentity) : null;
+  if (overridden?.session) return overridden.session;
 
   let incoming = null;
   for (const [key, value] of Object.entries(headers)) {
@@ -454,9 +576,24 @@ function normalizeOpencodeReasoning(model, body) {
   delete body.reasoning_effort;
 }
 
+// Session overrides: when upstream answers 500 [server_error] for a request
+// whose session is deterministically derived from the conversation id (real
+// clients), that exact upstream session can be poisoned server-side and every
+// retry keeps hitting it (observed live 2026-09-18: one conversation 500'd for
+// ~40 min while fresh sessions succeeded in the same seconds). Store a freshly
+// minted session per identity on 500; drop it once a request succeeds.
+const opencodeSessionOverrides = new Map(); // identityKey -> { session, setAt }
+const MAX_SESSION_OVERRIDES = 500;
+
 export class OpenCodeExecutor extends BaseExecutor {
   constructor() {
     super("opencode", PROVIDERS.opencode);
+    // Zen's muse free tier flaps with 500 [server_error] in short windows
+    // (observed live 2026-09-18: bursts of consecutive 500s that clear within
+    // minutes). DEFAULT_RETRY_CONFIG covers 502/503/504 but not 500, so every
+    // flap surfaced straight to the client. Retry 500 a couple of times so the
+    // window self-heals; genuinely-broken requests just pay ~5s extra latency.
+    this.config.retry = { ...(this.config.retry || {}), 500: { attempts: 2, delayMs: 2500 } };
   }
 
   prepareRequestCredentials({ body, credentials, providerSessionId, clientTool } = {}) {
@@ -499,24 +636,58 @@ export class OpenCodeExecutor extends BaseExecutor {
       body.store = false;
       normalizeResponsesTools(body);
       sanitizeResponsesItems(body);
-      if (!Array.isArray(body.tools) || body.tools.length === 0) {
-        cloakOpencodeTools(body, true);
-      }
+      // Decoys MUST be ensured even when caller tools exist: upstream 403s
+      // FreeTierError whenever any tools payload lacks the lowercase quartet
+      // bash/glob/grep/read (verified live 2026-09-18; extras are allowed).
+      // cloakOpencodeTools appends only missing names, so this is idempotent.
+      cloakOpencodeTools(body, true, credentials);
     } else if (body && typeof body === "object") {
-      cloakOpencodeTools(body, false);
+      cloakOpencodeTools(body, false, credentials);
     }
     return injectReasoningContent({ provider: this.provider, model, body });
   }
 
   async execute(args) {
-    return super.execute({ ...args, credentials: this.prepareRequestCredentials(args) });
+    const credentials = this.prepareRequestCredentials(args);
+    const result = await super.execute({ ...args, credentials });
+    if (args?.credentials && credentials?._opencodeToolNameMap) {
+      args.credentials._opencodeToolNameMap = credentials._opencodeToolNameMap;
+    }
+    try {
+      const identityKeyStr = identityKey(credentials);
+      const identity = identityKeyStr
+        ? identityKeyStr + ":" + baseModelId(String(args?.model || ""))
+        : null;
+      if (result?.response?.status === 500) {
+        try {
+          const dbgSes = credentials?.[SESSION_FIELD];
+          const dbgReq = credentials?.[REQ_FIELD];
+          result.response.clone().text().then((t) => {
+            console.error("[OC-DEBUG] 500 ses=" + String(dbgSes).slice(0, 40)
+              + " req=" + String(dbgReq).slice(0, 40)
+              + " model=" + String(args?.model || "") + " body=" + String(t).slice(0, 400));
+          }).catch(() => { });
+        } catch { }
+      }
+      if (identity && result?.response?.status === 500) {
+        // poisoned or broken upstream session: rotate so the next attempt (and
+        // the built-in retries of that attempt) uses a freshly minted session
+        if (opencodeSessionOverrides.size >= MAX_SESSION_OVERRIDES) opencodeSessionOverrides.clear();
+        opencodeSessionOverrides.set(identity, { session: generateSessionId(), setAt: Date.now() });
+      } else if (identity && result?.response?.status && result.response.status < 400) {
+        opencodeSessionOverrides.delete(identity);
+      }
+    } catch {
+      // rotation is best-effort; never fail the request because of it
+    }
+    return result;
   }
 
   buildUrl(model) {
     const base = this.config.baseUrl;
-    if (isResponsesModel(model)) return `${base}/zen/v1/responses`;
-    if (isMessagesModel(model)) return `${base}/zen/v1/messages`;
-    return `${base}/zen/v1/chat/completions`;
+    if (isResponsesModel(model)) return `${base}/responses`;
+    if (isMessagesModel(model)) return `${base}/messages`;
+    return `${base}/chat/completions`;
   }
 
   buildHeaders(credentials, stream = true, url = "") {
@@ -525,7 +696,7 @@ export class OpenCodeExecutor extends BaseExecutor {
     for (const [k, v] of Object.entries(raw)) lower[k.toLowerCase()] = v;
 
     const downstreamUa = lower["user-agent"] || "";
-    const isOpencodeDownstream = hasValidOpencodeVersion(downstreamUa);
+    const isOpencodeDownstream = isOfficialOpencodeUa(downstreamUa);
 
     const session = credentials?.[SESSION_FIELD] || this.prepareRequestCredentials({ credentials })[SESSION_FIELD];
     const downstreamReq = normalizeRequestId(lower["x-opencode-request"]);
@@ -537,6 +708,8 @@ export class OpenCodeExecutor extends BaseExecutor {
       "User-Agent": isOpencodeDownstream ? downstreamUa : OPENCODE_UA,
       "x-opencode-client": lower["x-opencode-client"] || "desktop",
       "x-opencode-session": session,
+      // /inference 403s without it; the official client sends the same id in both headers.
+      "x-opencode-session-id": session,
       "x-opencode-request": requestId,
       "x-opencode-project": lower["x-opencode-project"] || "global",
       "Accept": stream ? "text/event-stream" : "*/*",

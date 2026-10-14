@@ -59,8 +59,13 @@ export function createSSEStream(options = {}) {
   // Per-stream decoder with stream:true to correctly handle multi-byte chars split across chunks
   const decoder = new TextDecoder("utf-8", { fatal: false });
 
+  const mergedToolNameMap = new Map([
+    ...(toolNameMap instanceof Map ? toolNameMap.entries() : (toolNameMap ? Object.entries(toolNameMap) : [])),
+    ...(credentials?._opencodeToolNameMap instanceof Map ? credentials._opencodeToolNameMap.entries() : (credentials?._opencodeToolNameMap ? Object.entries(credentials._opencodeToolNameMap) : []))
+  ]);
+
   const state = mode === STREAM_MODE.TRANSLATE
-    ? { ...initState(sourceFormat), provider, toolNameMap, customToolNames: new Set(customToolNames || []), model, sessionId: credentials?._clientSessionId || null }
+    ? { ...initState(sourceFormat), provider, toolNameMap: mergedToolNameMap.size > 0 ? mergedToolNameMap : null, customToolNames: new Set(customToolNames || []), model, sessionId: credentials?._clientSessionId || null }
     : null;
 
   let totalContentLength = 0;

@@ -763,7 +763,7 @@
     ]
   },
   "opencode": {
-    "baseUrl": "https://opencode.ai",
+    "baseUrl": "https://opencode.ai/inference/v1",
     "headers": {
       "x-opencode-client": "desktop"
     },

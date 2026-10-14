@@ -17,6 +17,7 @@ import { resolveCursorModels } from "open-sse/services/cursorModels.js";
 import { resolveZedModels } from "open-sse/shared/zedAuth.js";
 import { updateProviderCredentials } from "@/sse/services/tokenRefresh";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
+import { fetchNoAuthModels } from "@/lib/noAuthModels";
 import { capabilitiesFromServiceKind, getCapabilitiesForModel } from "open-sse/providers/capabilities.js";
 
 // Per-provider live model resolvers. Each receives a connection record and
@@ -299,6 +300,13 @@ export async function buildModelsList(kindFilter, options = {}) {
       activeConnectionByProvider.set(conn.provider, conn);
     }
   }
+  // noAuth providers (e.g. OpenCode Free) never have a connection row — requests run
+  // under a virtual "Public" account — so they are always active, like in the dashboard.
+  // Hidden ones (ended/unavailable channels, local-only tools) stay out of the list.
+  for (const provider of Object.values(AI_PROVIDERS)) {
+    if (!provider.noAuth || provider.hidden || activeConnectionByProvider.has(provider.id)) continue;
+    activeConnectionByProvider.set(provider.id, { provider: provider.id, providerSpecificData: {}, isActive: true });
+  }
 
   const models = [];
 
@@ -411,6 +419,19 @@ export async function buildModelsList(kindFilter, options = {}) {
           }
         } catch (err) {
           console.log(`Live model fetch failed for ${providerId}: ${err?.message || err}`);
+        }
+      }
+
+      // noAuth providers with a public catalog (e.g. OpenCode Free models like
+      // big-pickle are not in the static registry): merge the live ids into the static
+      // list so static entries with a special targetFormat still appear. Never throws;
+      // with skipDynamicFetch only the cached catalog is used (no network).
+      const noAuthFetcher = AI_PROVIDERS[providerId]?.noAuth ? AI_PROVIDERS[providerId].modelsFetcher : null;
+      if (noAuthFetcher && !hasExplicitEnabledModels) {
+        const liveNoAuth = await fetchNoAuthModels(noAuthFetcher, { cacheOnly: skipDynamicFetch });
+        if (liveNoAuth.length) {
+          rawModelIds = Array.from(new Set([...rawModelIds, ...liveNoAuth.map((m) => m.id)]));
+          for (const m of liveNoAuth) liveModelKindById.set(m.id, modelKind(m));
         }
       }
 

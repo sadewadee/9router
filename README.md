@@ -379,6 +379,7 @@ Default URLs:
 >
 > **Kiro AI** moved to a paid model in Sep 2025 — the free tier is now capped at **50 credits/month** (plus 500 trial credits for new accounts in the first 30 days). Paid tiers: Pro $20/mo (1,000 credits), Pro+ $40/mo (2,000), Pro Max $100/mo (5,000), Power $200/mo (10,000).
 > **OpenCode Free** model list fluctuates over time (some models free only for limited promos) — subject to change without notice.
+> **Freebuff** (`cb/`, Codebuff free mode): sign in with the device-code flow or paste a Codebuff auth token. Requests always leave the server directly — relay proxy pools are bypassed — and the free model list follows the Freebuff CLI picker, so it can change without notice.
 > **Vertex AI**: the $300 free credit for new GCP accounts is still valid, but since Mar 2026 the **Gemini API endpoint no longer consumes these credits** — call the **Vertex AI Studio** endpoint instead.
 
 ### 🔑 API Key Providers (40+)
