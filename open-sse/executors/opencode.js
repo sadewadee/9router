@@ -14,7 +14,7 @@ import {
   coerceResponsesOutput,
 } from "../translator/formats/responsesApi.js";
 
-const OPENCODE_UA = "opencode/1.18.31";
+const OPENCODE_UA = "opencode/1.19.0";
 const MAX_SESSION_LENGTH = 256;
 const MAX_TOOL_NAME_LEN = 128;
 const SESSION_HEADER = "x-opencode-session";
@@ -213,20 +213,52 @@ export function generateRequestId(timestamp = Date.now()) {
   return `msg_${time}${unstableRandom()}`;
 }
 
-export function translateSessionId(sessionId, clientTool = "") {
+// Upstream validates that the 12-hex prefix of ses_/msg_ ids is a real
+// timestamp-encoded value (48 bits = ms << 12 | counter), not random hash
+// bytes (decolua/9router#4780; 403 FreeTierError otherwise).
+function encodeTimeHex(value) {
+  return Array.from({ length: 6 }, (_, index) =>
+    Number((value >> BigInt(40 - 8 * index)) & 0xffn)
+      .toString(16)
+      .padStart(2, "0")
+  ).join("");
+}
+
+export function translateSessionId(sessionId, clientTool = "", timestamp = Date.now()) {
   if (typeof sessionId === "string" && OPENCODE_SESSION_RE.test(sessionId.trim())) {
     return sessionId.trim();
   }
+  // A downstream session keeps ONE stable ses_ id (like a real OpenCode
+  // session), so cache the translation per (clientTool, sessionId).
+  const cacheKey = `opencode:tr:${clientTool || "generic"}:${sessionId || ""}`;
+  const existing = stableOpencodeSessions.get(cacheKey);
+  if (existing) {
+    existing.lastUsed = Date.now();
+    stableOpencodeSessions.delete(cacheKey);
+    stableOpencodeSessions.set(cacheKey, existing);
+    return existing.sessionId;
+  }
+  if (timestamp !== lastTimestamp) {
+    lastTimestamp = timestamp;
+    counter = 0;
+  }
+  counter++;
+  // Session ids are descending (inverted), same as generateSessionId().
+  const timeHex = encodeTimeHex(~(BigInt(timestamp) * 0x1000n + BigInt(counter)));
   const digest = crypto
     .createHash("sha256")
     .update(`opencode\0${clientTool || "generic"}\0${sessionId || ""}`)
     .digest();
-  const timeHex = digest.subarray(0, 6).toString("hex");
   let randomPart = "";
   for (let i = 6; i < 20; i++) {
     randomPart += BASE62_CHARS[digest[i] % 62];
   }
-  return `ses_${timeHex}${randomPart}`;
+  const id = `ses_${timeHex}${randomPart}`;
+  if (stableOpencodeSessions.size >= MAX_STABLE_SESSIONS) {
+    stableOpencodeSessions.delete(stableOpencodeSessions.keys().next().value);
+  }
+  stableOpencodeSessions.set(cacheKey, { sessionId: id, lastUsed: Date.now() });
+  return id;
 }
 
 function normalizeSession(value) {
@@ -347,21 +379,22 @@ function rememberOpencodeRequestId(id) {
   return !!seen;
 }
 
-export function deriveRequestId(sessionId, body) {
+export function deriveRequestId(sessionId, body, timestamp = Date.now()) {
   const text = lastUserText(body);
-  if (!text) return generateRequestId();
+  if (!text) return generateRequestId(timestamp);
   const digest = crypto
     .createHash("sha256")
     .update(`opencode-req\0${sessionId || ""}\0${text}`)
     .digest();
-  const timeHex = digest.subarray(0, 6).toString("hex");
+  // Request ids are ascending, same as generateRequestId().
+  const timeHex = encodeTimeHex(BigInt(timestamp) * 0x1000n + 1n);
   let randomPart = "";
   for (let i = 6; i < 20; i++) {
     randomPart += BASE62_CHARS[digest[i] % 62];
   }
   const id = `msg_${timeHex}${randomPart}`;
-  if (!OPENCODE_REQUEST_RE.test(id)) return generateRequestId();
-  if (rememberOpencodeRequestId(id)) return generateRequestId();
+  if (!OPENCODE_REQUEST_RE.test(id)) return generateRequestId(timestamp);
+  if (rememberOpencodeRequestId(id)) return generateRequestId(timestamp);
   return id;
 }
 

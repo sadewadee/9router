@@ -83,6 +83,31 @@ describe("OpenCode Free Session ID Format", () => {
     expect(translateSessionId(valid)).toBe(valid);
     expect(translateSessionId(`  ${valid}  `)).toBe(valid);
   });
+
+  // Upstream validates that the 12-hex prefix is a real timestamp-encoded value
+  // (decolua/9router#4780). The real CLI keeps only the low 48 bits of
+  // (ms << 12 | counter), so the decoded ms is compared modulo 2^36.
+  const MS_MASK = (1n << 36n) - 1n;
+
+  it("encodes a real timestamp in translated session ids and keeps them stable per session", () => {
+    const now = Date.now();
+    const raw = `ts-session-${now}`;
+    const id = translateSessionId(raw, "claude", now);
+    expect(id).toMatch(OPENCODE_SESSION_RE);
+    const value = BigInt(`0x${id.slice(4, 16)}`);
+    expect((~value & 0xffffffffffffn) >> 12n).toBe(BigInt(now) & MS_MASK);
+    expect(translateSessionId(raw, "claude", now + 5000)).toBe(id);
+    expect(translateSessionId(`${raw}-other`, "claude", now)).not.toBe(id);
+  });
+
+  it("encodes a real timestamp in derived request ids", () => {
+    const now = Date.now();
+    const body = { messages: [{ role: "user", content: `ts-request-${now}` }] };
+    const id = deriveRequestId("ses_f534dfae8ffeCy4Ee4tLWNygDc", body, now);
+    expect(id).toMatch(OPENCODE_REQUEST_RE);
+    const value = BigInt(`0x${id.slice(4, 16)}`);
+    expect((value & 0xffffffffffffn) >> 12n).toBe(BigInt(now) & MS_MASK);
+  });
 });
 
 describe("OpenCode Free Executor Session Resolution", () => {
@@ -171,25 +196,25 @@ describe("OpenCode Free Executor Session Resolution", () => {
 });
 
 describe("OpenCode Free User-Agent Validation", () => {
-  it("defaults User-Agent to opencode/1.18.31 for non-opencode downstream clients", () => {
+  it("defaults User-Agent to opencode/1.19.0 for non-opencode downstream clients", () => {
     const executor = getExecutor("opencode");
     const headersNoUa = executor.buildHeaders({});
-    expect(headersNoUa["User-Agent"]).toBe("opencode/1.18.31");
+    expect(headersNoUa["User-Agent"]).toBe("opencode/1.19.0");
 
     const headersClaude = executor.buildHeaders({ rawHeaders: { "user-agent": "Claude-Code/1.0" } });
-    expect(headersClaude["User-Agent"]).toBe("opencode/1.18.31");
+    expect(headersClaude["User-Agent"]).toBe("opencode/1.19.0");
   });
 
-  it("replaces bare opencode with versioned opencode/1.18.31 to prevent 403 FreeTierError", () => {
+  it("replaces bare opencode with versioned opencode/1.19.0 to prevent 403 FreeTierError", () => {
     const executor = getExecutor("opencode");
     const headers = executor.buildHeaders({ rawHeaders: { "user-agent": "opencode" } });
-    expect(headers["User-Agent"]).toBe("opencode/1.18.31");
+    expect(headers["User-Agent"]).toBe("opencode/1.19.0");
   });
 
   it("upgrades outdated opencode versions (< 1.17) to prevent 426 Upgrade Required", () => {
     const executor = getExecutor("opencode");
     const headers = executor.buildHeaders({ rawHeaders: { "user-agent": "opencode/1.15.0" } });
-    expect(headers["User-Agent"]).toBe("opencode/1.18.31");
+    expect(headers["User-Agent"]).toBe("opencode/1.19.0");
   });
 
   it("preserves valid opencode versions (>= 1.17)", () => {
