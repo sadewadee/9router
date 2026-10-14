@@ -6,7 +6,7 @@ import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
-import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
+import { ANTHROPIC_API_VERSION, OPENCODE_UA } from "../providers/shared.js";
 import {
   normalizeResponsesInput,
   clampResponsesCallId,
@@ -14,7 +14,6 @@ import {
   coerceResponsesOutput,
 } from "../translator/formats/responsesApi.js";
 
-const OPENCODE_UA = "opencode/1.19.0";
 const MAX_SESSION_LENGTH = 256;
 const MAX_TOOL_NAME_LEN = 128;
 const SESSION_HEADER = "x-opencode-session";
@@ -27,146 +26,133 @@ const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuv
 // OpenCode free tier requires the lowercase tool quartet 'bash', 'glob',
 // 'grep' and 'read' in the tools payload (verified by live bisection 2026-09-18:
 // tools without the full quartet get 403 FreeTierError even when bash/read exist).
-// Injected as cloaked decoy tools so external CLI tools (e.g. Claude Code's Bash/Read)
-// take precedence while satisfying upstream verification.
-const OPENCODE_DECOY_CHAT_TOOLS = [
-  {
-    type: "function",
-    function: {
-      name: "bash",
-      description: "This tool is currently unavailable and must not be used.",
-      parameters: { type: "object", properties: {} },
+// Live bisection 2026-10-14 on /inference/v1 tightened it: each of the four must
+// ALSO carry OpenCode's own description sentence (`sig`) and its required
+// parameter. Placeholder descriptions or empty schemas 403 as well, and so does a
+// second tool with the same lowercase name. A tool that differs only by case
+// (Claude Code's Bash/Read/Glob/Grep) coexists fine.
+// Injected as cloaked decoys so external CLI tools take precedence while
+// satisfying upstream verification.
+const OPENCODE_GATE_TOOLS = {
+  bash: {
+    sig: "IMPORTANT: This tool is for terminal operations",
+    description: "Executes a given bash command in a persistent shell session with optional timeout, ensuring proper handling and security measures.\n\nIMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO NOT use it for file operations (reading, writing, editing, searching, finding files) - use the specialized tools for this instead.",
+    properties: {
+      command: { type: "string", description: "The command to execute" },
+      timeout: { type: "integer", description: "Optional timeout in milliseconds" },
+      workdir: { type: "string", description: "The working directory to run the command in. Defaults to the current directory. Use this instead of 'cd' commands." },
     },
+    required: ["command"],
   },
-  {
-    type: "function",
-    function: {
-      name: "read",
-      description: "This tool is currently unavailable and must not be used.",
-      parameters: { type: "object", properties: {} },
+  glob: {
+    sig: "Fast file pattern matching tool",
+    description: "- Fast file pattern matching tool that works with any codebase size\n- Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\"\n- Returns matching file paths",
+    properties: {
+      pattern: { type: "string", description: "The glob pattern to match files against" },
+      path: { type: "string", description: "The directory to search in. If not specified, the current working directory will be used." },
     },
+    required: ["pattern"],
   },
-  {
-    type: "function",
-    function: {
-      name: "glob",
-      description: "This tool is currently unavailable and must not be used.",
-      parameters: { type: "object", properties: {} },
+  grep: {
+    sig: "Fast content search tool",
+    description: "- Fast content search tool that works with any codebase size\n- Searches file contents using regular expressions\n- Returns file paths and line numbers with matching lines",
+    properties: {
+      pattern: { type: "string", description: "The regex pattern to search for in file contents" },
+      path: { type: "string", description: "The directory to search in. Defaults to the current working directory." },
+      include: { type: "string", description: "File pattern to include in the search (e.g. \"*.js\", \"*.{ts,tsx}\")" },
     },
+    required: ["pattern"],
   },
-  {
-    type: "function",
-    function: {
-      name: "grep",
-      description: "This tool is currently unavailable and must not be used.",
-      parameters: { type: "object", properties: {} },
+  read: {
+    sig: "Read a file or directory from the local filesystem",
+    description: "Read a file or directory from the local filesystem. If the path does not exist, an error is returned.",
+    properties: {
+      filePath: { type: "string", description: "The absolute path to the file or directory to read" },
+      offset: { type: "integer", description: "The line number to start reading from (1-indexed)" },
+      limit: { type: "integer", description: "The maximum number of lines to read (defaults to 2000)" },
     },
+    required: ["filePath"],
   },
-];
+};
+const OPENCODE_GATE_NAMES = Object.keys(OPENCODE_GATE_TOOLS);
+const OPENCODE_DECOY_NOTE = " This tool is currently unavailable and must not be used.";
 
-const OPENCODE_DECOY_RESPONSES_TOOLS = [
-  {
-    type: "function",
-    name: "bash",
-    description: "This tool is currently unavailable and must not be used.",
-    parameters: { type: "object", properties: {} },
-  },
-  {
-    type: "function",
-    name: "read",
-    description: "This tool is currently unavailable and must not be used.",
-    parameters: { type: "object", properties: {} },
-  },
-  {
-    type: "function",
-    name: "glob",
-    description: "This tool is currently unavailable and must not be used.",
-    parameters: { type: "object", properties: {} },
-  },
-  {
-    type: "function",
-    name: "grep",
-    description: "This tool is currently unavailable and must not be used.",
-    parameters: { type: "object", properties: {} },
-  },
-];
+function opencodeDecoy(name, isResponses) {
+  const { description, properties, required } = OPENCODE_GATE_TOOLS[name];
+  const def = {
+    name,
+    description: description + OPENCODE_DECOY_NOTE,
+    parameters: { type: "object", properties: structuredClone(properties), required: [...required] },
+  };
+  return isResponses ? { type: "function", ...def } : { type: "function", function: def };
+}
 
-const OPENCODE_FINGERPRINT_TOOLS = ["bash", "glob", "grep", "read"];
+// Does a caller tool that owns a quartet name already pass the upstream gate
+// (i.e. it is OpenCode's own definition)? Case-sensitive on purpose: a false
+// negative only costs an alias, a false positive costs a 403.
+function meetsOpencodeGate(name, def) {
+  const { sig, required } = OPENCODE_GATE_TOOLS[name];
+  const params = def.parameters;
+  return typeof def.description === "string" && def.description.includes(sig)
+    && Array.isArray(params?.required)
+    && required.every((k) => params.required.includes(k) && params.properties?.[k]);
+}
 
 function cloakOpencodeTools(body, isResponses, credentials) {
   if (!body || typeof body !== "object") return;
   const toolNameMap = credentials?._opencodeToolNameMap || new Map();
   if (credentials) credentials._opencodeToolNameMap = toolNameMap;
+  if (!Array.isArray(body.tools)) body.tools = [];
 
-  if (isResponses) {
-    if (!Array.isArray(body.tools)) body.tools = [];
-    const satisfied = new Set();
-
-    // Pass 1: rename any existing tool matching fingerprint names (case-insensitively)
-    // to lowercase, preserving its full schema/description/parameters. This satisfies
-    // upstream's lowercase quartet requirement without causing 500 case-collision errors.
-    for (const tool of body.tools) {
-      if (!tool || typeof tool !== "object") continue;
-      const rawName = typeof tool.name === "string" ? tool.name : "";
-      const lower = rawName.trim().toLowerCase();
-      if (OPENCODE_FINGERPRINT_TOOLS.includes(lower)) {
-        satisfied.add(lower);
-        if (rawName !== lower) {
-          toolNameMap.set(lower, rawName);
-          tool.name = lower;
-        }
-      }
+  const satisfied = new Set();
+  for (const tool of body.tools) {
+    if (!tool || typeof tool !== "object") continue;
+    const def = tool.function && typeof tool.function === "object" ? tool.function : tool;
+    const name = typeof def.name === "string" ? def.name : "";
+    const lower = name.trim().toLowerCase();
+    if (!OPENCODE_GATE_TOOLS[lower]) continue;
+    if (name !== lower) {
+      // Differently-cased caller tool (Claude Code's Bash): it coexists with the
+      // lowercase decoy. Should the model call the decoy anyway, hand the call
+      // back to the caller's real tool.
+      toolNameMap.set(lower, name);
+      continue;
     }
-
-    // Pass 2: inject missing fingerprint tools as decoys
-    for (const decoy of OPENCODE_DECOY_RESPONSES_TOOLS) {
-      if (!satisfied.has(decoy.name)) {
-        body.tools.push({ ...decoy });
-        satisfied.add(decoy.name);
-      }
+    if (meetsOpencodeGate(name, def)) {
+      satisfied.add(name);
+      continue;
     }
-    if (!body.tool_choice) body.tool_choice = "auto";
-  } else {
-    // Chat completions format
-    if (!Array.isArray(body.tools)) body.tools = [];
-    const satisfied = new Set();
-
-    for (const tool of body.tools) {
-      if (!tool || typeof tool !== "object") continue;
-      const fn = tool.function && typeof tool.function === "object" ? tool.function : null;
-      const rawName = typeof fn?.name === "string" ? fn.name : (typeof tool.name === "string" ? tool.name : "");
-      const lower = rawName.trim().toLowerCase();
-      if (OPENCODE_FINGERPRINT_TOOLS.includes(lower)) {
-        satisfied.add(lower);
-        if (rawName !== lower) {
-          toolNameMap.set(lower, rawName);
-          if (fn) fn.name = lower;
-          if (typeof tool.name === "string") tool.name = lower;
-        }
-      }
-    }
-
-    const hasCallerTools = satisfied.size > 0 || body.tools.length > 0;
-    for (const decoy of OPENCODE_DECOY_CHAT_TOOLS) {
-      if (!satisfied.has(decoy.function.name)) {
-        body.tools.push({ ...decoy, function: { ...decoy.function } });
-        satisfied.add(decoy.function.name);
-      }
-    }
-    if (!body.tool_choice) {
-      body.tool_choice = hasCallerTools ? "auto" : "none";
-    }
+    // A caller tool that owns the exact lowercase name without being OpenCode's
+    // would duplicate it (403): move it aside under an alias, map the model's
+    // calls back to the original name, and let the decoy take the quartet slot.
+    const alias = `${name}_ext`;
+    def.name = alias;
+    toolNameMap.set(alias, name);
+    const choice = body.tool_choice;
+    const chosen = isResponses ? choice : choice?.function;
+    if (chosen && typeof chosen === "object" && chosen.name === name) chosen.name = alias;
   }
+
+  for (const name of OPENCODE_GATE_NAMES) {
+    if (!satisfied.has(name)) body.tools.push(opencodeDecoy(name, isResponses));
+  }
+  // tool_choice "none" 403s too (live 2026-10-14): the gate wants tools enabled,
+  // so the decoys stay callable in principle and rely on their "unavailable" note.
+  if (!body.tool_choice || body.tool_choice === "none") body.tool_choice = "auto";
 }
 
-function hasValidOpencodeVersion(ua) {
-  const m = String(ua || "").match(/opencode\/(\d+)\.(\d+)(?:\.(\d+))?/i);
-  if (!m) return false;
+// /inference 403s a bare "opencode/<ver>" UA and 426s anything older than 1.18
+// (live 2026-10-14), so a downstream UA is forwarded only when it is a genuine
+// full official one ("opencode/<ver> ai-sdk/... runtime/...", >= 1.18).
+function isOfficialOpencodeUa(ua) {
+  const text = String(ua || "");
+  const m = text.match(/opencode\/(\d+)\.(\d+)(?:\.(\d+))?/i);
+  if (!m || !text.includes(" ai-sdk/")) return false;
   const major = parseInt(m[1], 10);
   const minor = parseInt(m[2], 10);
-  return major > 1 || (major === 1 && minor >= 17);
+  return major > 1 || (major === 1 && minor >= 18);
 }
-// Models served by /zen/v1/responses; every other model stays on /chat/completions.
+// Models served by /responses; every other model stays on /chat/completions.
 const RESPONSES_MODELS = new Set([
   "muse-spark-1.2-contributor-free",
   "muse-spark-1.3-contributor-free",
@@ -699,9 +685,9 @@ export class OpenCodeExecutor extends BaseExecutor {
 
   buildUrl(model) {
     const base = this.config.baseUrl;
-    if (isResponsesModel(model)) return `${base}/zen/v1/responses`;
-    if (isMessagesModel(model)) return `${base}/zen/v1/messages`;
-    return `${base}/zen/v1/chat/completions`;
+    if (isResponsesModel(model)) return `${base}/responses`;
+    if (isMessagesModel(model)) return `${base}/messages`;
+    return `${base}/chat/completions`;
   }
 
   buildHeaders(credentials, stream = true, url = "") {
@@ -710,7 +696,7 @@ export class OpenCodeExecutor extends BaseExecutor {
     for (const [k, v] of Object.entries(raw)) lower[k.toLowerCase()] = v;
 
     const downstreamUa = lower["user-agent"] || "";
-    const isOpencodeDownstream = hasValidOpencodeVersion(downstreamUa);
+    const isOpencodeDownstream = isOfficialOpencodeUa(downstreamUa);
 
     const session = credentials?.[SESSION_FIELD] || this.prepareRequestCredentials({ credentials })[SESSION_FIELD];
     const downstreamReq = normalizeRequestId(lower["x-opencode-request"]);
@@ -722,6 +708,8 @@ export class OpenCodeExecutor extends BaseExecutor {
       "User-Agent": isOpencodeDownstream ? downstreamUa : OPENCODE_UA,
       "x-opencode-client": lower["x-opencode-client"] || "desktop",
       "x-opencode-session": session,
+      // /inference 403s without it; the official client sends the same id in both headers.
+      "x-opencode-session-id": session,
       "x-opencode-request": requestId,
       "x-opencode-project": lower["x-opencode-project"] || "global",
       "Accept": stream ? "text/event-stream" : "*/*",

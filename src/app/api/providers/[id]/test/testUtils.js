@@ -5,6 +5,7 @@ import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/sha
 import { getDefaultModel } from "open-sse/config/providerModels.js";
 import { resolveOllamaLocalHost, PROVIDERS } from "open-sse/config/providers.js";
 import { CODEX_CLI_VERSION } from "open-sse/config/appConstants.js";
+import { OPENCODE_FREE_BASE, OPENCODE_UA } from "open-sse/providers/shared.js";
 import { probeFreebuffToken } from "open-sse/executors/freebuff.js";
 import {
   refreshProviderCredentials,
@@ -760,8 +761,8 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
         return { valid, error: valid ? null : "Session expired — re-paste cookie" };
       }
       case "opencode": {
-        const res = await fetchWithConnectionProxy("https://opencode.ai/zen/v1/models", {
-          headers: { Authorization: "Bearer public", "User-Agent": "opencode/1.19.0" },
+        const res = await fetchWithConnectionProxy(`${OPENCODE_FREE_BASE}/models`, {
+          headers: { Authorization: "Bearer public", "User-Agent": OPENCODE_UA },
         }, effectiveProxy);
         return { valid: res.ok, error: res.ok ? null : "OpenCode free tier unavailable" };
       }
