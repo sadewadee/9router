@@ -4,9 +4,21 @@ import { fileURLToPath } from "url";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 
+// Node 18 lacks the File global that undici expects.
+if (typeof globalThis.File === "undefined") {
+  globalThis.File = class File extends Blob {
+    constructor(parts, name, options) {
+      super(parts, options);
+      this.name = String(name);
+    }
+  };
+}
+
 export default defineConfig({
+  css: { postcss: {} }, // hachibi: skip next postcss oxide binding (node18 build env)
   test: {
     environment: "node",
+    setupFiles: [resolve(__dirname, "file-polyfill.setup.mjs")],
     globals: true,
     include: ["**/*.test.js"],
     // Don't scan into git worktrees nested under .claude/ — they carry their

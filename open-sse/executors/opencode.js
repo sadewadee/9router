@@ -24,7 +24,9 @@ export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 export const OPENCODE_REQUEST_RE = /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-// OpenCode free tier requires both 'bash' and 'read' in tools payload.
+// OpenCode free tier requires the lowercase tool quartet 'bash', 'glob',
+// 'grep' and 'read' in the tools payload (verified by live bisection 2026-09-18:
+// tools without the full quartet get 403 FreeTierError even when bash/read exist).
 // Injected as cloaked decoy tools so external CLI tools (e.g. Claude Code's Bash/Read)
 // take precedence while satisfying upstream verification.
 const OPENCODE_DECOY_CHAT_TOOLS = [
@@ -44,6 +46,22 @@ const OPENCODE_DECOY_CHAT_TOOLS = [
       parameters: { type: "object", properties: {} },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "glob",
+      description: "This tool is currently unavailable and must not be used.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "grep",
+      description: "This tool is currently unavailable and must not be used.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
 ];
 
 const OPENCODE_DECOY_RESPONSES_TOOLS = [
@@ -59,29 +77,84 @@ const OPENCODE_DECOY_RESPONSES_TOOLS = [
     description: "This tool is currently unavailable and must not be used.",
     parameters: { type: "object", properties: {} },
   },
+  {
+    type: "function",
+    name: "glob",
+    description: "This tool is currently unavailable and must not be used.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    type: "function",
+    name: "grep",
+    description: "This tool is currently unavailable and must not be used.",
+    parameters: { type: "object", properties: {} },
+  },
 ];
 
-function cloakOpencodeTools(body, isResponses) {
+const OPENCODE_FINGERPRINT_TOOLS = ["bash", "glob", "grep", "read"];
+
+function cloakOpencodeTools(body, isResponses, credentials) {
   if (!body || typeof body !== "object") return;
+  const toolNameMap = credentials?._opencodeToolNameMap || new Map();
+  if (credentials) credentials._opencodeToolNameMap = toolNameMap;
+
   if (isResponses) {
     if (!Array.isArray(body.tools)) body.tools = [];
-    const names = new Set(body.tools.map((t) => t.name || t.function?.name));
-    for (const tool of OPENCODE_DECOY_RESPONSES_TOOLS) {
-      if (!names.has(tool.name)) body.tools.push({ ...tool });
+    const satisfied = new Set();
+
+    // Pass 1: rename any existing tool matching fingerprint names (case-insensitively)
+    // to lowercase, preserving its full schema/description/parameters. This satisfies
+    // upstream's lowercase quartet requirement without causing 500 case-collision errors.
+    for (const tool of body.tools) {
+      if (!tool || typeof tool !== "object") continue;
+      const rawName = typeof tool.name === "string" ? tool.name : "";
+      const lower = rawName.trim().toLowerCase();
+      if (OPENCODE_FINGERPRINT_TOOLS.includes(lower)) {
+        satisfied.add(lower);
+        if (rawName !== lower) {
+          toolNameMap.set(lower, rawName);
+          tool.name = lower;
+        }
+      }
+    }
+
+    // Pass 2: inject missing fingerprint tools as decoys
+    for (const decoy of OPENCODE_DECOY_RESPONSES_TOOLS) {
+      if (!satisfied.has(decoy.name)) {
+        body.tools.push({ ...decoy });
+        satisfied.add(decoy.name);
+      }
     }
     if (!body.tool_choice) body.tool_choice = "auto";
   } else {
-    const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
-    if (!hasTools) {
-      body.tools = OPENCODE_DECOY_CHAT_TOOLS.map((t) => ({ ...t, function: { ...t.function } }));
-      if (!body.tool_choice) body.tool_choice = "none";
-    } else {
-      const names = new Set(body.tools.map((t) => t.function?.name || t.name));
-      for (const tool of OPENCODE_DECOY_CHAT_TOOLS) {
-        if (!names.has(tool.function.name)) {
-          body.tools.push({ ...tool, function: { ...tool.function } });
+    // Chat completions format
+    if (!Array.isArray(body.tools)) body.tools = [];
+    const satisfied = new Set();
+
+    for (const tool of body.tools) {
+      if (!tool || typeof tool !== "object") continue;
+      const fn = tool.function && typeof tool.function === "object" ? tool.function : null;
+      const rawName = typeof fn?.name === "string" ? fn.name : (typeof tool.name === "string" ? tool.name : "");
+      const lower = rawName.trim().toLowerCase();
+      if (OPENCODE_FINGERPRINT_TOOLS.includes(lower)) {
+        satisfied.add(lower);
+        if (rawName !== lower) {
+          toolNameMap.set(lower, rawName);
+          if (fn) fn.name = lower;
+          if (typeof tool.name === "string") tool.name = lower;
         }
       }
+    }
+
+    const hasCallerTools = satisfied.size > 0 || body.tools.length > 0;
+    for (const decoy of OPENCODE_DECOY_CHAT_TOOLS) {
+      if (!satisfied.has(decoy.function.name)) {
+        body.tools.push({ ...decoy, function: { ...decoy.function } });
+        satisfied.add(decoy.function.name);
+      }
+    }
+    if (!body.tool_choice) {
+      body.tool_choice = hasCallerTools ? "auto" : "none";
     }
   }
 }
@@ -253,6 +326,27 @@ function lastUserText(body) {
 // The real CLI sends the current user message id (stable per turn, same on
 // retries) as x-opencode-request. Derive it deterministically from the
 // session plus the last user message so retries share the id.
+// Upstream (zen) caches by request id: a deterministic id that repeats after a
+// failed attempt gets the CACHED failure re-served forever (observed live
+// 2026-09-18 — one conversation 500'd for ~40 min on identical retries while
+// any fresh id succeeded). Keep the deterministic id for the FIRST occurrence
+// (preserves quota-friendly idempotency for silent client retries) but mint a
+// fresh id for every repeat so a cached failure can never stick.
+const seenOpencodeRequestIds = new Map(); // id -> firstSeen
+const REQUEST_ID_MEMORY_TTL_MS = 10 * 60 * 1000;
+
+function rememberOpencodeRequestId(id) {
+  const now = Date.now();
+  if (seenOpencodeRequestIds.size > 5000) {
+    for (const [k, v] of seenOpencodeRequestIds) {
+      if (now - v > REQUEST_ID_MEMORY_TTL_MS) seenOpencodeRequestIds.delete(k);
+    }
+  }
+  const seen = seenOpencodeRequestIds.get(id);
+  seenOpencodeRequestIds.set(id, now);
+  return !!seen;
+}
+
 export function deriveRequestId(sessionId, body) {
   const text = lastUserText(body);
   if (!text) return generateRequestId();
@@ -266,7 +360,9 @@ export function deriveRequestId(sessionId, body) {
     randomPart += BASE62_CHARS[digest[i] % 62];
   }
   const id = `msg_${timeHex}${randomPart}`;
-  return OPENCODE_REQUEST_RE.test(id) ? id : generateRequestId();
+  if (!OPENCODE_REQUEST_RE.test(id)) return generateRequestId();
+  if (rememberOpencodeRequestId(id)) return generateRequestId();
+  return id;
 }
 
 function normalizeRequestId(value) {
@@ -326,6 +422,13 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
   const headers = credentials?.rawHeaders || {};
   const native = nativeSession(headers);
   if (native) return native;
+
+  // rotated override (set after upstream 500s) wins over any derived session
+  const overrideIdentity = identityKey(credentials)
+    ? identityKey(credentials) + ":" + baseModelId(String(body?.model || ""))
+    : null;
+  const overridden = overrideIdentity ? opencodeSessionOverrides.get(overrideIdentity) : null;
+  if (overridden?.session) return overridden.session;
 
   let incoming = null;
   for (const [key, value] of Object.entries(headers)) {
@@ -454,9 +557,24 @@ function normalizeOpencodeReasoning(model, body) {
   delete body.reasoning_effort;
 }
 
+// Session overrides: when upstream answers 500 [server_error] for a request
+// whose session is deterministically derived from the conversation id (real
+// clients), that exact upstream session can be poisoned server-side and every
+// retry keeps hitting it (observed live 2026-09-18: one conversation 500'd for
+// ~40 min while fresh sessions succeeded in the same seconds). Store a freshly
+// minted session per identity on 500; drop it once a request succeeds.
+const opencodeSessionOverrides = new Map(); // identityKey -> { session, setAt }
+const MAX_SESSION_OVERRIDES = 500;
+
 export class OpenCodeExecutor extends BaseExecutor {
   constructor() {
     super("opencode", PROVIDERS.opencode);
+    // Zen's muse free tier flaps with 500 [server_error] in short windows
+    // (observed live 2026-09-18: bursts of consecutive 500s that clear within
+    // minutes). DEFAULT_RETRY_CONFIG covers 502/503/504 but not 500, so every
+    // flap surfaced straight to the client. Retry 500 a couple of times so the
+    // window self-heals; genuinely-broken requests just pay ~5s extra latency.
+    this.config.retry = { ...(this.config.retry || {}), 500: { attempts: 2, delayMs: 2500 } };
   }
 
   prepareRequestCredentials({ body, credentials, providerSessionId, clientTool } = {}) {
@@ -499,17 +617,51 @@ export class OpenCodeExecutor extends BaseExecutor {
       body.store = false;
       normalizeResponsesTools(body);
       sanitizeResponsesItems(body);
-      if (!Array.isArray(body.tools) || body.tools.length === 0) {
-        cloakOpencodeTools(body, true);
-      }
+      // Decoys MUST be ensured even when caller tools exist: upstream 403s
+      // FreeTierError whenever any tools payload lacks the lowercase quartet
+      // bash/glob/grep/read (verified live 2026-09-18; extras are allowed).
+      // cloakOpencodeTools appends only missing names, so this is idempotent.
+      cloakOpencodeTools(body, true, credentials);
     } else if (body && typeof body === "object") {
-      cloakOpencodeTools(body, false);
+      cloakOpencodeTools(body, false, credentials);
     }
     return injectReasoningContent({ provider: this.provider, model, body });
   }
 
   async execute(args) {
-    return super.execute({ ...args, credentials: this.prepareRequestCredentials(args) });
+    const credentials = this.prepareRequestCredentials(args);
+    const result = await super.execute({ ...args, credentials });
+    if (args?.credentials && credentials?._opencodeToolNameMap) {
+      args.credentials._opencodeToolNameMap = credentials._opencodeToolNameMap;
+    }
+    try {
+      const identityKeyStr = identityKey(credentials);
+      const identity = identityKeyStr
+        ? identityKeyStr + ":" + baseModelId(String(args?.model || ""))
+        : null;
+      if (result?.response?.status === 500) {
+        try {
+          const dbgSes = credentials?.[SESSION_FIELD];
+          const dbgReq = credentials?.[REQ_FIELD];
+          result.response.clone().text().then((t) => {
+            console.error("[OC-DEBUG] 500 ses=" + String(dbgSes).slice(0, 40)
+              + " req=" + String(dbgReq).slice(0, 40)
+              + " model=" + String(args?.model || "") + " body=" + String(t).slice(0, 400));
+          }).catch(() => { });
+        } catch { }
+      }
+      if (identity && result?.response?.status === 500) {
+        // poisoned or broken upstream session: rotate so the next attempt (and
+        // the built-in retries of that attempt) uses a freshly minted session
+        if (opencodeSessionOverrides.size >= MAX_SESSION_OVERRIDES) opencodeSessionOverrides.clear();
+        opencodeSessionOverrides.set(identity, { session: generateSessionId(), setAt: Date.now() });
+      } else if (identity && result?.response?.status && result.response.status < 400) {
+        opencodeSessionOverrides.delete(identity);
+      }
+    } catch {
+      // rotation is best-effort; never fail the request because of it
+    }
+    return result;
   }
 
   buildUrl(model) {
