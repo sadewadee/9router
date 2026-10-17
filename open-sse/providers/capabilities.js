@@ -233,6 +233,14 @@ export const PROVIDER_CAPABILITIES = {
   "codebuddy-intl": {
     "deepseek-v4.1-flash": { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: true, contextWindow: 1000000, maxOutput: 128000 },
   },
+  // OpenCode Free — the /inference gateway load-balances GLM across backends and
+  // some are strict decoders that 400 on the unknown field `thinking`
+  // ("[unknown_parameter] ... unknown field \"thinking\""). Without this entry the
+  // generic *glm-5.3* pattern resolves to the z.ai format (thinking +
+  // reasoning_effort); pin it to openai (reasoning_effort only). Verified 2026-10-18.
+  "opencode": {
+    "glm-5.3-flash-free": { vision: true, reasoning: true, thinkingFormat: "openai", contextWindow: 1000000, maxOutput: 32000 },
+  },
   // Qoder — upstream exposes opaque internal ids (dfmodel, kmodel, …); the
   // registry `name` is display-only and capability lookup matches on the raw
   // id, so every qoder model would fall through to DEFAULT_CAPABILITIES
