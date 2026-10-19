@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS, PROVIDER_OAUTH } from "../config/providers.js";
 import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE, selectAnthropicBeta } from "../providers/shared.js";
@@ -42,6 +43,16 @@ const HEADER_HOOKS = {
   kimiHeaders: (h, c) => Object.assign(h, buildKimiHeaders(c?.providerSpecificData?.deviceId)),
   clineHeaders: (h, c) => Object.assign(h, buildClineHeaders(c.apiKey || c.accessToken)),
   kilocodeOrg: (h, c) => { if (c.providerSpecificData?.orgId) h["X-Kilocode-OrganizationID"] = c.providerSpecificData.orgId; },
+  // ZCode gateway: Bearer next to x-api-key, plus fresh per-request attribution ids
+  // (runner-attribution.ts); the session id is per request, we keep no session state.
+  zcodeGateway: (h, c) => {
+    const token = c.apiKey || c.accessToken;
+    if (token) h["Authorization"] = `Bearer ${token}`;
+    h["x-request-id"] = randomUUID();
+    h["x-zcode-trace-id"] = randomUUID();
+    h["x-session-id"] = randomUUID();
+    h["x-zcode-session-type"] = "main";
+  },
 };
 
 // Config-driven OAuth refresh grants — derived from registry oauth.refresh.

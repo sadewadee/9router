@@ -30,6 +30,25 @@ export const CLAUDE_API_HEADERS = {
   "Anthropic-Beta": "claude-code-20250219,interleaved-thinking-2025-05-14"
 };
 
+// ZCode desktop client fingerprint (mirrors buildCliZCodeSourceHeaders in the ZCode repo).
+// Z.ai bills Coding Plan traffic that enters via the official ZCode gateway (zcode.z.ai)
+// at the ZCode rate; the gateway expects these static client headers. Bump ZCODE_APP_VERSION
+// to track the current ZCode release (root package.json "version").
+export const ZCODE_APP_VERSION = "3.16.1";
+export const ZCODE_SOURCE_HEADERS = {
+  "HTTP-Referer": "https://zcode.z.ai",
+  "User-Agent": `ZCode/${ZCODE_APP_VERSION}`,
+  "X-ZCode-App-Version": ZCODE_APP_VERSION,
+  "X-Title": "Z Code@electron",
+  "X-Release-Channel": "production",
+  "X-Client-Language": "en-US",
+  "X-Client-Timezone": "Asia/Singapore",
+  "X-ZCode-Agent": "glm",
+  "X-Platform": "darwin-arm64",
+  "X-Os-Category": "macos",
+  "X-Os-Version": "25.6.0"
+};
+
 // Full Claude CLI fingerprint — required by providers that gate on client identity (e.g. agentrouter)
 export const CLAUDE_CLI_SPOOF_HEADERS = {
   "Anthropic-Version": ANTHROPIC_API_VERSION,
