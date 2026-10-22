@@ -1,9 +1,20 @@
 import { Readable } from "stream";
 import { MEMORY_CONFIG } from "../config/runtimeConfig.js";
 import { dbg } from "./debugLog.js";
+import {
+  getHostOverrideIp,
+  supportsConnectTunnel,
+  createHostOverrideDirectDispatcher,
+  createHostOverrideTunnelDispatcher,
+} from "./upstreamHostOverrides.js";
 
 const originalFetch = globalThis.fetch;
 const proxyDispatchers = new Map();
+// Dispatchers for hosts pinned by UPSTREAM_HOST_OVERRIDES, keyed by
+// "proxy:<proxyUrl>|<ip>" or "direct:<ip>". Values are promises so concurrent
+// first requests share one dispatcher.
+const overrideDispatchers = new Map();
+let warnedUnsupportedOverrideProxy = false;
 
 // ─── TLS fingerprinting via got-scraping (browser-like JA3) ───────────────
 // Disabled: not in use. Kept commented for future re-enable.
@@ -232,6 +243,64 @@ async function getDispatcher(proxyUrl) {
   return proxyDispatchers.get(normalized);
 }
 
+function getOverrideDispatcher(key, create) {
+  let dispatcher = overrideDispatchers.get(key);
+  if (!dispatcher) {
+    // Evict oldest entry if max size reached (close it gracefully: in-flight requests finish first)
+    if (overrideDispatchers.size >= MEMORY_CONFIG.proxyDispatchersMaxSize) {
+      const oldestKey = overrideDispatchers.keys().next().value;
+      overrideDispatchers.get(oldestKey)?.then((d) => d.close()).catch(() => {});
+      overrideDispatchers.delete(oldestKey);
+    }
+    dispatcher = create();
+    overrideDispatchers.set(key, dispatcher);
+    dispatcher.catch(() => overrideDispatchers.delete(key));
+  }
+  return dispatcher;
+}
+
+/**
+ * Dispatcher for a request through an HTTP(S) proxy. When the target host is
+ * pinned by UPSTREAM_HOST_OVERRIDES the proxy is asked to CONNECT to the pinned
+ * IP (SNI/cert/Host stay on the hostname); otherwise the regular ProxyAgent.
+ */
+async function getProxyDispatcher(proxyUrl, targetUrl) {
+  const overrideIp = getHostOverrideIp(targetUrl);
+  if (overrideIp) {
+    const normalized = normalizeProxyUrl(proxyUrl);
+    if (normalized && supportsConnectTunnel(normalized)) {
+      return getOverrideDispatcher(`proxy:${normalized}|${overrideIp}`, () => createHostOverrideTunnelDispatcher(normalized, overrideIp));
+    }
+    if (normalized && !warnedUnsupportedOverrideProxy) {
+      warnedUnsupportedOverrideProxy = true;
+      console.warn("[ProxyFetch] UPSTREAM_HOST_OVERRIDES needs an http(s) proxy (CONNECT); not applied through this proxy type");
+    }
+  }
+  return getDispatcher(proxyUrl);
+}
+
+/**
+ * Fetch without a proxy. Honors UPSTREAM_HOST_OVERRIDES (dial the pinned IP,
+ * keep SNI/cert/Host on the hostname), so it also replaces `extra_hosts`.
+ */
+async function directFetch(url, options, targetUrl) {
+  const overrideIp = getHostOverrideIp(targetUrl);
+  if (!overrideIp) return originalFetch(url, options);
+  const dispatcher = await getOverrideDispatcher(`direct:${overrideIp}`, () => createHostOverrideDirectDispatcher(overrideIp));
+  return originalFetch(url, { ...options, dispatcher });
+}
+
+/**
+ * One-line reason for a failed proxy attempt. fetch() reports every network
+ * failure as "fetch failed"; the useful part (ECONNREFUSED, proxy 407, ...) is
+ * in `cause`. Never include the proxy URL here — it carries credentials.
+ */
+function describeProxyError(error) {
+  const cause = error?.cause;
+  const detail = cause?.message || cause?.code;
+  return detail && detail !== error.message ? `${error.message} (${detail})` : error.message;
+}
+
 /**
  * Create HTTPS request with manual socket connection (bypass DNS)
  */
@@ -294,7 +363,8 @@ async function createBypassRequest(parsedUrl, realIP, options) {
 export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   const targetUrl = typeof url === "string" ? url : url.toString();
 
-  // Vercel relay: forward request via relay headers
+  // Vercel relay: forward request via relay headers.
+  // UPSTREAM_HOST_OVERRIDES cannot apply here: the relay resolves DNS on its own infrastructure.
   const vercelRelayUrl = normalizeString(proxyOptions?.vercelRelayUrl);
   if (vercelRelayUrl) {
     const parsed = new URL(targetUrl);
@@ -310,8 +380,9 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   const envProxyUrl = connectionProxyUrl ? null : normalizeProxyUrl(getEnvProxyUrl(targetUrl));
   const proxyUrl = connectionProxyUrl || envProxyUrl;
 
-  // MITM DNS bypass: for known MITM-intercepted hosts, resolve real IP to avoid DNS spoof
-  if (shouldBypassMitmDns(targetUrl)) {
+  // MITM DNS bypass: for known MITM-intercepted hosts, resolve real IP to avoid DNS spoof.
+  // An explicit UPSTREAM_HOST_OVERRIDES entry for the host takes precedence over the bypass.
+  if (shouldBypassMitmDns(targetUrl) && !getHostOverrideIp(targetUrl)) {
     if (proxyUrl) {
       // Proxy resolves DNS externally (not affected by /etc/hosts) — use proxy directly
       try {
@@ -319,9 +390,9 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
         return await originalFetch(url, { ...options, dispatcher });
       } catch (proxyError) {
         if (proxyOptions?.strictProxy === true) {
-          throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
+          throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${describeProxyError(proxyError)}`);
         }
-        console.warn(`[ProxyFetch] Proxy failed, falling back to direct bypass: ${proxyError.message}`);
+        console.warn(`[ProxyFetch] Proxy failed, falling back to direct bypass: ${describeProxyError(proxyError)}`);
       }
     }
     // No proxy — manually resolve real IP to bypass DNS spoof
@@ -336,21 +407,21 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
 
   if (proxyUrl) {
     try {
-      const dispatcher = await getDispatcher(proxyUrl);
+      const dispatcher = await getProxyDispatcher(proxyUrl, targetUrl);
       return await originalFetch(url, { ...options, dispatcher });
     } catch (proxyError) {
       // If strictProxy is enabled, fail hard instead of falling back to direct
       if (proxyOptions?.strictProxy === true) {
-        throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
+        throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${describeProxyError(proxyError)}`);
       }
-      console.warn(`[ProxyFetch] Proxy failed, falling back to direct: ${proxyError.message}`);
-      return originalFetch(url, options);
+      console.warn(`[ProxyFetch] Proxy failed, falling back to direct: ${describeProxyError(proxyError)}`);
+      return directFetch(url, options, targetUrl);
     }
   }
 
   // got-scraping disabled — use native fetch directly
   // (Re-enable per-host by wrapping with tryGotScrapingFetch when needed)
-  return originalFetch(url, options);
+  return directFetch(url, options, targetUrl);
 }
 
 /**
