@@ -250,6 +250,7 @@ export function startCodebuddyCheckin({ intervalMs, initialDelayMs } = {}) {
   if (state.initialHandle.unref) state.initialHandle.unref();
   state.intervalHandle = setInterval(safeTick, period);
   if (state.intervalHandle.unref) state.intervalHandle.unref();
+  log.info(TAG, `Scheduler started: first tick in ${firstDelay}ms, then every ${period}ms`);
   return true;
 }
 
