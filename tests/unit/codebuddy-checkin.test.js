@@ -362,6 +362,48 @@ describe("scheduler (startCodebuddyCheckin)", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("logs one line with the interval and first delay when it actually starts", () => {
+    vi.useFakeTimers();
+    expect(startCodebuddyCheckin({ intervalMs: 1000, initialDelayMs: 50 })).toBe(true);
+    startCodebuddyCheckin({ intervalMs: 1000, initialDelayMs: 50 }); // no-op, no second line
+    const started = logLines().filter((l) => l.includes("Scheduler started"));
+    expect(started).toHaveLength(1);
+    expect(started[0]).toContain("CODEBUDDY_CHECKIN");
+    expect(started[0]).toContain("first tick in 50ms");
+    expect(started[0]).toContain("every 1000ms");
+  });
+
+  it("logs the default interval (6h) and first delay (30s) when started without options", () => {
+    vi.useFakeTimers();
+    startCodebuddyCheckin();
+    expect(logLines().some((l) => l.includes("first tick in 30000ms, then every 21600000ms"))).toBe(true);
+  });
+
+  it("does not log a start line when disabled", () => {
+    vi.stubEnv("CODEBUDDY_AUTO_CHECKIN", "false");
+    startCodebuddyCheckin();
+    expect(logLines().some((l) => l.includes("Scheduler started"))).toBe(false);
+  });
+
+  it("is idempotent across separate module instances (instrumentation + initializeApp both start it)", async () => {
+    vi.useFakeTimers();
+    expect(startCodebuddyCheckin({ intervalMs: 1000, initialDelayMs: 50 })).toBe(true);
+
+    vi.resetModules(); // a fresh copy of the module, as a second bundle would load it
+    const second = await import("../../src/sse/services/codebuddyCheckin.js");
+    expect(second.startCodebuddyCheckin).not.toBe(startCodebuddyCheckin);
+    expect(second.startCodebuddyCheckin({ intervalMs: 1000, initialDelayMs: 50 })).toBe(false);
+
+    expect(vi.getTimerCount()).toBe(2); // one initial timeout + one interval, not four
+    expect(logLines().filter((l) => l.includes("Scheduler started"))).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(50);
+    expect(repoMock.getProviderConnections.mock.calls.length).toBe(2); // exactly one tick (one query per provider)
+
+    second.stopCodebuddyCheckin(); // state is shared, so either instance can stop it
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("a rejecting tick never kills the interval", async () => {
     vi.useFakeTimers();
     repoMock.getProviderConnections.mockRejectedValue(new Error("db down"));
