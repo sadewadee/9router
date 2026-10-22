@@ -1,6 +1,7 @@
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { CodeBuddyBaseExecutor, isLegacyRequest } from "./codebuddy-base.js";
 import { contentToText, desensitizeText, desensitizeTools } from "../utils/codebuddyDesensitize.js";
+import { extractClientSessionId } from "../utils/sessionManager.js";
 
 // The gateway wants a leading system prompt; this exact line is the verified-good one.
 const LEAD_PROMPT = "You are CodeBuddy Code.";
@@ -37,6 +38,37 @@ export function buildIntlMessages(source, { legacy = false } = {}) {
   return [{ role: "system", content: lead }, ...rest];
 }
 
+// Text of the first user message (string or typed blocks); JSON for non-text content.
+function firstUserText(messages) {
+  const first = Array.isArray(messages) ? messages.find((m) => m?.role === "user") : null;
+  if (!first) return "";
+  const text = contentToText(first.content);
+  if (text) return text;
+  return first.content == null ? "" : JSON.stringify(first.content);
+}
+
+// 32 hex chars -> 8-4-4-4-12 with v4 version/variant bits, like the random UUIDs it replaces.
+function hexToUuid(hex) {
+  const variant = "89ab"[parseInt(hex[16], 16) & 3];
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-${variant}${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+/**
+ * Stable X-Conversation-ID. The upstream buckets its prompt-prefix cache by
+ * this value, so every turn of one conversation must send the same one.
+ * Seed: the client's own session id when the request carries one, else the
+ * first USER message (the system prompt is identical across conversations of
+ * the same client, so it cannot tell them apart). Always scoped by connection:
+ * the cache lives per account. No seed at all -> random, as before.
+ */
+export function deriveConversationId(credentials, body) {
+  const clientSession = extractClientSessionId(credentials?.rawHeaders, body, "codebuddy-intl");
+  const userText = clientSession ? "" : firstUserText(body?.messages);
+  if (!clientSession && !userText) return randomUUID();
+  const seed = clientSession ? `session:${clientSession}` : `first-user:${userText}`;
+  return hexToUuid(createHash("sha256").update(`${credentials?.connectionId || ""}\n${seed}`).digest("hex").slice(0, 32));
+}
+
 /**
  * CodeBuddyIntlExecutor — talks to https://www.codebuddy.ai/v2/chat/completions
  *
@@ -50,12 +82,13 @@ export class CodeBuddyIntlExecutor extends CodeBuddyBaseExecutor {
     super("codebuddy-intl");
   }
 
-  // The gateway rejects chat calls without per-request conversation IDs
-  // (HTTP 400 code 11128 "request illegal ... failed channel verification").
-  // The official client mints fresh IDs on every request, so do the same here.
+  // The gateway rejects chat calls without conversation IDs (HTTP 400 code
+  // 11128 "request illegal ... failed channel verification"). The official
+  // client keeps the conversation ID stable across a conversation and mints
+  // fresh request/message IDs on every request; do the same here.
   buildHeaders(credentials, stream = true, url, model, body = null) {
     const headers = super.buildHeaders(credentials, stream, url, model, body);
-    headers["X-Conversation-ID"] = randomUUID();
+    headers["X-Conversation-ID"] = deriveConversationId(credentials, body);
     headers["X-Conversation-Request-ID"] = randomUUID().replace(/-/g, "");
     headers["X-Conversation-Message-ID"] = randomUUID().replace(/-/g, "");
     return headers;
