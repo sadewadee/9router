@@ -118,6 +118,11 @@ async function runHeavyStartup() {
   import("@/sse/services/backgroundTokenRefresh.js")
     .then(({ startBackgroundTokenRefresh }) => startBackgroundTokenRefresh())
     .catch((e) => console.log("[BackgroundTokenRefresh] scheduler start failed:", e.message));
+
+  // Daily CodeBuddy check-in (free credits). Idempotent; CODEBUDDY_AUTO_CHECKIN=false disables it.
+  import("@/sse/services/codebuddyCheckin.js")
+    .then(({ startCodebuddyCheckin }) => startCodebuddyCheckin())
+    .catch((e) => console.log("[CodebuddyCheckin] scheduler start failed:", e.message));
 }
 
 function hasQuotaAutoPingEnabled(settings) {
