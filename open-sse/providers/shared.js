@@ -30,6 +30,25 @@ export const CLAUDE_API_HEADERS = {
   "Anthropic-Beta": "claude-code-20250219,interleaved-thinking-2025-05-14"
 };
 
+// ZCode desktop client fingerprint (mirrors buildCliZCodeSourceHeaders in the ZCode repo).
+// Z.ai bills Coding Plan traffic that enters via the official ZCode gateway (zcode.z.ai)
+// at the ZCode rate; the gateway expects these static client headers. Bump ZCODE_APP_VERSION
+// to track the current ZCode release (root package.json "version").
+export const ZCODE_APP_VERSION = "3.16.1";
+export const ZCODE_SOURCE_HEADERS = {
+  "HTTP-Referer": "https://zcode.z.ai",
+  "User-Agent": `ZCode/${ZCODE_APP_VERSION}`,
+  "X-ZCode-App-Version": ZCODE_APP_VERSION,
+  "X-Title": "Z Code@electron",
+  "X-Release-Channel": "production",
+  "X-Client-Language": "en-US",
+  "X-Client-Timezone": "Asia/Singapore",
+  "X-ZCode-Agent": "glm",
+  "X-Platform": "darwin-arm64",
+  "X-Os-Category": "macos",
+  "X-Os-Version": "25.6.0"
+};
+
 // Full Claude CLI fingerprint — required by providers that gate on client identity (e.g. agentrouter)
 export const CLAUDE_CLI_SPOOF_HEADERS = {
   "Anthropic-Version": ANTHROPIC_API_VERSION,
@@ -83,6 +102,11 @@ export const KIMI_CODING_BASE_URL = "https://api.kimi.com/coding/v1/messages";
 // Default base for dynamic compat providers (openai-compatible-* / anthropic-compatible-*) when user gives no baseUrl
 export const OPENAI_COMPAT_BASE = "https://api.openai.com/v1";
 export const ANTHROPIC_COMPAT_BASE = "https://api.anthropic.com/v1";
+
+// OpenCode Free: /zen/v1 403s every free model since 2026-10-14 (FreeTierError); the official
+// client (>=1.19) talks to /inference/v1 and the gate there also wants its full UA string.
+export const OPENCODE_FREE_BASE = "https://opencode.ai/inference/v1";
+export const OPENCODE_UA = "opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
 
 // Official Antigravity IDE Desktop 2.11.0 fingerprint captured from macOS arm64.
 // Keep this static even when 9router runs on Linux: the provider profile is

@@ -5,6 +5,8 @@ import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/sha
 import { getDefaultModel } from "open-sse/config/providerModels.js";
 import { resolveOllamaLocalHost, PROVIDERS } from "open-sse/config/providers.js";
 import { CODEX_CLI_VERSION } from "open-sse/config/appConstants.js";
+import { OPENCODE_FREE_BASE, OPENCODE_UA } from "open-sse/providers/shared.js";
+import { probeFreebuffToken } from "open-sse/executors/freebuff.js";
 import {
   refreshProviderCredentials,
   shouldRefreshCredentials,
@@ -92,6 +94,9 @@ const OAUTH_TEST_CONFIG = {
     authPrefix: "Bearer ",
   },
   "codebuddy-cn": { tokenExists: true },
+  // codebuddy-intl uses the same JWT token structure as codebuddy-cn
+  // (access + refresh token pair, ~1-year expiry) — same test strategy (#4232).
+  "codebuddy-intl": { tokenExists: true },
   kimchi: {
     url: KIMCHI_CONFIG.validationUrl || "https://api.cast.ai/v1/llm/openai/supported-providers",
     method: "GET",
@@ -126,6 +131,8 @@ const OAUTH_TEST_CONFIG = {
       402: "Connected, but Grok Build credits are exhausted (spending limit). Add credits or upgrade SuperGrok.",
     },
   },
+  // Freebuff: probed through probeFreebuffToken (direct egress, no free session consumed).
+  freebuff: { refreshable: false },
 };
 
 /**
@@ -390,6 +397,11 @@ async function testOAuthConnection(connection, effectiveProxy = null) {
     newTokens = tokens;
     accessToken = tokens.accessToken;
     return await tryProbe(accessToken);
+  }
+
+  if (connection.provider === "freebuff") {
+    const probe = await probeFreebuffToken(accessToken, effectiveProxy);
+    return { valid: probe.valid, error: probe.error, warning: probe.warning || null, refreshed: false, newTokens: null };
   }
 
   try {
@@ -752,8 +764,8 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
         return { valid, error: valid ? null : "Session expired — re-paste cookie" };
       }
       case "opencode": {
-        const res = await fetchWithConnectionProxy("https://opencode.ai/zen/v1/models", {
-          headers: { Authorization: "Bearer public", "User-Agent": "opencode/1.18.31" },
+        const res = await fetchWithConnectionProxy(`${OPENCODE_FREE_BASE}/models`, {
+          headers: { Authorization: "Bearer public", "User-Agent": OPENCODE_UA },
         }, effectiveProxy);
         return { valid: res.ok, error: res.ok ? null : "OpenCode free tier unavailable" };
       }
@@ -807,6 +819,11 @@ case "llm7": {
           headers: { Authorization: `Bearer ${connection.apiKey}` },
         }, effectiveProxy);
         return { valid: res.ok, error: res.ok ? null : "Invalid API key or base URL" };
+      }
+      case "freebuff": {
+        // Dual-auth: a pasted Codebuff authToken is checked like the OAuth access token.
+        const probe = await probeFreebuffToken(connection.apiKey, effectiveProxy);
+        return { valid: probe.valid, error: probe.error, warning: probe.warning || null, refreshed: false };
       }
       case "kimchi": {
         // Dual-auth: same validation endpoint as the OAuth flow — the token (API key

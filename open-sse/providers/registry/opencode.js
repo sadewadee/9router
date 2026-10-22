@@ -1,3 +1,5 @@
+import { OPENCODE_FREE_BASE } from "../shared.js";
+
 export default {
   id: "opencode",
   priority: 40,
@@ -13,7 +15,7 @@ export default {
   category: "free",
   noAuth: true,
   transport: {
-    baseUrl: "https://opencode.ai",
+    baseUrl: OPENCODE_FREE_BASE,
     headers: {
       "x-opencode-client": "desktop",
     },
@@ -29,6 +31,6 @@ export default {
     { id: "muse-spark-1.3-contributor-free", name: "Muse Spark 1.3 Contributor Free", targetFormat: "openai-responses" },
     { id: "union-alpha", name: "Union Alpha Free", targetFormat: "claude" },
   ],
-  modelsFetcher: { url: "https://opencode.ai/zen/v1/models", type: "opencode-free" },
+  modelsFetcher: { url: `${OPENCODE_FREE_BASE}/models`, type: "opencode-free" },
   passthroughModels: true,
 };

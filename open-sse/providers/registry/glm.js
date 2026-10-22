@@ -1,4 +1,4 @@
-import { CLAUDE_API_HEADERS } from "../shared.js";
+import { CLAUDE_API_HEADERS, ZCODE_SOURCE_HEADERS } from "../shared.js";
 
 export default {
   id: "glm",
@@ -15,33 +15,30 @@ export default {
     },
   },
   category: "apikey",
+  // Requests go through the official ZCode gateway with ZCode client headers so Z.ai bills
+  // them at the ZCode Coding Plan rate (api.z.ai/api/anthropic is rewritten to this URL by ZCode).
   transport: {
-    baseUrl: "https://api.z.ai/api/anthropic/v1/messages",
+    baseUrl: "https://zcode.z.ai/api/v1/ultra-zai/anthropic/v1/messages",
     format: "claude",
-    urlSuffix: "?beta=true",
-    headers: { ...CLAUDE_API_HEADERS },
+    headers: { ...CLAUDE_API_HEADERS, ...ZCODE_SOURCE_HEADERS },
     auth: {
       combined: true,
       header: "x-api-key",
       scheme: "raw",
+      hooks: ["zcodeGateway"],
     },
     usage: {
       url: "https://api.z.ai/api/monitor/usage/quota/limit",
     },
   },
-  // Multi-endpoint: pick the transport matching client sourceFormat to skip translation.
+  // No openai transport on purpose: coding/paas/v4 bypasses the gateway, so openai clients
+  // are translated to claude and sent through it as well.
   transports: [
     {
-      format: "openai",
-      baseUrl: "https://api.z.ai/api/coding/paas/v4/chat/completions",
-      auth: { combined: true, header: "Authorization", scheme: "bearer" },
-    },
-    {
       format: "claude",
-      baseUrl: "https://api.z.ai/api/anthropic/v1/messages",
-      urlSuffix: "?beta=true",
-      headers: { ...CLAUDE_API_HEADERS },
-      auth: { combined: true, header: "x-api-key", scheme: "raw" },
+      baseUrl: "https://zcode.z.ai/api/v1/ultra-zai/anthropic/v1/messages",
+      headers: { ...CLAUDE_API_HEADERS, ...ZCODE_SOURCE_HEADERS },
+      auth: { combined: true, header: "x-api-key", scheme: "raw", hooks: ["zcodeGateway"] },
     },
   ],
   models: [
