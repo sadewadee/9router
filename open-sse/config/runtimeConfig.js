@@ -65,6 +65,14 @@ export const SSE_HEARTBEAT_INTERVAL_MS = envMs("SSE_HEARTBEAT_INTERVAL_MS", 10 *
 // Fetch connect timeout: abort if upstream doesn't return response headers within this duration
 export const FETCH_CONNECT_TIMEOUT_MS = envMs("FETCH_CONNECT_TIMEOUT_MS", 60 * 1000);
 
+// CodeBuddy daily check-in scheduler (src/sse/services/codebuddyCheckin.js).
+// Disable with CODEBUDDY_AUTO_CHECKIN=false. Env: CODEBUDDY_CHECKIN_INTERVAL_MS.
+export const CODEBUDDY_CHECKIN_INTERVAL_MS = envMs("CODEBUDDY_CHECKIN_INTERVAL_MS", 6 * 60 * 60 * 1000);
+// First tick shortly after boot, so a fresh deploy does not wait a full interval.
+export const CODEBUDDY_CHECKIN_INITIAL_DELAY_MS = 30 * 1000;
+// Per billing call: a hung upstream must not wedge the (non-overlapping) tick.
+export const CODEBUDDY_CHECKIN_REQUEST_TIMEOUT_MS = 20 * 1000;
+
 // Gemini native TTS fetch timeout: abort if Google does not return response headers in time.
 export const GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS = envMs("GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS", 45 * 1000);
 
