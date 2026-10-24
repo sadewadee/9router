@@ -18,8 +18,11 @@ const LEAD_PROMPT = "You are CodeBuddy Code.";
  * consecutive system messages are not guaranteed to survive the per-model
  * conversion behind it. Legacy (fallback / CODEBUDDY_SYSTEM_PROMPT_MODE=legacy):
  * system/developer content is dropped and only LEAD_PROMPT is sent.
+ *
+ * `leadPrompt` / `prefixLead` let a sibling gateway swap the lead line, or send
+ * the client's system text alone (the lead then only stands in when there is none).
  */
-export function buildIntlMessages(source, { legacy = false } = {}) {
+export function buildIntlMessages(source, { legacy = false, leadPrompt = LEAD_PROMPT, prefixLead = true } = {}) {
   const systemParts = [];
   const rest = [];
   for (const message of Array.isArray(source) ? source : []) {
@@ -34,7 +37,8 @@ export function buildIntlMessages(source, { legacy = false } = {}) {
       rest.push({ ...message });
     }
   }
-  const lead = systemParts.length ? `${LEAD_PROMPT}\n\n${systemParts.join("\n\n")}` : LEAD_PROMPT;
+  const client = systemParts.join("\n\n");
+  const lead = !systemParts.length ? leadPrompt : prefixLead ? `${leadPrompt}\n\n${client}` : client;
   return [{ role: "system", content: lead }, ...rest];
 }
 
@@ -78,8 +82,9 @@ export function deriveConversationId(credentials, body) {
  * mirror reasoning_summary exactly like CodeBuddyExecutor.
  */
 export class CodeBuddyIntlExecutor extends CodeBuddyBaseExecutor {
-  constructor() {
-    super("codebuddy-intl");
+  // `provider` lets sibling gateways on the same platform (workbuddy) reuse the transform.
+  constructor(provider = "codebuddy-intl") {
+    super(provider);
   }
 
   // The gateway rejects chat calls without conversation IDs (HTTP 400 code
@@ -92,6 +97,11 @@ export class CodeBuddyIntlExecutor extends CodeBuddyBaseExecutor {
     headers["X-Conversation-Request-ID"] = randomUUID().replace(/-/g, "");
     headers["X-Conversation-Message-ID"] = randomUUID().replace(/-/g, "");
     return headers;
+  }
+
+  // Options for buildIntlMessages; a sibling gateway overrides this to change the lead prompt.
+  messageOptions(legacy) {
+    return { legacy };
   }
 
   transformRequest(model, body, stream, credentials) {
@@ -108,7 +118,7 @@ export class CodeBuddyIntlExecutor extends CodeBuddyBaseExecutor {
       transformed.reasoning_summary = "auto";
     }
 
-    transformed.messages = buildIntlMessages(transformed.messages, { legacy });
+    transformed.messages = buildIntlMessages(transformed.messages, this.messageOptions(legacy));
     if (!legacy) {
       if (Array.isArray(transformed.tools)) transformed.tools = desensitizeTools(transformed.tools);
       if (Array.isArray(transformed.functions)) transformed.functions = desensitizeTools(transformed.functions);

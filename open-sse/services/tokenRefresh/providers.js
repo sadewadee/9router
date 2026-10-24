@@ -2,6 +2,7 @@ import { PROVIDERS, PROVIDER_OAUTH } from "../../config/providers.js";
 import { OAUTH_ENDPOINTS, GITHUB_COPILOT, buildKimiHeaders } from "../../config/appConstants.js";
 import { proxyAwareFetch } from "../../utils/proxyFetch.js";
 import { dedupRefresh } from "./dedup.js";
+import { buildWorkBuddyRefreshHeaders } from "../../utils/workbuddyIdentity.js";
 import { buildExternalIdpRefreshParams } from "../../../src/lib/oauth/kiroExternalIdp.js";
 
 let _xaiServiceSingleton = null;
@@ -601,6 +602,52 @@ export async function refreshCodebuddyIntlToken(refreshToken, log) {
     }
 
     log?.info?.("TOKEN_REFRESH", "Successfully refreshed CodeBuddy intl token", {
+      hasNewAccessToken: !!data.data.accessToken,
+      hasNewRefreshToken: !!data.data.refreshToken,
+      expiresIn: data.data.expiresIn,
+    });
+
+    return {
+      accessToken: data.data.accessToken,
+      refreshToken: data.data.refreshToken || refreshToken,
+      expiresIn: data.data.expiresIn,
+    };
+  }, log);
+}
+
+// WorkBuddy (workbuddy.ai) refresh — same endpoint shape as CodeBuddy (refresh
+// token in X-Refresh-Token, empty JSON body) with the desktop client's non-chat
+// headers (single-segment WorkBuddy/<version> UA, account X-User-Id / X-Domain).
+// Response: { code: 0, data: { accessToken, refreshToken, expiresIn, domain } }.
+export async function refreshWorkbuddyToken(refreshToken, credentials, log) {
+  if (!refreshToken) return null;
+  return dedupRefresh("workbuddy", refreshToken, async () => {
+    const oauth = PROVIDER_OAUTH["workbuddy"] || {};
+    const response = await fetch(oauth.refreshUrl, {
+      method: "POST",
+      headers: buildWorkBuddyRefreshHeaders(refreshToken, credentials),
+      body: "{}",
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      log?.error?.("TOKEN_REFRESH", "Failed to refresh WorkBuddy token", {
+        status: response.status,
+        error: errorText,
+      });
+      return null;
+    }
+
+    const data = await response.json();
+    if (data.code !== 0 || !data.data?.accessToken) {
+      log?.error?.("TOKEN_REFRESH", "WorkBuddy token refresh returned no token", {
+        code: data.code,
+        msg: data.msg,
+      });
+      return null;
+    }
+
+    log?.info?.("TOKEN_REFRESH", "Successfully refreshed WorkBuddy token", {
       hasNewAccessToken: !!data.data.accessToken,
       hasNewRefreshToken: !!data.data.refreshToken,
       expiresIn: data.data.expiresIn,
