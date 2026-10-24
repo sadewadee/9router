@@ -13,7 +13,15 @@ import { proxyAwareFetch } from "../utils/proxyFetch.js";
  *   2. POST /api/v1/agent-runs {action:"START"}  -> runId (agent id resolved from the model)
  *   3. POST /api/v1/chat/completions with codebuff_metadata {run_id, client_id, cost_mode:"free",
  *      freebuff_instance_id} and a leading system message that opens with the canonical Buffy prompt
- *   4. POST /api/v1/agent-runs {action:"FINISH"} once the response ends (best effort)
+ *   4. POST /api/v1/agent-runs {action:"FINISH"} for a run that is done (best effort)
+ *
+ * Session and run lifecycle (in-memory, per token):
+ *   - One free session per token. A request for another model first releases the old session
+ *     (DELETE /api/v1/freebuff/session/attempt), otherwise a `limited` tier with slotLimit 1 keeps the
+ *     old slot for an hour and the next admission fails with purchase_capacity.
+ *   - One agent run per (token, agent), reused across requests and rotated after
+ *     FREEBUFF_RUN_ROTATION_MS (default 6h). A rotated run drains: FINISH goes out once its last
+ *     in-flight request is done. FREEBUFF_RUN_ROTATION_MS=0 restores START/FINISH on every request.
  *
  * Egress must be direct: Codebuff detects the CF-Worker header Cloudflare stamps on Worker
  * subrequests, so relay pools (Cloudflare/Vercel/Deno) are ignored for this provider.
@@ -24,6 +32,7 @@ const CHAT_URL = `${BASE_URL}/api/v1/chat/completions`;
 const AGENT_RUNS_URL = `${BASE_URL}/api/v1/agent-runs`;
 const SESSION_URL = `${BASE_URL}/api/v1/freebuff/session`;
 const SESSION_ADMISSION_URL = `${BASE_URL}/api/v1/freebuff/session/admission`;
+const SESSION_ATTEMPT_URL = `${BASE_URL}/api/v1/freebuff/session/attempt`;
 
 // User-Agent sent on every Codebuff call. Override with env FREEBUFF_USER_AGENT.
 const DEFAULT_USER_AGENT = "Freebuff-CLI/0.0.200";
@@ -81,6 +90,7 @@ const QUEUED_RETRY_MIN_SEC = 1;
 const QUEUED_RETRY_MAX_SEC = 30;
 const REFUSAL_RETRY_AFTER_SEC = 30;
 const MAX_CACHED_SESSIONS = 200;
+const DEFAULT_RUN_ROTATION_MS = 6 * 3_600_000;
 const CLI_CLAIM_PREFIX = "cli:";
 
 // Gate codes on /chat/completions that mean "your free session is gone": forget it and re-admit.
@@ -110,10 +120,17 @@ const REFUSAL_STATUS = {
   first_tab_discount_changed: 409,
 };
 
-// In-memory free sessions: `${sha1(token)}:${model}` -> session entry. Never keyed by the raw token.
+// In-memory free sessions: sha1(token) -> session entry, one per token. Never keyed by the raw token.
 const sessions = new Map();
-// Single in-flight admission per key so concurrent chat calls share one session request.
+// Single in-flight admission per token ({ model, promise }) so concurrent chat calls share one session request.
 const inflightSessions = new Map();
+
+// Agent runs reused across requests: `${sha1(token)}:${agentId}` -> run entry.
+const activeRuns = new Map();
+// Rotated or retired runs waiting for their last in-flight request before FINISH.
+const drainingRuns = new Set();
+// Single in-flight START per run key so concurrent requests share one agent run.
+const inflightRunStarts = new Map();
 
 // Relay pool URLs already warned about (one warning per relay per process).
 const warnedRelays = new Set();
@@ -147,8 +164,20 @@ function tokenOf(credentials) {
   return typeof token === "string" ? token.trim() : "";
 }
 
-function sessionKey(token, model) {
-  return `${createHash("sha1").update(token).digest("hex")}:${model}`;
+function sessionKey(token) {
+  return createHash("sha1").update(token).digest("hex");
+}
+
+function runKey(token, agentId) {
+  return `${sessionKey(token)}:${agentId}`;
+}
+
+// Read at request time (not import time) so a restart is enough to flip it. 0 = a run per request.
+function runRotationMs() {
+  const raw = String(process.env.FREEBUFF_RUN_ROTATION_MS ?? "").trim();
+  if (!raw) return DEFAULT_RUN_ROTATION_MS;
+  const ms = Number(raw);
+  return Number.isFinite(ms) && ms >= 0 ? Math.floor(ms) : DEFAULT_RUN_ROTATION_MS;
 }
 
 function isTruthyEnv(name) {
@@ -274,15 +303,22 @@ function pruneSessions() {
   }
 }
 
-function clearSessionCache(token = null, model = null) {
-  if (token && model) {
-    sessions.delete(sessionKey(token, model));
-  } else if (token) {
-    const prefix = `${sessionKey(token, "")}`;
-    for (const key of sessions.keys()) if (key.startsWith(prefix)) sessions.delete(key);
-  } else {
+// Forget a session the upstream reports as gone (nothing to release). With an instance id only that
+// session is dropped, so a stale failure cannot wipe the fresh session a model switch just opened.
+function clearSessionCache(token = null, instanceId = null) {
+  if (!token) {
     sessions.clear();
+    return;
   }
+  const key = sessionKey(token);
+  if (instanceId && sessions.get(key)?.instanceId !== instanceId) return;
+  sessions.delete(key);
+}
+
+function clearRunCache() {
+  activeRuns.clear();
+  drainingRuns.clear();
+  inflightRunStarts.clear();
 }
 
 // Normalise one admission (or queue poll) answer into a session state or throw a FreebuffHttpError.
@@ -365,7 +401,10 @@ async function admitOnce(token, model, ctx) {
     // No session route at all: the waiting room is off, chat needs no instance id.
     if (result.status === 404) return { type: "disabled" };
   }
-  return interpretSession(result, model, claimId, multi);
+  const state = interpretSession(result, model, claimId, multi);
+  // Releasing the claim later must send the very pair of ids this admission used.
+  if (multi && (state.type === "active" || state.type === "queued")) Object.assign(state, { attemptId, claimId });
+  return state;
 }
 
 // Poll a queued session by instance id (only used for servers that still queue).
@@ -377,6 +416,7 @@ async function pollQueued(token, entry, model, ctx) {
 }
 
 async function resolveSession(token, model, ctx, cached, allowModelLockRetry = true) {
+  const key = sessionKey(token);
   let state = cached?.type === "queued" ? await pollQueued(token, cached, model, ctx) : { type: "restart" };
   // "restart": the poll/admission says there is no usable row; POST a fresh admission (max 2 tries).
   for (let attempt = 0; state.type === "restart" && attempt < 2; attempt++) {
@@ -387,30 +427,43 @@ async function resolveSession(token, model, ctx, cached, allowModelLockRetry = t
     const locked = state.currentModel;
     if (allowModelLockRetry && locked && locked !== model && FREEBUFF_AGENT_ID_BY_MODEL[locked]) {
       ctx.log?.info?.("FREEBUFF", `Session locked to ${locked}; using it instead of ${model}`);
-      const resolved = await resolveSession(token, locked, ctx, null, false);
-      // Remember the lock under the requested model too, or every request would repeat the admission.
-      const lockedEntry = sessions.get(sessionKey(token, locked));
-      if (lockedEntry) sessions.set(sessionKey(token, model), lockedEntry);
-      return { ...resolved, lockedFrom: model };
+      try {
+        const resolved = await resolveSession(token, locked, ctx, null, false);
+        return { ...resolved, lockedFrom: model };
+      } finally {
+        // Remember the lock under the requested model too, or every request would repeat the admission.
+        const lockedEntry = sessions.get(key);
+        if (lockedEntry?.model === locked) lockedEntry.serves.add(model);
+      }
     }
     throw new FreebuffHttpError(409, "model_locked", `Freebuff: an active session is locked to ${locked || "another model"}`, {
       upstream: { status: "model_locked", currentModel: locked, requestedModel: model },
     });
   }
+
+  // Models this entry answers for: the requested one (also across a queue poll) and the one it really runs.
+  const serves = new Set([model, ...(cached?.type === "queued" ? cached.serves : [])]);
+  // The claim ids come from the admission, or from the queued claim a poll just promoted.
+  const claimSource = state.attemptId ? state : cached?.type === "queued" ? cached : null;
+  const claim = claimSource ? { attemptId: claimSource.attemptId, claimId: claimSource.claimId } : {};
+
   if (state.type === "queued") {
-    sessions.set(sessionKey(token, model), {
+    sessions.set(key, {
       type: "queued",
+      model,
+      serves,
       instanceId: state.instanceId,
       retryAtMs: Date.now() + state.retryAfterSec * 1000,
       position: state.position,
       queueDepth: state.queueDepth,
       retryAfterSec: state.retryAfterSec,
+      ...claim,
     });
     throw queuedError(state.instanceId, state.position, state.queueDepth, state.retryAfterSec);
   }
   if (state.type === "disabled") {
-    const entry = { type: "disabled", instanceId: "", model, multi: false, expiresAt: Date.now() + DISABLED_SESSION_TTL_MS };
-    sessions.set(sessionKey(token, model), entry);
+    const entry = { type: "disabled", instanceId: "", model, serves, multi: false, expiresAt: Date.now() + DISABLED_SESSION_TTL_MS };
+    sessions.set(key, entry);
     return { instanceId: "", resolvedModel: model, multi: false };
   }
   if (state.type !== "active") {
@@ -418,35 +471,70 @@ async function resolveSession(token, model, ctx, cached, allowModelLockRetry = t
   }
 
   const expiresAt = Date.now() + Math.max(1000, state.ttlMs - SESSION_EXPIRY_MARGIN_MS);
-  const entry = { type: "active", instanceId: state.instanceId, model: state.model, multi: state.multi, expiresAt };
+  serves.add(state.model);
+  const entry = { type: "active", instanceId: state.instanceId, model: state.model, serves, multi: state.multi, expiresAt, ...claim };
   pruneSessions();
-  sessions.set(sessionKey(token, model), entry);
+  sessions.set(key, entry);
   return { instanceId: entry.instanceId, resolvedModel: entry.model, multi: entry.multi };
 }
 
-// Session for (token, model): cached until near expiry; one shared in-flight admission per key.
-async function getFreebuffSession(token, model = DEFAULT_MODEL, ctx = {}) {
-  const key = sessionKey(token, model);
-  const now = Date.now();
-  const cached = sessions.get(key);
-  if (cached?.type === "active" && now < cached.expiresAt) {
-    return { instanceId: cached.instanceId, resolvedModel: cached.model, multi: cached.multi };
+// Give the slot of a free session back before another model is admitted: DELETE /session/attempt with
+// the claim's own attempt/instance headers (the refund is automatic). Best effort: a failure is logged
+// and never fails the request that triggered the switch.
+async function releaseSession(token, entry, nextModel, ctx) {
+  const key = sessionKey(token);
+  if (sessions.get(key) === entry) sessions.delete(key);
+  ctx.log?.info?.("FREEBUFF", `Releasing the ${entry.model} session before admitting ${nextModel}`);
+  // The old session's runs are not going to be used again; end them once their requests are done.
+  if (entry.type === "active") retireRuns(token, FREEBUFF_AGENT_ID_BY_MODEL[entry.model]);
+  // Claims from the legacy session route carry no attempt id and cannot be released this way.
+  if (!entry.attemptId) return;
+  const headers = jsonHeaders(token, { [HEADER_ATTEMPT]: entry.attemptId, [HEADER_INSTANCE]: entry.claimId });
+  try {
+    const result = await callJson(SESSION_ATTEMPT_URL, { method: "DELETE", headers }, ctx.proxyOptions);
+    if (!result.ok && result.status !== 404) {
+      ctx.log?.warn?.("FREEBUFF", `Releasing the ${entry.model} session answered ${result.status}`);
+    }
+  } catch (err) {
+    ctx.log?.warn?.("FREEBUFF", `Releasing the ${entry.model} session failed: ${err?.message || err}`);
   }
-  if (cached?.type === "disabled" && now < cached.expiresAt) {
-    return { instanceId: "", resolvedModel: cached.model, multi: false };
-  }
-  if (cached?.type === "queued" && now < cached.retryAtMs) {
-    throw queuedError(cached.instanceId, cached.position, cached.queueDepth, Math.max(1, Math.ceil((cached.retryAtMs - now) / 1000)));
-  }
+}
 
-  let pending = inflightSessions.get(key);
-  if (!pending) {
+// Session for a token: cached until near expiry; one shared in-flight admission per token. The token
+// owns a single session, so asking for a model it does not serve releases the old one first.
+async function getFreebuffSession(token, model = DEFAULT_MODEL, ctx = {}) {
+  const key = sessionKey(token);
+  for (;;) {
+    const pending = inflightSessions.get(key);
+    if (pending && pending.model !== model) {
+      // A switch to another model is under way: let it settle, then judge against what it left behind.
+      await pending.promise.catch(() => {});
+      continue;
+    }
+
+    const now = Date.now();
+    const cached = sessions.get(key);
+    const serves = cached?.serves.has(model) === true;
+    if (serves && cached.type === "active" && now < cached.expiresAt) {
+      return { instanceId: cached.instanceId, resolvedModel: cached.model, multi: cached.multi };
+    }
+    if (serves && cached.type === "disabled" && now < cached.expiresAt) {
+      return { instanceId: "", resolvedModel: cached.model, multi: false };
+    }
+    if (serves && cached.type === "queued" && now < cached.retryAtMs) {
+      throw queuedError(cached.instanceId, cached.position, cached.queueDepth, Math.max(1, Math.ceil((cached.retryAtMs - now) / 1000)));
+    }
+    if (pending) return pending.promise;
+
     // The admission is shared by every waiting request, so it must not die with the first caller's abort signal.
     const sharedCtx = { ...ctx, signal: undefined };
-    pending = resolveSession(token, model, sharedCtx, cached).finally(() => inflightSessions.delete(key));
-    inflightSessions.set(key, pending);
+    const promise = (async () => {
+      if (cached && !serves) await releaseSession(token, cached, model, sharedCtx);
+      return resolveSession(token, model, sharedCtx, serves ? cached : null);
+    })().finally(() => inflightSessions.delete(key));
+    inflightSessions.set(key, { model, promise });
+    return promise;
   }
-  return pending;
 }
 
 async function startAgentRun(token, agentId, ctx = {}) {
@@ -470,15 +558,101 @@ async function startAgentRun(token, agentId, ctx = {}) {
 }
 
 // Best effort: the call is issued synchronously, failures are swallowed.
-function finishAgentRun(token, runId, status = "completed", ctx = {}, errorMessage = "") {
+function finishAgentRun(token, runId, status = "completed", ctx = {}, errorMessage = "", { totalSteps = 1 } = {}) {
   if (!runId) return Promise.resolve();
-  const payload = { action: "FINISH", runId, status, totalSteps: 1, directCredits: 0, totalCredits: 0, steps: [] };
+  const payload = { action: "FINISH", runId, status, totalSteps, directCredits: 0, totalCredits: 0, steps: [] };
   if (errorMessage) payload.errorMessage = String(errorMessage).slice(0, 5000);
   return callJson(
     AGENT_RUNS_URL,
     { method: "POST", headers: jsonHeaders(token, { "Content-Type": "application/json" }), body: JSON.stringify(payload) },
     ctx.proxyOptions,
   ).catch(() => {});
+}
+
+// FINISH a run that is no longer current once its last in-flight request is done.
+function finishIfReady(run) {
+  if (run.dead || run.finishing || run.inflight > 0 || activeRuns.get(run.key) === run) return;
+  run.finishing = true;
+  drainingRuns.delete(run);
+  void finishAgentRun(run.token, run.id, "completed", { proxyOptions: run.proxyOptions }, "", { totalSteps: run.requestCount });
+}
+
+// Stop handing out the run of this agent; it drains and FINISHes after its in-flight requests.
+function retireRuns(token, agentId) {
+  const key = runKey(token, agentId);
+  const run = activeRuns.get(key);
+  if (!run) return;
+  activeRuns.delete(key);
+  drainingRuns.add(run);
+  finishIfReady(run);
+}
+
+// START a run and make it the current one for its (token, agent); the run it replaces starts draining.
+async function startManagedRun(token, agentId, key, ctx) {
+  const id = await startAgentRun(token, agentId, ctx);
+  const run = { id, key, token, agentId, proxyOptions: ctx.proxyOptions, startedAt: Date.now(), inflight: 0, requestCount: 0 };
+  const previous = activeRuns.get(key);
+  activeRuns.set(key, run);
+  if (previous) {
+    ctx.log?.debug?.("FREEBUFF", `Agent run ${previous.id} rotated out after ${previous.requestCount} request(s), now ${id}`);
+    drainingRuns.add(previous);
+    finishIfReady(previous);
+  }
+  return run;
+}
+
+// A run for one request: { runId, release(status, message), invalidate() }. release() is idempotent.
+// By default the run is shared with the other requests of this token and agent (see the header);
+// with FREEBUFF_RUN_ROTATION_MS=0 every request gets its own START and FINISH.
+async function acquireAgentRun(token, agentId, ctx = {}) {
+  const rotationMs = runRotationMs();
+  if (rotationMs === 0) {
+    const runId = await startAgentRun(token, agentId, ctx);
+    let released = false;
+    return {
+      runId,
+      release(status, message) {
+        if (released) return;
+        released = true;
+        void finishAgentRun(token, runId, status, ctx, message);
+      },
+      invalidate() {},
+    };
+  }
+
+  const key = runKey(token, agentId);
+  let run = activeRuns.get(key);
+  if (!run || Date.now() - run.startedAt >= rotationMs) {
+    let pending = inflightRunStarts.get(key);
+    if (!pending) {
+      // The START is shared by every waiting request, so it must not die with the first caller's abort signal.
+      const sharedCtx = { ...ctx, signal: undefined };
+      // A failed START is not cached: the entry only becomes the current run once START answered.
+      pending = startManagedRun(token, agentId, key, sharedCtx).finally(() => inflightRunStarts.delete(key));
+      inflightRunStarts.set(key, pending);
+    }
+    run = await pending;
+  }
+
+  run.inflight++;
+  run.requestCount++;
+  run.proxyOptions = ctx.proxyOptions;
+  let released = false;
+  return {
+    runId: run.id,
+    release() {
+      if (released) return;
+      released = true;
+      run.inflight = Math.max(0, run.inflight - 1);
+      finishIfReady(run);
+    },
+    // The upstream no longer knows this run: nobody reuses it and there is nothing left to FINISH.
+    invalidate() {
+      run.dead = true;
+      if (activeRuns.get(run.key) === run) activeRuns.delete(run.key);
+      drainingRuns.delete(run);
+    },
+  };
 }
 
 function messageText(content) {
@@ -613,12 +787,15 @@ async function readErrorBody(response) {
   }
 }
 
-function isRetriableGateError(status, errText) {
+// What a rejected chat call asks us to renew before one retry: "session" (re-admit), "run" (fresh
+// START, the session is fine) or null (pass the error through).
+function gateRetryKind(status, errText) {
   const data = parseJson(errText);
   const code = typeof data?.error === "string" ? data.error : "";
-  if (code === "freebuff_update_required" || (code && SESSION_INVALID_CODES.has(code))) return true;
-  // The run vanished server side (per-request runs make this rare); a fresh START fixes it.
-  return status === 400 && /runid not (found|running)/i.test(errText);
+  if (code === "freebuff_update_required" || (code && SESSION_INVALID_CODES.has(code))) return "session";
+  // The run vanished server side (a long-lived run can expire); a fresh START fixes it.
+  if (status === 400 && /runid not (found|running)/i.test(errText)) return "run";
+  return null;
 }
 
 // Finish the agent run when the response body ends, errors or is cancelled.
@@ -740,7 +917,7 @@ export class FreebuffExecutor extends BaseExecutor {
 
     for (let attempt = 0; attempt < 2; attempt++) {
       let session;
-      let runId = null;
+      let lease = null;
       let startFailed = false;
       try {
         session = await getFreebuffSession(token, targetModel, ctx);
@@ -753,14 +930,14 @@ export class FreebuffExecutor extends BaseExecutor {
           );
         }
         startFailed = true;
-        runId = await startAgentRun(token, agentId, ctx);
+        lease = await acquireAgentRun(token, agentId, ctx);
         startFailed = false;
       } catch (err) {
         if (err instanceof FreebuffHttpError) {
           // A START that reports a dead session (not our own queued answer) gets one fresh admission.
           if (startFailed && attempt === 0 && SESSION_INVALID_CODES.has(err.code)) {
             log?.debug?.("FREEBUFF", `Agent run START reported ${err.code}, re-admitting`);
-            clearSessionCache(token, targetModel);
+            clearSessionCache(token, session.instanceId);
             continue;
           }
           log?.debug?.("FREEBUFF", `Session/run initialization refused (${err.status} ${err.code})`);
@@ -769,14 +946,22 @@ export class FreebuffExecutor extends BaseExecutor {
         throw err;
       }
 
-      const transformedBody = buildChatBody(body, {
-        model: session.resolvedModel,
-        runId,
-        instanceId: session.instanceId,
-        multi: session.multi,
-        stream,
-      });
-      const bodyStr = JSON.stringify(transformedBody);
+      const runId = lease.runId;
+      let transformedBody;
+      let bodyStr;
+      try {
+        transformedBody = buildChatBody(body, {
+          model: session.resolvedModel,
+          runId,
+          instanceId: session.instanceId,
+          multi: session.multi,
+          stream,
+        });
+        bodyStr = JSON.stringify(transformedBody);
+      } catch (error) {
+        lease.release("failed", error.message);
+        throw error;
+      }
       log?.debug?.("FETCH", `FREEBUFF -> ${url} | model=${session.resolvedModel} runId=${runId} | body=${bodyStr.length}B`);
 
       // Abort if upstream doesn't return response headers within the connection timeout.
@@ -790,7 +975,7 @@ export class FreebuffExecutor extends BaseExecutor {
         response = await proxyAwareFetch(url, { method: "POST", headers, body: bodyStr, signal: mergedSignal }, ctx.proxyOptions);
       } catch (error) {
         clearTimeout(connectTimer);
-        void finishAgentRun(token, runId, "failed", ctx, error.message);
+        lease.release("failed", error.message);
         if (connectCtrl.signal.aborted && error.name === "AbortError" && !signal?.aborted) {
           throw new Error("Freebuff fetch connect timeout");
         }
@@ -800,18 +985,18 @@ export class FreebuffExecutor extends BaseExecutor {
 
       if (!response.ok) {
         const errText = await readErrorBody(response);
-        void finishAgentRun(token, runId, "failed", ctx, `${response.status} ${errText.slice(0, 200)}`);
-        if (attempt === 0 && isRetriableGateError(response.status, errText)) {
-          log?.debug?.("FREEBUFF", `Session gate rejected the request (${response.status}), re-admitting`);
-          clearSessionCache(token, targetModel);
+        const retry = attempt === 0 ? gateRetryKind(response.status, errText) : null;
+        if (retry === "run") lease.invalidate();
+        lease.release("failed", `${response.status} ${errText.slice(0, 200)}`);
+        if (retry) {
+          log?.debug?.("FREEBUFF", `Chat gate rejected the request (${response.status}), renewing the ${retry}`);
+          if (retry === "session") clearSessionCache(token, session.instanceId);
           continue;
         }
         return { response, url, headers, transformedBody };
       }
 
-      const wrapped = wrapStreamWithCleanup(response, (status, message) => {
-        void finishAgentRun(token, runId, status, ctx, message);
-      });
+      const wrapped = wrapStreamWithCleanup(response, (status, message) => lease.release(status, message));
       return { response: wrapped, url, headers, transformedBody };
     }
 
@@ -831,18 +1016,24 @@ export const __test__ = {
   directEgressOptions,
   generateClientId,
   clearSessionCache,
+  clearRunCache,
+  runRotationMs,
   resolveModel,
   tokenOf,
   sessions,
+  activeRuns,
+  drainingRuns,
   warnedRelays,
   ROOT_SYSTEM_PROMPT,
   DEFAULT_MODEL,
   DEFAULT_USER_AGENT,
+  DEFAULT_RUN_ROTATION_MS,
   BASE_URL,
   CHAT_URL,
   AGENT_RUNS_URL,
   SESSION_URL,
   SESSION_ADMISSION_URL,
+  SESSION_ATTEMPT_URL,
 };
 
 export default FreebuffExecutor;

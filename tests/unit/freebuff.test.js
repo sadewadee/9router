@@ -46,7 +46,11 @@ const {
   directEgressOptions,
   generateClientId,
   clearSessionCache,
+  clearRunCache,
+  runRotationMs,
   sessions,
+  activeRuns,
+  drainingRuns,
   warnedRelays,
   ROOT_SYSTEM_PROMPT,
   DEFAULT_MODEL,
@@ -55,6 +59,8 @@ const {
   AGENT_RUNS_URL,
   SESSION_URL,
   SESSION_ADMISSION_URL,
+  SESSION_ATTEMPT_URL,
+  DEFAULT_RUN_ROTATION_MS,
 } = __test__;
 
 // ---------------------------------------------------------------------------
@@ -102,6 +108,9 @@ function parseCall([url, init, opts]) {
 const allCalls = () => fetchMock.mock.calls.map(parseCall);
 const callsTo = (url, method) => allCalls().filter((c) => c.url === url && (!method || c.method === method));
 const agentRunCalls = (action) => callsTo(AGENT_RUNS_URL, "POST").filter((c) => c.body?.action === action);
+const releaseCalls = () => callsTo(SESSION_ATTEMPT_URL, "DELETE");
+const activeSession = (headers) =>
+  json({ status: "active", instanceId: headers["x-freebuff-instance-id"], model: headers["x-freebuff-model"], remainingMs: 600_000 });
 
 /**
  * Default upstream: admission echoes the claim id back as an active session, START hands out
@@ -121,6 +130,7 @@ function installUpstream(overrides = {}) {
     session: () => json({ status: "none" }),
     start: () => json({ runId: `run-${++runSeq}` }),
     finish: () => json({}),
+    release: () => json({}),
     chat: () => sse(),
     ...overrides,
   };
@@ -129,6 +139,7 @@ function installUpstream(overrides = {}) {
     const body = init?.body ? JSON.parse(init.body) : null;
     if (url === SESSION_ADMISSION_URL) return handlers.admission(headers, body);
     if (url === SESSION_URL) return handlers.session(headers, init?.method);
+    if (url === SESSION_ATTEMPT_URL) return handlers.release(headers, init?.method);
     if (url === AGENT_RUNS_URL) return body?.action === "FINISH" ? handlers.finish(body) : handlers.start(body);
     if (url === CHAT_URL) return handlers.chat(body, headers);
     throw new Error(`unexpected fetch to ${url}`);
@@ -155,18 +166,24 @@ function makeExecuteArgs(overrides = {}) {
 
 const executor = new FreebuffExecutor();
 
+// The handshake/lifecycle tests assert one START and one FINISH per request, which is the legacy mode
+// (FREEBUFF_RUN_ROTATION_MS=0). The default run reuse has its own section further down.
 beforeEach(() => {
   fetchMock.mockReset();
   clearSessionCache();
+  clearRunCache();
   warnedRelays.clear();
   delete process.env.FREEBUFF_FOLD_TOOLS;
   delete process.env.FREEBUFF_USER_AGENT;
+  process.env.FREEBUFF_RUN_ROTATION_MS = "0";
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   delete process.env.FREEBUFF_FOLD_TOOLS;
   delete process.env.FREEBUFF_USER_AGENT;
+  delete process.env.FREEBUFF_RUN_ROTATION_MS;
 });
 
 // ---------------------------------------------------------------------------
@@ -908,6 +925,638 @@ describe("free session handling", () => {
     const queued = await executor.execute(makeExecuteArgs());
     expect(queued.response.status).toBe(503);
     expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// run reuse and rotation (the default; FREEBUFF_RUN_ROTATION_MS=0 is the legacy mode above)
+// ---------------------------------------------------------------------------
+
+describe("agent run reuse", () => {
+  beforeEach(() => {
+    delete process.env.FREEBUFF_RUN_ROTATION_MS;
+  });
+
+  const GLM = "z-ai/glm-5.3-flash";
+
+  it("reuses one run across sequential requests: one admission, one START, no FINISH in between", async () => {
+    installUpstream();
+    const credentials = { accessToken: newToken() };
+
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+
+    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
+    expect(agentRunCalls("START")).toHaveLength(1);
+    expect(agentRunCalls("FINISH")).toHaveLength(0);
+    const [first, second] = callsTo(CHAT_URL);
+    expect(first.body.codebuff_metadata.run_id).toBe("run-1");
+    expect(second.body.codebuff_metadata.run_id).toBe("run-1");
+
+    const [run] = [...activeRuns.values()];
+    expect(activeRuns.size).toBe(1);
+    expect(run).toMatchObject({ id: "run-1", agentId: "base3-free-mimo", inflight: 0, requestCount: 2 });
+  });
+
+  it("keeps a run per agent: another model on the same token gets its own run", async () => {
+    installUpstream();
+    const credentials = { accessToken: newToken() };
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    await drain((await executor.execute(makeExecuteArgs({ credentials, model: GLM }))).response);
+    expect(agentRunCalls("START").map((c) => c.body.agentId)).toEqual(["base3-free-mimo", "base3-free-glm-5-3-flash"]);
+  });
+
+  it("does not share runs across tokens", async () => {
+    installUpstream();
+    await drain((await executor.execute(makeExecuteArgs())).response);
+    await drain((await executor.execute(makeExecuteArgs())).response);
+    expect(agentRunCalls("START")).toHaveLength(2);
+    expect(activeRuns.size).toBe(2);
+    for (const key of activeRuns.keys()) expect(key).not.toContain("fb-test-token");
+  });
+
+  it("shares one admission and one START between concurrent requests", async () => {
+    let release;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    installUpstream({
+      admission: async (headers) => {
+        await gate;
+        return activeSession(headers);
+      },
+      start: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return json({ runId: "run-shared" });
+      },
+    });
+    const credentials = { accessToken: newToken() };
+    const runs = [0, 1, 2].map(() => executor.execute(makeExecuteArgs({ credentials })));
+    await vi.waitFor(() => expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1));
+    release();
+    for (const r of await Promise.all(runs)) await drain(r.response);
+
+    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
+    expect(agentRunCalls("START")).toHaveLength(1);
+    expect(callsTo(CHAT_URL).map((c) => c.body.codebuff_metadata.run_id)).toEqual(["run-shared", "run-shared", "run-shared"]);
+    expect([...activeRuns.values()][0]).toMatchObject({ inflight: 0, requestCount: 3 });
+    expect(agentRunCalls("FINISH")).toHaveLength(0);
+  });
+
+  it("does not cache a failed START", async () => {
+    let starts = 0;
+    installUpstream({
+      start: () => {
+        starts += 1;
+        return starts === 1 ? json({ error: "boom" }, { status: 500 }) : json({ runId: "run-ok" });
+      },
+    });
+    const credentials = { accessToken: newToken() };
+
+    const failed = await executor.execute(makeExecuteArgs({ credentials }));
+    expect(failed.response.status).toBe(500);
+    expect(activeRuns.size).toBe(0);
+    expect(callsTo(CHAT_URL)).toHaveLength(0);
+
+    const ok = await executor.execute(makeExecuteArgs({ credentials }));
+    expect(ok.response.status).toBe(200);
+    await drain(ok.response);
+    expect(agentRunCalls("START")).toHaveLength(2);
+    expect(callsTo(CHAT_URL)[0].body.codebuff_metadata.run_id).toBe("run-ok");
+    expect([...activeRuns.values()].map((r) => r.id)).toEqual(["run-ok"]);
+  });
+
+  it("hands a START failure to every request that waited on it, then starts again", async () => {
+    let starts = 0;
+    installUpstream({
+      start: async () => {
+        starts += 1;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return starts === 1 ? json({ error: "boom" }, { status: 503 }) : json({ runId: "run-ok" });
+      },
+    });
+    const credentials = { accessToken: newToken() };
+    const results = await Promise.all([executor.execute(makeExecuteArgs({ credentials })), executor.execute(makeExecuteArgs({ credentials }))]);
+    expect(results.map((r) => r.response.status)).toEqual([503, 503]);
+    expect(agentRunCalls("START")).toHaveLength(1);
+
+    const ok = await executor.execute(makeExecuteArgs({ credentials }));
+    expect(ok.response.status).toBe(200);
+    await drain(ok.response);
+    expect(agentRunCalls("START")).toHaveLength(2);
+  });
+
+  it("leaves a reused run alone when a request fails", async () => {
+    let chats = 0;
+    installUpstream({
+      chat: () => {
+        chats += 1;
+        if (chats === 1) return json({ error: "upstream_down" }, { status: 500 });
+        if (chats === 2) throw new Error("socket hang up");
+        return sse();
+      },
+    });
+    const credentials = { accessToken: newToken() };
+    expect((await executor.execute(makeExecuteArgs({ credentials }))).response.status).toBe(500);
+    await expect(executor.execute(makeExecuteArgs({ credentials }))).rejects.toThrow("socket hang up");
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+
+    expect(agentRunCalls("START")).toHaveLength(1);
+    expect(agentRunCalls("FINISH")).toHaveLength(0);
+    expect([...activeRuns.values()][0]).toMatchObject({ id: "run-1", inflight: 0, requestCount: 3 });
+  });
+
+  it("keeps the run when the chat gate sends the session away", async () => {
+    let chats = 0;
+    installUpstream({
+      chat: () => {
+        chats += 1;
+        return chats === 1 ? json({ error: "session_superseded", message: "Another session took over" }, { status: 409 }) : sse();
+      },
+    });
+    const { response } = await executor.execute(makeExecuteArgs());
+    expect(response.status).toBe(200);
+    await drain(response);
+    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(2);
+    expect(agentRunCalls("START")).toHaveLength(1);
+    expect(agentRunCalls("FINISH")).toHaveLength(0);
+    expect(callsTo(CHAT_URL).map((c) => c.body.codebuff_metadata.run_id)).toEqual(["run-1", "run-1"]);
+  });
+
+  it("replaces a run the upstream no longer knows without touching the session or finishing it", async () => {
+    let chats = 0;
+    installUpstream({
+      chat: () => {
+        chats += 1;
+        return chats === 1 ? json({ error: "bad_request", message: "runId not found" }, { status: 400 }) : sse();
+      },
+    });
+    const { response } = await executor.execute(makeExecuteArgs());
+    expect(response.status).toBe(200);
+    await drain(response);
+
+    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
+    expect(agentRunCalls("START")).toHaveLength(2);
+    expect(agentRunCalls("FINISH")).toHaveLength(0);
+    expect(callsTo(CHAT_URL).map((c) => c.body.codebuff_metadata.run_id)).toEqual(["run-1", "run-2"]);
+    expect([...activeRuns.values()].map((r) => r.id)).toEqual(["run-2"]);
+    expect(drainingRuns.size).toBe(0);
+  });
+
+  describe("rotation", () => {
+    it("rotates after the interval and finishes the old run only once its last request is done", async () => {
+      process.env.FREEBUFF_RUN_ROTATION_MS = "60000";
+      vi.useFakeTimers({ toFake: ["Date"] });
+      installUpstream();
+      const credentials = { accessToken: newToken() };
+
+      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+      const stillStreaming = await executor.execute(makeExecuteArgs({ credentials }));
+      expect(agentRunCalls("START")).toHaveLength(1);
+
+      vi.advanceTimersByTime(59_000);
+      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+      expect(agentRunCalls("START")).toHaveLength(1);
+
+      vi.advanceTimersByTime(2_000);
+      const rotated = await executor.execute(makeExecuteArgs({ credentials }));
+      expect(rotated.response.status).toBe(200);
+      expect(agentRunCalls("START")).toHaveLength(2);
+      expect(callsTo(CHAT_URL).map((c) => c.body.codebuff_metadata.run_id)).toEqual(["run-1", "run-1", "run-1", "run-2"]);
+
+      // run-1 still has a request in flight: it drains, no FINISH yet
+      expect(agentRunCalls("FINISH")).toHaveLength(0);
+      expect(drainingRuns.size).toBe(1);
+
+      await drain(stillStreaming.response);
+      expect(agentRunCalls("FINISH")).toHaveLength(1);
+      expect(agentRunCalls("FINISH")[0].body).toEqual({
+        action: "FINISH",
+        runId: "run-1",
+        status: "completed",
+        totalSteps: 3,
+        directCredits: 0,
+        totalCredits: 0,
+        steps: [],
+      });
+      expect(drainingRuns.size).toBe(0);
+
+      // the current run is never finished by its own requests
+      await drain(rotated.response);
+      expect(agentRunCalls("FINISH")).toHaveLength(1);
+      expect([...activeRuns.values()].map((r) => r.id)).toEqual(["run-2"]);
+    });
+
+    it("finishes an idle run right away when it rotates", async () => {
+      process.env.FREEBUFF_RUN_ROTATION_MS = "1000";
+      vi.useFakeTimers({ toFake: ["Date"] });
+      installUpstream();
+      const credentials = { accessToken: newToken() };
+
+      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+      vi.advanceTimersByTime(1_500);
+      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+
+      expect(agentRunCalls("START")).toHaveLength(2);
+      expect(agentRunCalls("FINISH")).toHaveLength(1);
+      expect(agentRunCalls("FINISH")[0].body).toMatchObject({ runId: "run-1", status: "completed", totalSteps: 1 });
+    });
+
+    it("keeps the old run when the replacement START fails, and retries on the next request", async () => {
+      process.env.FREEBUFF_RUN_ROTATION_MS = "1000";
+      vi.useFakeTimers({ toFake: ["Date"] });
+      let starts = 0;
+      installUpstream({
+        start: () => {
+          starts += 1;
+          return starts === 2 ? json({ error: "boom" }, { status: 500 }) : json({ runId: `run-${starts}` });
+        },
+      });
+      const credentials = { accessToken: newToken() };
+      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+      vi.advanceTimersByTime(1_500);
+
+      expect((await executor.execute(makeExecuteArgs({ credentials }))).response.status).toBe(500);
+      expect(agentRunCalls("FINISH")).toHaveLength(0);
+      expect([...activeRuns.values()].map((r) => r.id)).toEqual(["run-1"]);
+
+      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+      expect([...activeRuns.values()].map((r) => r.id)).toEqual(["run-3"]);
+      expect(agentRunCalls("FINISH").map((c) => c.body.runId)).toEqual(["run-1"]);
+    });
+
+    it("defaults to six hours and falls back to it for a bad value", () => {
+      expect(DEFAULT_RUN_ROTATION_MS).toBe(6 * 3_600_000);
+      expect(runRotationMs()).toBe(DEFAULT_RUN_ROTATION_MS);
+      for (const bad of ["abc", "-5", "NaN", "  "]) {
+        process.env.FREEBUFF_RUN_ROTATION_MS = bad;
+        expect(runRotationMs()).toBe(DEFAULT_RUN_ROTATION_MS);
+      }
+      process.env.FREEBUFF_RUN_ROTATION_MS = "0";
+      expect(runRotationMs()).toBe(0);
+      process.env.FREEBUFF_RUN_ROTATION_MS = "1500.9";
+      expect(runRotationMs()).toBe(1500);
+    });
+
+    it("keeps one run for hours at the default interval", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      installUpstream({
+        admission: (headers) =>
+          json({ status: "active", instanceId: headers["x-freebuff-instance-id"], model: headers["x-freebuff-model"], remainingMs: 40_000_000 }),
+      });
+      const credentials = { accessToken: newToken() };
+      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+      vi.advanceTimersByTime(DEFAULT_RUN_ROTATION_MS - 60_000);
+      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+      expect(agentRunCalls("START")).toHaveLength(1);
+      vi.advanceTimersByTime(120_000);
+      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+      expect(agentRunCalls("START")).toHaveLength(2);
+    });
+  });
+
+  it("FREEBUFF_RUN_ROTATION_MS=0 restores a START and a FINISH for every request", async () => {
+    process.env.FREEBUFF_RUN_ROTATION_MS = "0";
+    installUpstream();
+    const credentials = { accessToken: newToken() };
+
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    await vi.waitFor(() => expect(agentRunCalls("FINISH")).toHaveLength(1));
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    await vi.waitFor(() => expect(agentRunCalls("FINISH")).toHaveLength(2));
+
+    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
+    expect(agentRunCalls("START")).toHaveLength(2);
+    expect(callsTo(CHAT_URL).map((c) => c.body.codebuff_metadata.run_id)).toEqual(["run-1", "run-2"]);
+    expect(agentRunCalls("FINISH").map((c) => c.body)).toEqual([
+      expect.objectContaining({ runId: "run-1", status: "completed", totalSteps: 1, directCredits: 0, totalCredits: 0 }),
+      expect.objectContaining({ runId: "run-2", status: "completed", totalSteps: 1, directCredits: 0, totalCredits: 0 }),
+    ]);
+    expect(activeRuns.size).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// one free session per token, released on a model switch
+// ---------------------------------------------------------------------------
+
+describe("free session release on model switch", () => {
+  const GLM = "z-ai/glm-5.3-flash";
+  const DEEPSEEK = "deepseek/deepseek-v4-flash";
+
+  beforeEach(() => {
+    delete process.env.FREEBUFF_RUN_ROTATION_MS;
+  });
+
+  it("releases the old session with its own attempt headers before admitting the new model", async () => {
+    installUpstream();
+    const credentials = { accessToken: newToken() };
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    const { response } = await executor.execute(makeExecuteArgs({ credentials, model: GLM }));
+    expect(response.status).toBe(200);
+    await drain(response);
+
+    const [first, second] = callsTo(SESSION_ADMISSION_URL);
+    expect(releaseCalls()).toHaveLength(1);
+    const [release] = releaseCalls();
+    expect(release.url).toBe("https://www.codebuff.com/api/v1/freebuff/session/attempt");
+    expect(release.headers["x-freebuff-desktop-attempt-id"]).toBe(first.headers["x-freebuff-desktop-attempt-id"]);
+    expect(release.headers["x-freebuff-instance-id"]).toBe(first.headers["x-freebuff-instance-id"]);
+    expect(release.headers.Authorization).toBe(`Bearer ${credentials.accessToken}`);
+    expect(release.headers["User-Agent"]).toBe(DEFAULT_USER_AGENT);
+    expect(release.body).toBeNull();
+
+    // DELETE goes out between the two admissions
+    const order = allCalls().map((c) => `${c.method} ${c.url}`);
+    const at = (label) => order.map((l, i) => (l === label ? i : -1)).filter((i) => i >= 0);
+    const [a1, a2] = at(`POST ${SESSION_ADMISSION_URL}`);
+    const [del] = at(`DELETE ${SESSION_ATTEMPT_URL}`);
+    expect(a1).toBeLessThan(del);
+    expect(del).toBeLessThan(a2);
+
+    // the new session, not the old one, carries the second chat
+    const [, chat] = callsTo(CHAT_URL);
+    expect(chat.body.model).toBe(GLM);
+    expect(chat.body.codebuff_metadata.freebuff_instance_id).toBe(second.headers["x-freebuff-instance-id"]);
+    expect(chat.body.codebuff_metadata.freebuff_instance_id).not.toBe(first.headers["x-freebuff-instance-id"]);
+
+    // one session per token: the cache holds the new model only
+    expect(sessions.size).toBe(1);
+    expect([...sessions.values()][0]).toMatchObject({ type: "active", model: GLM });
+  });
+
+  it("sends the ids of the admission request even when the server answers with another instance id", async () => {
+    installUpstream({
+      admission: (headers) =>
+        json({ status: "active", instanceId: `cli:server-${headers["x-freebuff-model"]}`, model: headers["x-freebuff-model"], remainingMs: 600_000 }),
+    });
+    const credentials = { accessToken: newToken() };
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    await drain((await executor.execute(makeExecuteArgs({ credentials, model: GLM }))).response);
+
+    const [first] = callsTo(SESSION_ADMISSION_URL);
+    const [release] = releaseCalls();
+    expect(release.headers["x-freebuff-desktop-attempt-id"]).toBe(first.headers["x-freebuff-desktop-attempt-id"]);
+    expect(release.headers["x-freebuff-instance-id"]).toBe(first.headers["x-freebuff-instance-id"]);
+    // chat still uses the id the server handed out
+    expect(callsTo(CHAT_URL)[0].body.codebuff_metadata.freebuff_instance_id).toBe("cli:server-mimo/mimo-v2.5");
+  });
+
+  it("does not release while the same model keeps being served", async () => {
+    installUpstream();
+    const credentials = { accessToken: newToken() };
+    for (let i = 0; i < 3; i++) await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
+    expect(releaseCalls()).toHaveLength(0);
+  });
+
+  it("does not release another token's session", async () => {
+    installUpstream();
+    await drain((await executor.execute(makeExecuteArgs())).response);
+    await drain((await executor.execute(makeExecuteArgs({ model: GLM }))).response);
+    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(2);
+    expect(releaseCalls()).toHaveLength(0);
+  });
+
+  it("ends the runs of the released session's agent, after their in-flight requests", async () => {
+    installUpstream();
+    const credentials = { accessToken: newToken() };
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    const stillStreaming = await executor.execute(makeExecuteArgs({ credentials }));
+
+    await drain((await executor.execute(makeExecuteArgs({ credentials, model: GLM }))).response);
+    expect(releaseCalls()).toHaveLength(1);
+    // run-1 (mimo) has a request in flight: it drains instead of finishing
+    expect(agentRunCalls("FINISH")).toHaveLength(0);
+    expect(drainingRuns.size).toBe(1);
+    expect(agentRunCalls("START").map((c) => c.body.agentId)).toEqual(["base3-free-mimo", "base3-free-glm-5-3-flash"]);
+
+    await drain(stillStreaming.response);
+    expect(agentRunCalls("FINISH")).toHaveLength(1);
+    expect(agentRunCalls("FINISH")[0].body).toMatchObject({ runId: "run-1", status: "completed", totalSteps: 2 });
+    expect(drainingRuns.size).toBe(0);
+    // the new model's run is the only live one
+    expect([...activeRuns.values()].map((r) => r.agentId)).toEqual(["base3-free-glm-5-3-flash"]);
+  });
+
+  it("finishes an idle run of the released session's agent immediately", async () => {
+    installUpstream();
+    const credentials = { accessToken: newToken() };
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    await drain((await executor.execute(makeExecuteArgs({ credentials, model: GLM }))).response);
+    expect(agentRunCalls("FINISH").map((c) => c.body.runId)).toEqual(["run-1"]);
+  });
+
+  it("does not fail the request when the release answers an error", async () => {
+    installUpstream({ release: () => json({ error: "nope" }, { status: 500 }) });
+    const log = { info: vi.fn(), warn: vi.fn(), debug: vi.fn() };
+    const credentials = { accessToken: newToken() };
+    await drain((await executor.execute(makeExecuteArgs({ credentials, log }))).response);
+    const { response } = await executor.execute(makeExecuteArgs({ credentials, log, model: GLM }));
+    expect(response.status).toBe(200);
+    await drain(response);
+    expect(releaseCalls()).toHaveLength(1);
+    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(2);
+    expect(callsTo(CHAT_URL)[1].body.model).toBe(GLM);
+    expect(log.warn).toHaveBeenCalledWith("FREEBUFF", expect.stringContaining("500"));
+  });
+
+  it("does not fail the request when the release call itself throws", async () => {
+    installUpstream({
+      release: () => {
+        throw new Error("socket hang up");
+      },
+    });
+    const log = { info: vi.fn(), warn: vi.fn(), debug: vi.fn() };
+    const credentials = { accessToken: newToken() };
+    await drain((await executor.execute(makeExecuteArgs({ credentials, log }))).response);
+    const { response } = await executor.execute(makeExecuteArgs({ credentials, log, model: GLM }));
+    expect(response.status).toBe(200);
+    await drain(response);
+    expect(callsTo(CHAT_URL)[1].body.model).toBe(GLM);
+    expect(log.warn).toHaveBeenCalledWith("FREEBUFF", expect.stringContaining("socket hang up"));
+  });
+
+  it("treats a 404 on release as already gone", async () => {
+    installUpstream({ release: () => json({ error: "not_found" }, { status: 404 }) });
+    const log = { info: vi.fn(), warn: vi.fn(), debug: vi.fn() };
+    const credentials = { accessToken: newToken() };
+    await drain((await executor.execute(makeExecuteArgs({ credentials, log }))).response);
+    await drain((await executor.execute(makeExecuteArgs({ credentials, log, model: GLM }))).response);
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it("drops the old session even when the new admission is refused, instead of reusing a released one", async () => {
+    installUpstream({
+      admission: (headers) =>
+        headers["x-freebuff-model"] === GLM ? json({ status: "purchase_capacity", message: "no slot" }) : activeSession(headers),
+    });
+    const credentials = { accessToken: newToken() };
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    const refused = await executor.execute(makeExecuteArgs({ credentials, model: GLM }));
+    expect(refused.response.status).toBe(429);
+    expect(sessions.size).toBe(0);
+
+    // going back to the first model needs a fresh admission: its old session was released
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(3);
+  });
+
+  it("serialises concurrent requests for different models: the switch waits for the pending admission", async () => {
+    let release;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    installUpstream({
+      admission: async (headers) => {
+        if (headers["x-freebuff-model"] === "mimo/mimo-v2.5") await gate;
+        return activeSession(headers);
+      },
+    });
+    const credentials = { accessToken: newToken() };
+    const first = executor.execute(makeExecuteArgs({ credentials }));
+    await vi.waitFor(() => expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1));
+    const second = executor.execute(makeExecuteArgs({ credentials, model: GLM }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // nothing for the second model may reach the upstream before the first admission settles
+    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
+    expect(releaseCalls()).toHaveLength(0);
+
+    release();
+    const [a, b] = await Promise.all([first, second]);
+    expect(a.response.status).toBe(200);
+    expect(b.response.status).toBe(200);
+    await drain(a.response);
+    await drain(b.response);
+
+    const order = allCalls().filter((c) => [SESSION_ADMISSION_URL, SESSION_ATTEMPT_URL].includes(c.url));
+    expect(order.map((c) => `${c.method} ${c.headers["x-freebuff-model"] || "-"}`)).toEqual([
+      "POST mimo/mimo-v2.5",
+      "DELETE -",
+      `POST ${GLM}`,
+    ]);
+    expect(sessions.size).toBe(1);
+    expect([...sessions.values()][0].model).toBe(GLM);
+  });
+
+  it("shares one admission between concurrent requests for the new model", async () => {
+    installUpstream();
+    const credentials = { accessToken: newToken() };
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    const results = await Promise.all([1, 2, 3].map(() => executor.execute(makeExecuteArgs({ credentials, model: GLM }))));
+    for (const r of results) await drain(r.response);
+    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(2);
+    expect(releaseCalls()).toHaveLength(1);
+    expect(agentRunCalls("START")).toHaveLength(2);
+  });
+
+  it("releases a queued claim of the old model too", async () => {
+    installUpstream({
+      admission: (headers) =>
+        headers["x-freebuff-model"] === "mimo/mimo-v2.5"
+          ? json({ status: "queued", instanceId: "cli:server-queued", position: 2, queueDepth: 4, estimatedWaitMs: 5000 })
+          : activeSession(headers),
+    });
+    const credentials = { accessToken: newToken() };
+    expect((await executor.execute(makeExecuteArgs({ credentials }))).response.status).toBe(503);
+    const { response } = await executor.execute(makeExecuteArgs({ credentials, model: GLM }));
+    expect(response.status).toBe(200);
+    await drain(response);
+
+    const [queuedAdmission] = callsTo(SESSION_ADMISSION_URL);
+    const [release] = releaseCalls();
+    expect(release.headers["x-freebuff-desktop-attempt-id"]).toBe(queuedAdmission.headers["x-freebuff-desktop-attempt-id"]);
+    expect(release.headers["x-freebuff-instance-id"]).toBe(queuedAdmission.headers["x-freebuff-instance-id"]);
+  });
+
+  it("keeps the claim ids when a queued session is promoted by a poll", async () => {
+    const handlers = installUpstream({
+      admission: () => json({ status: "queued", instanceId: "cli:server-queued", estimatedWaitMs: 1000 }),
+    });
+    const credentials = { accessToken: newToken() };
+    expect((await executor.execute(makeExecuteArgs({ credentials }))).response.status).toBe(503);
+
+    handlers.session = () => json({ status: "active", instanceId: "cli:server-queued", model: "mimo/mimo-v2.5", remainingMs: 600_000 });
+    handlers.admission = activeSession;
+    const nowSpy = vi.spyOn(Date, "now");
+    nowSpy.mockReturnValue(Date.now() + 10_000);
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    await drain((await executor.execute(makeExecuteArgs({ credentials, model: GLM }))).response);
+
+    const [queuedAdmission] = callsTo(SESSION_ADMISSION_URL);
+    const [release] = releaseCalls();
+    expect(release.headers["x-freebuff-desktop-attempt-id"]).toBe(queuedAdmission.headers["x-freebuff-desktop-attempt-id"]);
+    expect(release.headers["x-freebuff-instance-id"]).toBe(queuedAdmission.headers["x-freebuff-instance-id"]);
+  });
+
+  it("cannot release a session from the legacy session route (no attempt id), but still switches", async () => {
+    installUpstream({
+      admission: () => json({ error: "not found" }, { status: 404 }),
+      session: (headers, method) =>
+        method === "POST" ? json({ status: "active", instanceId: `legacy-${headers["x-freebuff-model"]}`, model: headers["x-freebuff-model"], remainingMs: 600_000 }) : json({ status: "none" }),
+    });
+    const credentials = { accessToken: newToken() };
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    await drain((await executor.execute(makeExecuteArgs({ credentials, model: GLM }))).response);
+    expect(releaseCalls()).toHaveLength(0);
+    expect(callsTo(CHAT_URL).map((c) => c.body.codebuff_metadata.freebuff_instance_id)).toEqual(["legacy-mimo/mimo-v2.5", `legacy-${GLM}`]);
+  });
+
+  it("keeps the model_locked fallback without releasing it for the model that was redirected", async () => {
+    installUpstream({
+      admission: (headers) =>
+        headers["x-freebuff-model"] === GLM
+          ? activeSession(headers)
+          : json({ status: "model_locked", currentModel: GLM, requestedModel: headers["x-freebuff-model"] }, { status: 409 }),
+    });
+    const credentials = { accessToken: newToken() };
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    expect(callsTo(CHAT_URL).map((c) => c.body.model)).toEqual([GLM, GLM]);
+    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(2);
+    expect(releaseCalls()).toHaveLength(0);
+
+    // a model the lock does not cover still releases the locked session
+    await drain((await executor.execute(makeExecuteArgs({ credentials, model: DEEPSEEK }))).response);
+    expect(releaseCalls()).toHaveLength(1);
+    const glmAdmission = callsTo(SESSION_ADMISSION_URL).find((c) => c.headers["x-freebuff-model"] === GLM);
+    expect(releaseCalls()[0].headers["x-freebuff-instance-id"]).toBe(glmAdmission.headers["x-freebuff-instance-id"]);
+  });
+
+  it("does not let a stale gate failure wipe the session a model switch opened", async () => {
+    let resolveChat;
+    const chatGate = new Promise((resolve) => {
+      resolveChat = resolve;
+    });
+    let chats = 0;
+    installUpstream({
+      chat: async () => {
+        chats += 1;
+        if (chats === 1) {
+          await chatGate;
+          return json({ error: "session_superseded", message: "gone" }, { status: 409 });
+        }
+        return sse();
+      },
+    });
+    const credentials = { accessToken: newToken() };
+    const slow = executor.execute(makeExecuteArgs({ credentials }));
+    await vi.waitFor(() => expect(callsTo(CHAT_URL)).toHaveLength(1));
+    await drain((await executor.execute(makeExecuteArgs({ credentials, model: GLM }))).response);
+    const glmSession = [...sessions.values()][0];
+    expect(glmSession.model).toBe(GLM);
+
+    resolveChat();
+    const retried = await slow;
+    expect(retried.response.status).toBe(200);
+    await drain(retried.response);
+
+    // The stale failure concerned the already released mimo session. The glm session was still known,
+    // so the retry (mimo again) released it instead of leaking its slot.
+    const glmAdmission = callsTo(SESSION_ADMISSION_URL).find((c) => c.headers["x-freebuff-model"] === GLM);
+    expect(releaseCalls()).toHaveLength(2);
+    expect(releaseCalls()[1].headers["x-freebuff-instance-id"]).toBe(glmAdmission.headers["x-freebuff-instance-id"]);
+    expect([...sessions.values()][0]).toMatchObject({ model: "mimo/mimo-v2.5" });
   });
 });
 
