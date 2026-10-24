@@ -5,7 +5,6 @@ import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/sha
 import { getDefaultModel } from "open-sse/config/providerModels.js";
 import { resolveOllamaLocalHost, PROVIDERS } from "open-sse/config/providers.js";
 import { CODEX_CLI_VERSION } from "open-sse/config/appConstants.js";
-import { OPENCODE_FREE_BASE, OPENCODE_UA } from "open-sse/providers/shared.js";
 import { probeFreebuffToken } from "open-sse/executors/freebuff.js";
 import {
   refreshProviderCredentials,
@@ -764,10 +763,9 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
         return { valid, error: valid ? null : "Session expired — re-paste cookie" };
       }
       case "opencode": {
-        const res = await fetchWithConnectionProxy(`${OPENCODE_FREE_BASE}/models`, {
-          headers: { Authorization: "Bearer public", "User-Agent": OPENCODE_UA },
-        }, effectiveProxy);
-        return { valid: res.ok, error: res.ok ? null : "OpenCode free tier unavailable" };
+        // Free tier is anonymous (Bearer public): there is no credential to validate, and any
+        // probe is a request from this IP that the free gate fingerprints and counts. No network call.
+        return { valid: true, error: null };
       }
       case "opencode-go": {
         const res = await fetchWithConnectionProxy("https://opencode.ai/zen/go/v1/chat/completions", {

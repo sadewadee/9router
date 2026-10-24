@@ -6,7 +6,8 @@ import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
-import { ANTHROPIC_API_VERSION, OPENCODE_UA } from "../providers/shared.js";
+import { ANTHROPIC_API_VERSION, OPENCODE_UA, OPENCODE_CLIENT } from "../providers/shared.js";
+import { estimateInputTokens } from "../utils/usageTracking.js";
 import {
   normalizeResponsesInput,
   clampResponsesCallId,
@@ -18,9 +19,7 @@ const MAX_SESSION_LENGTH = 256;
 const MAX_TOOL_NAME_LEN = 128;
 const SESSION_HEADER = "x-opencode-session";
 const SESSION_FIELD = "_opencodeSession";
-const REQ_FIELD = "_opencodeRequest";
 export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
-export const OPENCODE_REQUEST_RE = /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 // OpenCode free tier requires the lowercase tool quartet 'bash', 'glob',
@@ -141,11 +140,18 @@ function cloakOpencodeTools(body, isResponses, credentials) {
   if (!body.tool_choice || body.tool_choice === "none") body.tool_choice = "auto";
 }
 
-// /inference 403s a bare "opencode/<ver>" UA and 426s anything older than 1.18
-// (live 2026-10-14), so a downstream UA is forwarded only when it is a genuine
-// full official one ("opencode/<ver> ai-sdk/... runtime/...", >= 1.18).
+// A downstream UA is forwarded only when it is a genuine official one:
+// - v2 CLI: "opencode/<channel>/<x.y.z>/<client>", optionally followed by the AI SDK
+//   suffix (" ai-sdk/provider-utils/<v> runtime/<rt>"), major >= 2.
+// - v1 client: /inference 403s a bare "opencode/<ver>" UA and 426s anything older
+//   than 1.18 (live 2026-10-14), so it must be the full
+//   "opencode/<ver> ai-sdk/... runtime/..." form, >= 1.18.
+const OPENCODE_V2_UA_RE = /^opencode\/[a-z0-9._-]+\/(\d+)\.\d+\.\d+\/[a-z0-9._-]+(?: .+)?$/i;
+
 function isOfficialOpencodeUa(ua) {
-  const text = String(ua || "");
+  const text = String(ua || "").trim();
+  const v2 = text.match(OPENCODE_V2_UA_RE);
+  if (v2) return parseInt(v2[1], 10) >= 2;
   const m = text.match(/opencode\/(\d+)\.(\d+)(?:\.(\d+))?/i);
   if (!m || !text.includes(" ai-sdk/")) return false;
   const major = parseInt(m[1], 10);
@@ -188,18 +194,7 @@ export function generateSessionId(timestamp = Date.now()) {
   return `ses_${time}${unstableRandom()}`;
 }
 
-export function generateRequestId(timestamp = Date.now()) {
-  const current = BigInt(timestamp) * 0x1000n + 1n;
-  const value = current;
-  const time = Array.from({ length: 6 }, (_, index) =>
-    Number((value >> BigInt(40 - 8 * index)) & 0xffn)
-      .toString(16)
-      .padStart(2, "0")
-  ).join("");
-  return `msg_${time}${unstableRandom()}`;
-}
-
-// Upstream validates that the 12-hex prefix of ses_/msg_ ids is a real
+// Upstream validates that the 12-hex prefix of ses_ ids is a real
 // timestamp-encoded value (48 bits = ms << 12 | counter), not random hash
 // bytes (decolua/9router#4780; 403 FreeTierError otherwise).
 function encodeTimeHex(value) {
@@ -312,85 +307,6 @@ export function stableSessionId(credentials) {
   return sessionId;
 }
 
-function lastUserText(body) {
-  try {
-    if (!body || typeof body !== "object") return "";
-    const arr = Array.isArray(body.messages)
-      ? body.messages
-      : Array.isArray(body.input)
-        ? body.input
-        : null;
-    if (!arr) return typeof body.input === "string" ? body.input.slice(-600) : "";
-    for (let i = arr.length - 1; i >= 0; i--) {
-      const msg = arr[i];
-      if (!msg) continue;
-      if (msg.role && msg.role !== "user") continue;
-      const content = msg.content;
-      if (typeof content === "string" && content.trim()) return content.trim().slice(-600);
-      if (Array.isArray(content)) {
-        const text = content
-          .map((part) => (typeof part === "string" ? part : part?.text || part?.input_text || ""))
-          .join(" ")
-          .trim();
-        if (text) return text.slice(-600);
-      }
-    }
-  } catch {
-    return "";
-  }
-  return "";
-}
-
-// The real CLI sends the current user message id (stable per turn, same on
-// retries) as x-opencode-request. Derive it deterministically from the
-// session plus the last user message so retries share the id.
-// Upstream (zen) caches by request id: a deterministic id that repeats after a
-// failed attempt gets the CACHED failure re-served forever (observed live
-// 2026-09-18 — one conversation 500'd for ~40 min on identical retries while
-// any fresh id succeeded). Keep the deterministic id for the FIRST occurrence
-// (preserves quota-friendly idempotency for silent client retries) but mint a
-// fresh id for every repeat so a cached failure can never stick.
-const seenOpencodeRequestIds = new Map(); // id -> firstSeen
-const REQUEST_ID_MEMORY_TTL_MS = 10 * 60 * 1000;
-
-function rememberOpencodeRequestId(id) {
-  const now = Date.now();
-  if (seenOpencodeRequestIds.size > 5000) {
-    for (const [k, v] of seenOpencodeRequestIds) {
-      if (now - v > REQUEST_ID_MEMORY_TTL_MS) seenOpencodeRequestIds.delete(k);
-    }
-  }
-  const seen = seenOpencodeRequestIds.get(id);
-  seenOpencodeRequestIds.set(id, now);
-  return !!seen;
-}
-
-export function deriveRequestId(sessionId, body, timestamp = Date.now()) {
-  const text = lastUserText(body);
-  if (!text) return generateRequestId(timestamp);
-  const digest = crypto
-    .createHash("sha256")
-    .update(`opencode-req\0${sessionId || ""}\0${text}`)
-    .digest();
-  // Request ids are ascending, same as generateRequestId().
-  const timeHex = encodeTimeHex(BigInt(timestamp) * 0x1000n + 1n);
-  let randomPart = "";
-  for (let i = 6; i < 20; i++) {
-    randomPart += BASE62_CHARS[digest[i] % 62];
-  }
-  const id = `msg_${timeHex}${randomPart}`;
-  if (!OPENCODE_REQUEST_RE.test(id)) return generateRequestId(timestamp);
-  if (rememberOpencodeRequestId(id)) return generateRequestId(timestamp);
-  return id;
-}
-
-function normalizeRequestId(value) {
-  if (typeof value !== "string") return null;
-  const normalized = value.trim();
-  if (!normalized || normalized.length > MAX_SESSION_LENGTH) return null;
-  return OPENCODE_REQUEST_RE.test(normalized) ? normalized : null;
-}
-
 function bodyHasSessionHints(body) {
   try {
     if (!body || typeof body !== "object") return false;
@@ -476,18 +392,6 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
   }
 
   return stableSessionId(credentials);
-}
-
-function resolveOpencodeRequestId(body, credentials, sessionId) {
-  const raw = credentials?.rawHeaders || {};
-  for (const [key, value] of Object.entries(raw)) {
-    if (key.toLowerCase() === "x-opencode-request") {
-      const normalized = normalizeRequestId(value);
-      if (normalized) return normalized;
-      break;
-    }
-  }
-  return deriveRequestId(sessionId, body);
 }
 
 function normalizeResponsesTools(body) {
@@ -585,6 +489,55 @@ function normalizeOpencodeReasoning(model, body) {
 const opencodeSessionOverrides = new Map(); // identityKey -> { session, setAt }
 const MAX_SESSION_OVERRIDES = 500;
 
+// The v2 CLI sends promptCacheKey = affinity id, minus the "ses_" prefix when it is
+// the 64-hex form (packages/core/src/session/model-request.ts, v2.1.4).
+const OPENCODE_SESSION_64HEX_RE = /^ses_[0-9a-f]{64}$/;
+
+function promptCacheKey(affinity) {
+  return OPENCODE_SESSION_64HEX_RE.test(affinity) ? affinity.slice(4) : affinity;
+}
+
+// v2 dropped x-opencode-request; per-request tracing is a W3C traceparent
+// (version-traceId-parentId-flags, 01 = sampled).
+function newTraceparent() {
+  return `00-${crypto.randomBytes(16).toString("hex")}-${crypto.randomBytes(8).toString("hex")}-01`;
+}
+
+// Env overrides are read per call so ops can flip them without a rebuild.
+function opencodeUa() {
+  return process.env.OPENCODE_UA?.trim() || OPENCODE_UA;
+}
+
+function opencodeClient() {
+  return process.env.OPENCODE_CLIENT?.trim() || OPENCODE_CLIENT;
+}
+
+function freeBaseUrl(configBase) {
+  return (process.env.OPENCODE_FREE_BASE_URL?.trim() || configBase).replace(/\/+$/, "");
+}
+
+// The official catalog (models.opencode.ai) serves Anthropic-format free models from
+// /inference/anthropic/v1 while chat and responses share /inference/openai/v1. Any
+// other base (e.g. the legacy /inference/v1 flipped in via OPENCODE_FREE_BASE_URL)
+// serves every path itself.
+function freeMessagesBase(base) {
+  return base.replace(/\/inference\/openai\/v1$/, "/inference/anthropic/v1");
+}
+
+// Free-lane request size cap. The free allowance behaves like a token bucket keyed on
+// request size (anomalyco/opencode#58751: one account, same minute, 447k-token context
+// -> 429 FreeUsageLimitError, 23k-token new session -> 200; 167k fails, compacted to 49k
+// passes), so big agent contexts only burn upstream quota to be refused. Requests whose
+// estimated input exceeds this are refused locally; 0 disables the guard.
+const DEFAULT_FREE_MAX_INPUT_TOKENS = 60000;
+
+function freeMaxInputTokens() {
+  const raw = process.env.OPENCODE_FREE_MAX_INPUT_TOKENS?.trim();
+  if (!raw) return DEFAULT_FREE_MAX_INPUT_TOKENS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : DEFAULT_FREE_MAX_INPUT_TOKENS;
+}
+
 export class OpenCodeExecutor extends BaseExecutor {
   constructor() {
     super("opencode", PROVIDERS.opencode);
@@ -603,7 +556,6 @@ export class OpenCodeExecutor extends BaseExecutor {
     return {
       ...sourceCredentials,
       [SESSION_FIELD]: session,
-      [REQ_FIELD]: resolveOpencodeRequestId(body, sourceCredentials, session),
     };
   }
 
@@ -644,10 +596,50 @@ export class OpenCodeExecutor extends BaseExecutor {
     } else if (body && typeof body === "object") {
       cloakOpencodeTools(body, false, credentials);
     }
+    // Anthropic-format /messages bodies reject unknown fields, so no cache key there.
+    const session = credentials?.[SESSION_FIELD];
+    if (session && body && typeof body === "object" && !isMessagesModel(model || body.model)) {
+      body.prompt_cache_key = promptCacheKey(session);
+    }
     return injectReasoningContent({ provider: this.provider, model, body });
   }
 
+  // Size guard for the free lane (see freeMaxInputTokens). Returns an execute()-shaped
+  // result carrying a local 413, or null when the request may go upstream.
+  //
+  // Why 413 with "request not allowed" in the text: chatCore turns this response into
+  // an error result and the combo loop (open-sse/services/combo.js) then asks
+  // checkFallbackError(status, text) whether to try the next model. A request-scoped
+  // 4xx normally returns to the client without fallback (accountFallback.js), but the
+  // "request not allowed" text rule matches first and yields shouldFallback=true with
+  // the shortest cooldown (5s). The noAuth "opencode" connection is virtual
+  // (id "noauth"), so markAccountUnavailable (src/sse/services/auth.js) returns early
+  // and persists no modelLock: a size refusal never rate-limits later small requests.
+  // 413 also keeps SDK clients from retrying (they retry 429/5xx) and tells a direct
+  // caller exactly what happened. 429/5xx would fall back too but misreport an upstream
+  // limit, so they are deliberately avoided.
+  // Estimate = JSON length / 4 (shared estimator); inline base64 images inflate it,
+  // which only errs towards falling back.
+  refuseOversizedRequest({ model, body, log } = {}) {
+    const limit = freeMaxInputTokens();
+    if (!limit) return null;
+    const estimate = estimateInputTokens(body);
+    if (estimate <= limit) return null;
+    const warning = `free lane size guard: ~${estimate} input tokens > ${limit} (${baseModelId(model)}), not sent upstream`;
+    if (log?.warn) log.warn("OPENCODE", warning);
+    else console.warn(`[OPENCODE] ${warning}`);
+    const message = `OpenCode free lane: request not allowed, estimated input ~${estimate} tokens exceeds the ${limit} limit (OPENCODE_FREE_MAX_INPUT_TOKENS); the free allowance is keyed on request size, compact the context or use another model`;
+    return {
+      response: new Response(message, { status: 413, headers: { "Content-Type": "text/plain" } }),
+      url: this.buildUrl(model),
+      headers: {},
+      transformedBody: null,
+    };
+  }
+
   async execute(args) {
+    const refused = this.refuseOversizedRequest(args);
+    if (refused) return refused;
     const credentials = this.prepareRequestCredentials(args);
     const result = await super.execute({ ...args, credentials });
     if (args?.credentials && credentials?._opencodeToolNameMap) {
@@ -661,10 +653,8 @@ export class OpenCodeExecutor extends BaseExecutor {
       if (result?.response?.status === 500) {
         try {
           const dbgSes = credentials?.[SESSION_FIELD];
-          const dbgReq = credentials?.[REQ_FIELD];
           result.response.clone().text().then((t) => {
             console.error("[OC-DEBUG] 500 ses=" + String(dbgSes).slice(0, 40)
-              + " req=" + String(dbgReq).slice(0, 40)
               + " model=" + String(args?.model || "") + " body=" + String(t).slice(0, 400));
           }).catch(() => { });
         } catch { }
@@ -684,9 +674,9 @@ export class OpenCodeExecutor extends BaseExecutor {
   }
 
   buildUrl(model) {
-    const base = this.config.baseUrl;
+    const base = freeBaseUrl(this.config.baseUrl);
     if (isResponsesModel(model)) return `${base}/responses`;
-    if (isMessagesModel(model)) return `${base}/messages`;
+    if (isMessagesModel(model)) return `${freeMessagesBase(base)}/messages`;
     return `${base}/chat/completions`;
   }
 
@@ -699,19 +689,21 @@ export class OpenCodeExecutor extends BaseExecutor {
     const isOpencodeDownstream = isOfficialOpencodeUa(downstreamUa);
 
     const session = credentials?.[SESSION_FIELD] || this.prepareRequestCredentials({ credentials })[SESSION_FIELD];
-    const downstreamReq = normalizeRequestId(lower["x-opencode-request"]);
-    const requestId = credentials?.[REQ_FIELD] || downstreamReq || generateRequestId();
 
+    // Mirrors the v2.1.4 CLI (packages/core/src/session/model-request.ts). One session
+    // per conversation, so id and affinity are the same value; downstream
+    // x-opencode-request (v1 only) is never forwarded.
     const headers = {
       "Content-Type": "application/json",
       "Authorization": "Bearer public",
-      "User-Agent": isOpencodeDownstream ? downstreamUa : OPENCODE_UA,
-      "x-opencode-client": lower["x-opencode-client"] || "desktop",
-      "x-opencode-session": session,
-      // /inference 403s without it; the official client sends the same id in both headers.
       "x-opencode-session-id": session,
-      "x-opencode-request": requestId,
+      "x-session-affinity": session,
+      "X-Session-Id": session,
+      "User-Agent": isOpencodeDownstream ? downstreamUa : opencodeUa(),
       "x-opencode-project": lower["x-opencode-project"] || "global",
+      "x-opencode-session": session,
+      "x-opencode-client": lower["x-opencode-client"] || opencodeClient(),
+      "traceparent": newTraceparent(),
       "Accept": stream ? "text/event-stream" : "*/*",
     };
     if (url.endsWith("/messages")) headers["anthropic-version"] = ANTHROPIC_API_VERSION;

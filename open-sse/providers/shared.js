@@ -103,10 +103,17 @@ export const KIMI_CODING_BASE_URL = "https://api.kimi.com/coding/v1/messages";
 export const OPENAI_COMPAT_BASE = "https://api.openai.com/v1";
 export const ANTHROPIC_COMPAT_BASE = "https://api.anthropic.com/v1";
 
-// OpenCode Free: /zen/v1 403s every free model since 2026-10-14 (FreeTierError); the official
-// client (>=1.19) talks to /inference/v1 and the gate there also wants its full UA string.
-export const OPENCODE_FREE_BASE = "https://opencode.ai/inference/v1";
-export const OPENCODE_UA = "opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
+// OpenCode Free: /zen/v1 403s every free model since 2026-10-14 (FreeTierError). The v2 CLI
+// (2.1.4) takes its endpoints and client identity from the official catalog
+// (models.opencode.ai/api.json): chat/responses on /inference/openai/v1, UA
+// "opencode/<channel>/<version>/<client>" plus the AI SDK suffix. The v1 shape
+// (/inference/v1, "opencode/1.19.0 ai-sdk/..." UA, x-opencode-request) is retired; ops can
+// still point the executor back at the legacy base with OPENCODE_FREE_BASE_URL.
+export const OPENCODE_FREE_BASE = "https://opencode.ai/inference/openai/v1";
+// The /models list was only ever verified on the legacy path, so the model fetcher stays there.
+export const OPENCODE_FREE_LEGACY_BASE = "https://opencode.ai/inference/v1";
+export const OPENCODE_UA = "opencode/latest/2.1.4/cli ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4";
+export const OPENCODE_CLIENT = "cli";
 
 // Official Antigravity IDE Desktop 2.11.0 fingerprint captured from macOS arm64.
 // Keep this static even when 9router runs on Linux: the provider profile is
