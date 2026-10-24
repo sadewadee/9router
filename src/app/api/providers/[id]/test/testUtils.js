@@ -97,6 +97,8 @@ const OAUTH_TEST_CONFIG = {
   // codebuddy-intl uses the same JWT token structure as codebuddy-cn
   // (access + refresh token pair, ~1-year expiry) — same test strategy (#4232).
   "codebuddy-intl": { tokenExists: true },
+  // workbuddy: same JWT access + refresh token pair as the CodeBuddy gateways.
+  workbuddy: { tokenExists: true },
   kimchi: {
     url: KIMCHI_CONFIG.validationUrl || "https://api.cast.ai/v1/llm/openai/supported-providers",
     method: "GET",

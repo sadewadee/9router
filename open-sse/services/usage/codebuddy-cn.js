@@ -20,7 +20,8 @@
  */
 
 import { proxyAwareFetch } from "../../utils/proxyFetch.js";
-import { PROVIDERS } from "../../providers/index.js";
+import { PROVIDERS, PROVIDER_OAUTH } from "../../providers/index.js";
+import { resolveWorkBuddyUid } from "../../utils/workbuddyIdentity.js";
 import { U, parseResetTime } from "./shared.js";
 
 const PROVIDER_ID = "codebuddy-cn";
@@ -43,40 +44,90 @@ function refillCadence(acc) {
   return "Monthly";
 }
 
-async function getCodeBuddyUsage(providerId, accessToken, apiKey, providerSpecificData, proxyOptions = null) {
+// Per-gateway request/label overrides of the shared fetcher (defaults = the CN/intl behaviour).
+const DEFAULT_PROFILE = {
+  label: "CodeBuddy CN",
+  defaultPlan: "CodeBuddy",
+  headers: (providerId) => PROVIDERS[providerId]?.headers || {},
+  body: () => "{}",
+};
+
+// The billing API reads package windows as UTC+8 wall-clock "YYYY-MM-DD HH:mm:ss".
+function billingWallClock(date) {
+  return new Date(date.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 19).replace("T", " ");
+}
+
+// WorkBuddy global realm: the client's billing call (single-segment UA, account
+// uid) with the package filter it sends — every package still valid, active or
+// not yet started.
+const WORKBUDDY_PROFILE = {
+  label: "WorkBuddy",
+  defaultPlan: "WorkBuddy",
+  headers: (providerId, providerSpecificData, token) => {
+    const oauth = PROVIDER_OAUTH[providerId] || {};
+    const uid = resolveWorkBuddyUid({ providerSpecificData, accessToken: token });
+    return {
+      "User-Agent": oauth.userAgent,
+      "X-CodeBuddy-Request": "1",
+      "Accept-Language": PROVIDERS[providerId]?.headers?.["Accept-Language"] || "en-US",
+      "X-Domain": oauth.domain,
+      ...(uid ? { "X-User-Id": uid } : {}),
+    };
+  },
+  body: () => {
+    const now = new Date();
+    return JSON.stringify({
+      PageNumber: 1,
+      PageSize: 100,
+      ProductCode: "p_tcaca",
+      Status: [0, 3],
+      PackageEndTimeRangeBegin: billingWallClock(now),
+      PackageEndTimeRangeEnd: billingWallClock(new Date(now.getTime() + 365 * 101 * 24 * 3600 * 1000)),
+    });
+  },
+};
+
+async function getCodeBuddyUsage(providerId, accessToken, apiKey, providerSpecificData, proxyOptions = null, profile = DEFAULT_PROFILE) {
   const token = accessToken || apiKey;
   if (!token) {
     return { message: `CodeBuddy (${providerId}) credential not available.` };
   }
+  const { label, defaultPlan } = profile;
 
   try {
-    const response = await proxyAwareFetch(U(providerId).url, {
-      method: "POST",
-      headers: {
-        ...(PROVIDERS[providerId]?.headers || {}),
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: "{}",
-    }, proxyOptions);
+    // Some realms serve billing at two paths (workbuddy: bare first, /v2 on 404).
+    const { url, fallbackUrl } = U(providerId);
+    let response;
+    for (const target of [url, fallbackUrl].filter(Boolean)) {
+      response = await proxyAwareFetch(target, {
+        method: "POST",
+        headers: {
+          ...profile.headers(providerId, providerSpecificData, token),
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: profile.body(),
+      }, proxyOptions);
+      if (response.status !== 404) break;
+    }
 
     if (response.status === 401 || response.status === 403) {
-      return { message: "CodeBuddy CN credential invalid or expired." };
+      return { message: `${label} credential invalid or expired.` };
     }
     if (!response.ok) {
-      return { message: `CodeBuddy CN quota API error (${response.status}).` };
+      return { message: `${label} quota API error (${response.status}).` };
     }
 
     const json = await response.json();
     if (json?.code !== 0) {
-      return { message: `CodeBuddy CN quota error: ${json?.msg || "unknown"}` };
+      return { message: `${label} quota error: ${json?.msg || "unknown"}` };
     }
 
     const data = json?.data?.Response?.Data || {};
     const accounts = Array.isArray(data.Accounts) ? data.Accounts : [];
     if (accounts.length === 0) {
-      return { message: "CodeBuddy CN connected. No credit package found." };
+      return { message: `${label} connected. No credit package found.` };
     }
 
     const cycleEndMs = (acc) => {
@@ -129,7 +180,7 @@ async function getCodeBuddyUsage(providerId, accessToken, apiKey, providerSpecif
     });
 
     const basePkg = refills[0] || accounts[0] || {};
-    const plan = basePkg.PackageName || basePkg.SubProductName || "CodeBuddy";
+    const plan = basePkg.PackageName || basePkg.SubProductName || defaultPlan;
 
     return { plan, quotas };
   } catch (error) {
@@ -143,4 +194,8 @@ export async function getCodeBuddyCnUsage(accessToken, apiKey, providerSpecificD
 
 export async function getCodeBuddyIntlUsage(accessToken, apiKey, providerSpecificData, proxyOptions = null) {
   return getCodeBuddyUsage("codebuddy-intl", accessToken, apiKey, providerSpecificData, proxyOptions);
+}
+
+export async function getWorkBuddyUsage(accessToken, apiKey, providerSpecificData, proxyOptions = null) {
+  return getCodeBuddyUsage("workbuddy", accessToken, apiKey, providerSpecificData, proxyOptions, WORKBUDDY_PROFILE);
 }
