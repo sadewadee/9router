@@ -1,4 +1,4 @@
-import { OPENCODE_FREE_BASE } from "../shared.js";
+import { OPENCODE_FREE_BASE, OPENCODE_FREE_LEGACY_BASE, OPENCODE_CLIENT } from "../shared.js";
 
 export default {
   id: "opencode",
@@ -17,7 +17,7 @@ export default {
   transport: {
     baseUrl: OPENCODE_FREE_BASE,
     headers: {
-      "x-opencode-client": "desktop",
+      "x-opencode-client": OPENCODE_CLIENT,
     },
     forceStream: true,
     noAuth: true,
@@ -31,6 +31,6 @@ export default {
     { id: "muse-spark-1.3-contributor-free", name: "Muse Spark 1.3 Contributor Free", targetFormat: "openai-responses" },
     { id: "union-alpha", name: "Union Alpha Free", targetFormat: "claude" },
   ],
-  modelsFetcher: { url: `${OPENCODE_FREE_BASE}/models`, type: "opencode-free" },
+  modelsFetcher: { url: `${OPENCODE_FREE_LEGACY_BASE}/models`, type: "opencode-free" },
   passthroughModels: true,
 };

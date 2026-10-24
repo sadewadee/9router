@@ -41,16 +41,12 @@ function upstreamSession(call) {
   return upstreamHeaders(call)["x-opencode-session"];
 }
 
-function upstreamRequestId(call) {
-  return upstreamHeaders(call)["x-opencode-request"];
-}
-
 beforeEach(() => {
   fetchMock.mockReset();
 });
 
-describe("OpenCode repeat-request self-heal (session rotation + request-id freshness)", () => {
-  it("a repeated (session, message) after upstream 500 gets a fresh request id, not the cached one", async () => {
+describe("OpenCode repeat-request self-heal (session rotation)", () => {
+  it("a repeated (session, message) after upstream 500 rotates away from the failed session", async () => {
     const executor = getExecutor("opencode");
 
     // Request #1 fails upstream with 500 (router-level retries included).
@@ -65,14 +61,11 @@ describe("OpenCode repeat-request self-heal (session rotation + request-id fresh
     });
 
     expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(1);
-    const id1 = upstreamRequestId(0);
     const ses1 = upstreamSession(0);
-    expect(id1).toMatch(/^msg_/);
     expect(ses1).toMatch(/^ses_/);
 
     // Request #2: SAME conversation, SAME message text (a user retry after the
-    // failure). It must NOT reuse the failed request id and must rotate away
-    // from the failed session.
+    // failure). It must rotate away from the failed session.
     await executor.execute({
       model: MODEL,
       body: makeBody(),
@@ -82,20 +75,20 @@ describe("OpenCode repeat-request self-heal (session rotation + request-id fresh
       clientTool: "claude",
     });
 
-    const id2 = upstreamRequestId(fetchMock.mock.calls.length - 2);
     const ses2 = upstreamSession(fetchMock.mock.calls.length - 2);
-    expect(id2).not.toBe(id1);
     expect(ses2).not.toBe(ses1);
-  });
+    // each failed execute burns the executor's two 2.5s 500-retries, so allow for real timers
+  }, 30000);
 
-  it("two different conversations with the same text still get distinct request ids", async () => {
+  it("two different conversations with the same text still get distinct sessions", async () => {
     fetchMock.mockResolvedValue(makeSseResponse(200));
     await executorSafeRun("conversation-aaa");
     await executorSafeRun("conversation-bbb");
-    const a = upstreamRequestId(fetchMock.mock.calls.length - 2);
-    const b = upstreamRequestId(fetchMock.mock.calls.length - 1);
-    expect(a).toMatch(/^msg_/);
-    expect(b).toMatch(/^msg_/);
+    const a = upstreamSession(fetchMock.mock.calls.length - 2);
+    const b = upstreamSession(fetchMock.mock.calls.length - 1);
+    expect(a).toMatch(/^ses_/);
+    expect(b).toMatch(/^ses_/);
+    expect(a).not.toBe(b);
   });
 });
 
