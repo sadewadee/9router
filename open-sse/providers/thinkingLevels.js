@@ -36,6 +36,27 @@ const CODEX_GPT_5_6_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh
 
 // Model-name pattern overrides (glob, first match wins) — more precise than format default.
 const PATTERN_THINKING = [
+  // workbuddy per-model effort sets (global catalog). Sending a level outside a
+  // model's set is a 400 upstream, so the shorter list wins where the sources
+  // differ (deepseek-v4.1-flash, primary-model: high only). Kept ahead of the
+  // generic *codex* / *deepseek-v4.* patterns below, which would shadow them.
+  { provider: "workbuddy", pattern: "fast-model",          levels: ["medium"] },
+  { provider: "workbuddy", pattern: "balanced-model",      levels: ["medium"] },
+  { provider: "workbuddy", pattern: "primary-model",       levels: ["high"] },
+  { provider: "workbuddy", pattern: "deepseek-v4.1-flash", levels: ["high"] },
+  { provider: "workbuddy", pattern: "hy4-preview*",        levels: ["high"] },
+  { provider: "workbuddy", pattern: "hy3",                 levels: ["low", "high"] },
+  { provider: "workbuddy", pattern: "gpt-6-astra",         levels: ["low", "medium", "high", "xhigh", "max"] },
+  { provider: "workbuddy", pattern: "gpt-5.6-*",           levels: ["low", "medium", "high", "xhigh", "max"] },
+  { provider: "workbuddy", pattern: "gpt-5.5",             levels: ["low", "medium", "high", "xhigh"] },
+  { provider: "workbuddy", pattern: "gpt-5.4",             levels: ["low", "medium", "high", "xhigh"] },
+  { provider: "workbuddy", pattern: "gpt-5.3-codex",       levels: ["medium"] },
+  { provider: "workbuddy", pattern: "gemini-3.5-flash",    levels: ["medium"] },
+  { provider: "workbuddy", pattern: "glm-5.3",             levels: ["low", "high", "max"] },
+  { provider: "workbuddy", pattern: "glm-5.2",             levels: ["high", "xhigh"] },
+  { provider: "workbuddy", pattern: "kimi-k3",             levels: ["medium"] },
+  { provider: "workbuddy", pattern: "kimi-k2.8-preview",   levels: ["low", "high", "max"] },
+  { provider: "workbuddy", pattern: "kimi-k2.6",           levels: ["medium"] },
   { provider: "codex", pattern: "*gpt-6*", levels: CODEX_GPT_5_6_LEVELS },
   { provider: "codex", pattern: "*gpt-5.6-sol*", levels: [...CODEX_GPT_5_6_LEVELS, "ultra"] },
   { provider: "codex", pattern: "*gpt-5.6-terra*", levels: [...CODEX_GPT_5_6_LEVELS, "ultra"] },

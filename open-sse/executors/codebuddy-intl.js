@@ -78,8 +78,9 @@ export function deriveConversationId(credentials, body) {
  * mirror reasoning_summary exactly like CodeBuddyExecutor.
  */
 export class CodeBuddyIntlExecutor extends CodeBuddyBaseExecutor {
-  constructor() {
-    super("codebuddy-intl");
+  // `provider` lets sibling gateways on the same platform (workbuddy) reuse the transform.
+  constructor(provider = "codebuddy-intl") {
+    super(provider);
   }
 
   // The gateway rejects chat calls without conversation IDs (HTTP 400 code
