@@ -4,6 +4,8 @@
 //   GET  /v2/plugin/login/account?state=     -> uid / nickname (Bearer; only answers after login)
 //   GET  /auth/realms/copilot/overseas/user/register?userId=  -> idempotent account activation
 // Activation must never block saving the connection; "region required" is surfaced on it.
+// Login calls go out as the desktop client (single-segment WorkBuddy/<version> UA); the
+// register call is the web onboarding call and carries browser headers.
 import { describe, it, expect, vi, afterEach } from "vitest";
 import fs from "fs";
 import path from "path";
@@ -15,6 +17,9 @@ import { selectCheckinConnections } from "../../src/sse/services/codebuddyChecki
 const BASE = "https://www.workbuddy.ai";
 const jwt = (claims) => `eyJhbGciOiJSUzI1NiJ9.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.sig`;
 const ACCESS = jwt({ sub: "uid-jwt" });
+const BILLING_UA = "WorkBuddy/5.8.4";
+const BROWSER_ACCEPT = "application/json, text/plain, */*";
+const CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 const tokenOk = { code: 0, data: { accessToken: ACCESS, refreshToken: "rt-1", expiresIn: 5184000, domain: "www.workbuddy.ai", tokenType: "Bearer" } };
@@ -64,7 +69,8 @@ describe("requestDeviceCode (auth/state)", () => {
     expect(init.body).toBe("{}");
     expect(headerValue(init, "Origin")).toBe(BASE);
     expect(headerValue(init, "Referer")).toBe(`${BASE}/`);
-    expect(headerValue(init, "User-Agent")).toBe("WorkBuddy/5.5.4");
+    expect(headerValue(init, "User-Agent")).toBe(BILLING_UA);
+    expect(headerValue(init, "Accept")).toBe(BROWSER_ACCEPT);
     expect(headerValue(init, "X-Requested-With")).toBe("XMLHttpRequest");
     expect(headerValue(init, "Content-Type")).toBe("application/json");
     expect(headerValue(init, "Authorization")).toBeUndefined();
@@ -96,8 +102,22 @@ describe("pollToken (auth/token + login/account)", () => {
     expect(url).toBe(`${BASE}/v2/plugin/auth/token?state=a%20b%26c`);
     expect(init.method).toBe("GET");
     expect(headerValue(init, "Origin")).toBe(BASE);
-    expect(headerValue(init, "User-Agent")).toBe("WorkBuddy/5.5.4");
+    expect(headerValue(init, "User-Agent")).toBe(BILLING_UA);
+    expect(headerValue(init, "Accept")).toBe(BROWSER_ACCEPT);
     expect(headerValue(init, "Authorization")).toBeUndefined();
+  });
+
+  it("follows WORKBUDDY_CLIENT_VERSION for the login UA, with no rebuild", async () => {
+    const net = stubFetch({ "/v2/plugin/auth/token": () => json({ code: 11217, msg: "login ing" }) });
+    const before = process.env.WORKBUDDY_CLIENT_VERSION;
+    process.env.WORKBUDDY_CLIENT_VERSION = "5.9.1";
+    try {
+      await workbuddy.pollToken(workbuddy.config, "s");
+    } finally {
+      if (before === undefined) delete process.env.WORKBUDDY_CLIENT_VERSION;
+      else process.env.WORKBUDDY_CLIENT_VERSION = before;
+    }
+    expect(headerValue(net.calls[0].init, "User-Agent")).toBe("WorkBuddy/5.9.1");
   });
 
   it("reports code 11217 as authorization_pending and anything else as an error", async () => {
@@ -119,6 +139,7 @@ describe("pollToken (auth/token + login/account)", () => {
     const acct = net.last("/v2/plugin/login/account");
     expect(acct.url).toBe(`${BASE}/v2/plugin/login/account?state=st-9`);
     expect(headerValue(acct.init, "Authorization")).toBe(`Bearer ${ACCESS}`);
+    expect(headerValue(acct.init, "User-Agent")).toBe(BILLING_UA);
     expect(out.ok).toBe(true);
     expect(out.data).toMatchObject({
       access_token: ACCESS,
@@ -157,6 +178,19 @@ describe("account activation (overseas register)", () => {
     expect(headerValue(init, "Authorization")).toBe(`Bearer ${ACCESS}`);
     expect(headerValue(init, "X-User-Id")).toBe("uid-1");
     expect(headerValue(init, "Origin")).toBe(BASE);
+  });
+
+  it("sends the web onboarding call with browser headers, not the desktop client's", async () => {
+    const net = stubFetch(register({ code: 200, msg: "register success" }));
+    await workbuddy.postExchange(tokens);
+    const { init } = net.calls[0];
+    expect(headerValue(init, "User-Agent")).toBe(CHROME_UA);
+    expect(headerValue(init, "Accept")).toBe(BROWSER_ACCEPT);
+    expect(headerValue(init, "Content-Type")).toBe("application/json");
+    expect(headerValue(init, "Referer")).toBe(`${BASE}/`);
+    for (const key of ["X-Requested-With", "X-CodeBuddy-Request", "X-Machine-ID", "X-Session-ID", "X-Domain"]) {
+      expect(headerValue(init, key), key).toBeUndefined();
+    }
   });
 
   it("reports a region requirement (code 500 / 'region required')", async () => {

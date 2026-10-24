@@ -115,6 +115,18 @@ export const ANTIGRAVITY_IDE_VERSION = "2.11.0";
 export const ANTIGRAVITY_IDE_BASE_URL = "https://daily-cloudcode-pa.googleapis.com";
 export const ANTIGRAVITY_IDE_USER_AGENT = `antigravity/ide/${ANTIGRAVITY_IDE_VERSION} darwin/arm64`;
 
+// WorkBuddy International desktop client identity, from a packet capture of desktop
+// WorkBuddy 5.8.4 (2026-10-16). The chat UA's CLI/<v> tail is the CLI bundled in the
+// desktop app, not the app itself; non-chat calls (login, refresh, billing) send the
+// single-segment WorkBuddy/<v>. Ops can bump these without a rebuild: see
+// utils/workbuddyIdentity.js (WORKBUDDY_CLIENT_VERSION, WORKBUDDY_CLI_VERSION, WORKBUDDY_CHAT_UA).
+export const WORKBUDDY_CLIENT_VERSION = "5.8.4";
+export const WORKBUDDY_CLI_VERSION = "2.161.0";
+export const WORKBUDDY_APP_NAME = "workbuddy-ai";
+export const workbuddyChatUa = (version = WORKBUDDY_CLIENT_VERSION, cliVersion = WORKBUDDY_CLI_VERSION) =>
+  `WorkBuddy/${version} ${WORKBUDDY_APP_NAME}/${version} CLI/${cliVersion}`;
+export const workbuddyBillingUa = (version = WORKBUDDY_CLIENT_VERSION) => `WorkBuddy/${version}`;
+
 // Antigravity OAuth client credentials (public CLI client — duplicated in usage.js + src/lib/oauth)
 export const ANTIGRAVITY_OAUTH_CLIENT = {
   clientId: "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",

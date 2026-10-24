@@ -1,5 +1,5 @@
 import { WORKBUDDY_CONFIG } from "../constants/oauth.js";
-import { jwtSubject } from "open-sse/utils/workbuddyIdentity.js";
+import { jwtSubject, workBuddyBillingUserAgent } from "open-sse/utils/workbuddyIdentity.js";
 
 // WorkBuddy International (workbuddy.ai) - Browser OAuth Polling Flow, no PKCE
 // 1. POST stateUrl?platform=CLI -> { state, authUrl }
@@ -7,6 +7,8 @@ import { jwtSubject } from "open-sse/utils/workbuddyIdentity.js";
 // 3. Poll tokenUrl?state= until success (code 0; code 11217 = still waiting)
 // 4. GET accountUrl?state= with the new Bearer for uid / nickname (answers only after login)
 // 5. GET registerUrl?userId= activates the new global account (idempotent)
+// Steps 1-4 go out as the desktop client (single-segment WorkBuddy/<version> UA); step 5 is
+// the web onboarding call, so it carries browser headers.
 const LOGIN_PENDING_CODE = 11217;
 const REGISTER_OK_CODE = 200;
 const REGISTER_REGION_CODE = 500;
@@ -15,13 +17,26 @@ const REGISTER_TIMEOUT_MS = 15000;
 const REGION_REQUIRED_MESSAGE =
   "WorkBuddy account has no region yet. Open https://www.workbuddy.ai, finish the region step, then retry.";
 
+const BROWSER_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
 const authHeaders = (config) => ({
   "Content-Type": "application/json",
   Accept: "application/json, text/plain, */*",
   "X-Requested-With": "XMLHttpRequest",
   Origin: config.origin,
   Referer: `${config.origin}/`,
-  "User-Agent": config.userAgent,
+  "User-Agent": workBuddyBillingUserAgent(),
+});
+
+const registerHeaders = (config, uid, accessToken) => ({
+  "User-Agent": BROWSER_USER_AGENT,
+  Accept: "application/json, text/plain, */*",
+  "Content-Type": "application/json",
+  Origin: config.origin,
+  Referer: `${config.origin}/`,
+  Authorization: `Bearer ${accessToken}`,
+  "X-User-Id": uid,
 });
 
 // Best effort: the account endpoint only enriches the connection, login works without it.
@@ -46,7 +61,7 @@ async function activateAccount(config, uid, accessToken) {
   try {
     const response = await fetch(`${config.registerUrl}?userId=${encodeURIComponent(uid)}`, {
       method: "GET",
-      headers: { ...authHeaders(config), Authorization: `Bearer ${accessToken}`, "X-User-Id": uid },
+      headers: registerHeaders(config, uid, accessToken),
       signal: AbortSignal.timeout(REGISTER_TIMEOUT_MS),
     });
     if (!response.ok) return { status: "failed", message: `HTTP ${response.status}` };

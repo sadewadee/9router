@@ -2,7 +2,7 @@ import { PROVIDERS, PROVIDER_OAUTH } from "../../config/providers.js";
 import { OAUTH_ENDPOINTS, GITHUB_COPILOT, buildKimiHeaders } from "../../config/appConstants.js";
 import { proxyAwareFetch } from "../../utils/proxyFetch.js";
 import { dedupRefresh } from "./dedup.js";
-import { resolveWorkBuddyUid, workBuddyDeviceHeaders } from "../../utils/workbuddyIdentity.js";
+import { buildWorkBuddyRefreshHeaders } from "../../utils/workbuddyIdentity.js";
 import { buildExternalIdpRefreshParams } from "../../../src/lib/oauth/kiroExternalIdp.js";
 
 let _xaiServiceSingleton = null;
@@ -616,30 +616,16 @@ export async function refreshCodebuddyIntlToken(refreshToken, log) {
 }
 
 // WorkBuddy (workbuddy.ai) refresh — same endpoint shape as CodeBuddy (refresh
-// token in X-Refresh-Token, empty JSON body) with the desktop client fingerprint:
-// the chat User-Agent and the per-account X-User-Id / X-Machine-ID / X-Session-ID.
+// token in X-Refresh-Token, empty JSON body) with the desktop client's non-chat
+// headers (single-segment WorkBuddy/<version> UA, account X-User-Id / X-Domain).
 // Response: { code: 0, data: { accessToken, refreshToken, expiresIn, domain } }.
-const WORKBUDDY_REFRESH_HEADER_KEYS = [
-  "User-Agent", "X-Requested-With", "X-CodeBuddy-Request", "Origin", "Referer", "Accept-Language", "X-Domain",
-];
-
 export async function refreshWorkbuddyToken(refreshToken, credentials, log) {
   if (!refreshToken) return null;
   return dedupRefresh("workbuddy", refreshToken, async () => {
     const oauth = PROVIDER_OAUTH["workbuddy"] || {};
-    const staticHeaders = PROVIDERS["workbuddy"]?.headers || {};
-    const uid = resolveWorkBuddyUid(credentials);
     const response = await fetch(oauth.refreshUrl, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        ...Object.fromEntries(WORKBUDDY_REFRESH_HEADER_KEYS.filter((k) => staticHeaders[k]).map((k) => [k, staticHeaders[k]])),
-        ...(uid ? { "X-User-Id": uid } : {}),
-        ...workBuddyDeviceHeaders(uid || credentials?.connectionId),
-        "X-Refresh-Token": refreshToken,
-        "X-Auth-Refresh-Source": "plugin",
-      },
+      headers: buildWorkBuddyRefreshHeaders(refreshToken, credentials),
       body: "{}",
     });
 

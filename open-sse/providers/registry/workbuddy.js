@@ -1,10 +1,14 @@
+import { WORKBUDDY_CLIENT_VERSION, workbuddyChatUa } from "../shared.js";
+
 // WorkBuddy International (workbuddy.ai) — Tencent's desktop agent. Same
 // CodeBuddy platform/gateway as codebuddy-intl, but a separate realm: accounts,
 // domain and client fingerprint differ, and accounts are not shared between
-// codebuddy.ai and workbuddy.ai. Wire protocol per HanawaBanana/workbuddy2api
-// (realm `global`): stream-only /v2/chat/completions, no PKCE login, refresh via
-// X-Refresh-Token. A wrong platform segment in the User-Agent is answered with
-// 403 code 11140 ("request illegal").
+// codebuddy.ai and workbuddy.ai. Wire protocol: stream-only /v2/chat/completions,
+// no PKCE login, refresh via X-Refresh-Token. Chat goes out as the desktop client
+// (WorkBuddy 5.8.4 packet capture, see shared.js); a wrong platform segment in the
+// User-Agent is answered with 403 code 11140 ("request illegal"). The UA and
+// X-IDE-Version below are defaults: WorkBuddyExecutor re-reads WORKBUDDY_CLIENT_VERSION /
+// WORKBUDDY_CLI_VERSION / WORKBUDDY_CHAT_UA on every request.
 export default {
   id: "workbuddy",
   alias: "wb",
@@ -29,22 +33,25 @@ export default {
     forceStream: true,
     // Same unified OpenAI reasoning_effort shape as the CodeBuddy gateways.
     thinkingFormat: "openai",
-    // Desktop client fingerprint (the executor adds the per-account identity
-    // headers: X-User-Id, X-Machine-ID, X-Session-ID, conversation family).
+    // Desktop client chat fingerprint. The executor adds the per-request part:
+    // X-User-Id, Accept, the conversation and trace id families. The desktop's chat
+    // calls carry no X-Machine-ID / X-Session-ID (those ride billing calls only).
     headers: {
-      "User-Agent": "WorkBuddy/5.5.4 WorkBuddy AI/5.5.4 CLI/2.137.1",
+      "User-Agent": workbuddyChatUa(),
       "X-Requested-With": "XMLHttpRequest",
       "X-CodeBuddy-Request": "1",
       "Origin": "https://www.workbuddy.ai",
       "Referer": "https://www.workbuddy.ai/",
       "Accept-Language": "en-US",
-      "X-No-Enterprise-Id": "1",
-      "X-Domain": "www.workbuddy.ai",
+      "X-Agent-Intent": "craft",
       "X-Agent-Purpose": "conversation",
+      "X-Agent-Type": "main",
       "X-IDE-Name": "WorkBuddy",
       "X-IDE-Type": "WorkBuddy",
-      "X-IDE-Version": "5.5.4",
-      "X-Product": "WorkBuddy",
+      "X-IDE-Version": WORKBUDDY_CLIENT_VERSION,
+      "X-Private-Data": "true",
+      "X-Product": "SaaS",
+      "X-Domain": "www.workbuddy.ai",
     },
     auth: {
       combined: true,
@@ -94,8 +101,6 @@ export default {
     refreshUrl: "https://www.workbuddy.ai/v2/plugin/auth/token/refresh",
     // Idempotent account activation every new global account needs after login.
     registerUrl: "https://www.workbuddy.ai/auth/realms/copilot/overseas/user/register",
-    // Single-segment UA of the client's non-chat calls (login, billing).
-    userAgent: "WorkBuddy/5.5.4",
     origin: "https://www.workbuddy.ai",
     domain: "www.workbuddy.ai",
     platform: "CLI",

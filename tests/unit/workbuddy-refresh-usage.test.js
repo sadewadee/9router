@@ -1,6 +1,8 @@
 // WorkBuddy token refresh + billing usage + registry data.
-//   refresh: POST /v2/plugin/auth/token/refresh, token in X-Refresh-Token, desktop-client headers
-//   usage:   POST workbuddy.ai /billing/meter/get-user-resource (bare path first, /v2 on 404)
+//   refresh: POST /v2/plugin/auth/token/refresh, token in X-Refresh-Token, desktop-client
+//            headers (single-segment WorkBuddy/<version> UA, no machine/session ids)
+//   usage:   POST workbuddy.ai /billing/meter/get-user-resource (bare path first, /v2 on 404),
+//            the only call that carries the per-account X-Machine-ID / X-Session-ID
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const proxyFetchMock = vi.hoisted(() => vi.fn());
@@ -17,7 +19,10 @@ import { getCapabilitiesForModel } from "../../open-sse/providers/capabilities.j
 import { getThinkingLevels } from "../../open-sse/providers/thinkingLevels.js";
 
 const BASE = "https://www.workbuddy.ai";
-const HEX36 = /^[0-9a-f]{36}$/;
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const HEX32 = /^[0-9a-f]{32}$/;
+const BILLING_UA = "WorkBuddy/5.8.4";
+const BROWSER_ACCEPT = "application/json, text/plain, */*";
 const jwt = (claims) => `eyJhbGciOiJSUzI1NiJ9.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.sig`;
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status });
 
@@ -47,10 +52,11 @@ describe("refreshWorkbuddyToken", () => {
     expect(out).toEqual({ accessToken: "new-access", refreshToken: "new-refresh", expiresIn: 5184000 });
   });
 
-  it("sends the desktop client fingerprint and the account identity", async () => {
+  it("sends the desktop's non-chat headers: billing UA, browser Accept, realm and account identity", async () => {
     await refreshWorkbuddyToken(freshRefreshToken(), { providerSpecificData: { uid: "uid-111" } });
     const h = fetchMock.mock.calls[0][1].headers;
-    expect(h["User-Agent"]).toBe("WorkBuddy/5.5.4 WorkBuddy AI/5.5.4 CLI/2.137.1");
+    expect(h["User-Agent"]).toBe(BILLING_UA);
+    expect(h["Accept"]).toBe(BROWSER_ACCEPT);
     expect(h["Origin"]).toBe(BASE);
     expect(h["Referer"]).toBe(`${BASE}/`);
     expect(h["X-Domain"]).toBe("www.workbuddy.ai");
@@ -59,16 +65,35 @@ describe("refreshWorkbuddyToken", () => {
     expect(h["Accept-Language"]).toBe("en-US");
     expect(h["Content-Type"]).toBe("application/json");
     expect(h["X-User-Id"]).toBe("uid-111");
-    expect(h["X-Machine-ID"]).toMatch(HEX36);
-    expect(h["X-Session-ID"]).toMatch(HEX36);
   });
 
-  it("uses the same device id as the chat path and takes the uid from the token when needed", async () => {
+  it("carries no machine/session ids, no agent headers and no enterprise marker for a personal account", async () => {
+    await refreshWorkbuddyToken(freshRefreshToken(), { providerSpecificData: { uid: "uid-111" } });
+    const h = fetchMock.mock.calls[0][1].headers;
+    for (const key of ["X-Machine-ID", "X-Session-ID", "X-Device-Token", "X-Product", "X-IDE-Version", "X-Enterprise-Id", "X-No-Enterprise-Id"]) {
+      expect(h[key], key).toBeUndefined();
+    }
+  });
+
+  it("uses the stored account domain, adds X-Enterprise-Id for an enterprise account, and takes the uid from the token when needed", async () => {
     await refreshWorkbuddyToken(freshRefreshToken(), { accessToken: jwt({ sub: "uid-jwt" }) });
-    await refreshWorkbuddyToken(freshRefreshToken(), { providerSpecificData: { uid: "uid-jwt" } });
+    await refreshWorkbuddyToken(freshRefreshToken(), { providerSpecificData: { uid: "uid-e", domain: "ent.workbuddy.ai", enterpriseId: "ent-42" } });
     const [a, b] = fetchMock.mock.calls.map(([, init]) => init.headers);
     expect(a["X-User-Id"]).toBe("uid-jwt");
-    expect(a["X-Machine-ID"]).toBe(b["X-Machine-ID"]);
+    expect(b["X-Domain"]).toBe("ent.workbuddy.ai");
+    expect(b["X-Enterprise-Id"]).toBe("ent-42");
+  });
+
+  it("follows WORKBUDDY_CLIENT_VERSION for the UA, with no rebuild", async () => {
+    const before = process.env.WORKBUDDY_CLIENT_VERSION;
+    process.env.WORKBUDDY_CLIENT_VERSION = "5.9.1";
+    try {
+      await refreshWorkbuddyToken(freshRefreshToken(), { providerSpecificData: { uid: "uid-111" } });
+    } finally {
+      if (before === undefined) delete process.env.WORKBUDDY_CLIENT_VERSION;
+      else process.env.WORKBUDDY_CLIENT_VERSION = before;
+    }
+    expect(fetchMock.mock.calls[0][1].headers["User-Agent"]).toBe("WorkBuddy/5.9.1");
   });
 
   it("keeps the old refresh token when the response carries none", async () => {
@@ -116,7 +141,7 @@ describe("getWorkBuddyUsage", () => {
   const billing = (accounts) => json({ code: 0, data: { Response: { Data: { Accounts: accounts } } } });
   const tokenArg = jwt({ sub: "uid-jwt" });
 
-  it("POSTs the client's package filter to the bare billing path with single-segment WorkBuddy headers", async () => {
+  it("POSTs the client's package filter to the bare billing path with the desktop's billing headers", async () => {
     proxyFetchMock.mockImplementation(async () => billing([account()]));
     await getWorkBuddyUsage(tokenArg, null, { uid: "uid-111" }, { strictProxy: false });
 
@@ -126,16 +151,74 @@ describe("getWorkBuddyUsage", () => {
     expect(init.method).toBe("POST");
     expect(proxyOptions).toEqual({ strictProxy: false });
     expect(init.headers["Authorization"]).toBe(`Bearer ${tokenArg}`);
-    expect(init.headers["User-Agent"]).toBe("WorkBuddy/5.5.4");
+    expect(init.headers["Content-Type"]).toBe("application/json");
+    expect(init.headers["Accept"]).toBe(BROWSER_ACCEPT);
+    expect(init.headers["User-Agent"]).toBe(BILLING_UA);
+    expect(init.headers["X-Requested-With"]).toBe("XMLHttpRequest");
+    expect(init.headers["Origin"]).toBe(BASE);
+    expect(init.headers["Referer"]).toBe(`${BASE}/`);
     expect(init.headers["X-User-Id"]).toBe("uid-111");
     expect(init.headers["X-Domain"]).toBe("www.workbuddy.ai");
     expect(init.headers["X-CodeBuddy-Request"]).toBe("1");
     expect(init.headers["Accept-Language"]).toBe("en-US");
+    expect(init.headers["X-Request-ID"]).toMatch(HEX32);
+    expect(init.headers["X-No-Enterprise-Id"]).toBe("1");
 
     const body = JSON.parse(init.body);
     expect(body).toMatchObject({ PageNumber: 1, PageSize: 100, ProductCode: "p_tcaca", Status: [0, 3] });
     expect(body.PackageEndTimeRangeBegin).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
     expect(body.PackageEndTimeRangeEnd > body.PackageEndTimeRangeBegin).toBe(true);
+  });
+
+  it("sends a UUID-shaped X-Machine-ID / X-Session-ID, stable per account and different across accounts", async () => {
+    proxyFetchMock.mockImplementation(async () => billing([account()]));
+    await getWorkBuddyUsage(tokenArg, null, { uid: "uid-111" }, null);
+    await getWorkBuddyUsage(tokenArg, null, { uid: "uid-111" }, null);
+    await getWorkBuddyUsage(tokenArg, null, { uid: "uid-222" }, null);
+    const [a1, a2, b] = proxyFetchMock.mock.calls.map(([, init]) => init.headers);
+    expect(a1["X-Machine-ID"]).toMatch(UUID_V4);
+    expect(a1["X-Session-ID"]).toMatch(UUID_V4);
+    expect(a1["X-Machine-ID"]).not.toBe(a1["X-Session-ID"]);
+    expect(a2["X-Machine-ID"]).toBe(a1["X-Machine-ID"]);
+    expect(a2["X-Session-ID"]).toBe(a1["X-Session-ID"]);
+    expect(b["X-Machine-ID"]).not.toBe(a1["X-Machine-ID"]);
+    expect(b["X-Session-ID"]).not.toBe(a1["X-Session-ID"]);
+    expect(a2["X-Request-ID"]).not.toBe(a1["X-Request-ID"]);
+  });
+
+  it("seeds the ids from the access token's sub when the uid was not stored", async () => {
+    proxyFetchMock.mockImplementation(async () => billing([account()]));
+    await getWorkBuddyUsage(tokenArg, null, {}, null);
+    await getWorkBuddyUsage("opaque-token", null, {}, null);
+    const [fromJwt, opaque] = proxyFetchMock.mock.calls.map(([, init]) => init.headers);
+    expect(fromJwt["X-User-Id"]).toBe("uid-jwt");
+    expect(fromJwt["X-Machine-ID"]).toMatch(UUID_V4);
+    expect(opaque["X-User-Id"]).toBeUndefined();
+    expect(opaque["X-Machine-ID"]).toBeUndefined();
+    expect(opaque["X-Session-ID"]).toBeUndefined();
+  });
+
+  it("adds the enterprise headers instead of X-No-Enterprise-Id for an enterprise account, with the stored domain", async () => {
+    proxyFetchMock.mockImplementation(async () => billing([account()]));
+    await getWorkBuddyUsage(tokenArg, null, { uid: "uid-e", domain: "ent.workbuddy.ai", enterpriseId: "ent-42" }, null);
+    const h = proxyFetchMock.mock.calls[0][1].headers;
+    expect(h["X-Enterprise-Id"]).toBe("ent-42");
+    expect(h["X-Tenant-Id"]).toBe("ent-42");
+    expect(h["X-No-Enterprise-Id"]).toBeUndefined();
+    expect(h["X-Domain"]).toBe("ent.workbuddy.ai");
+  });
+
+  it("follows WORKBUDDY_CLIENT_VERSION for the billing UA", async () => {
+    proxyFetchMock.mockImplementation(async () => billing([account()]));
+    const before = process.env.WORKBUDDY_CLIENT_VERSION;
+    process.env.WORKBUDDY_CLIENT_VERSION = "5.9.1";
+    try {
+      await getWorkBuddyUsage(tokenArg, null, { uid: "uid-111" }, null);
+    } finally {
+      if (before === undefined) delete process.env.WORKBUDDY_CLIENT_VERSION;
+      else process.env.WORKBUDDY_CLIENT_VERSION = before;
+    }
+    expect(proxyFetchMock.mock.calls[0][1].headers["User-Agent"]).toBe("WorkBuddy/5.9.1");
   });
 
   it("falls back to the /v2 billing path when the bare one answers 404", async () => {

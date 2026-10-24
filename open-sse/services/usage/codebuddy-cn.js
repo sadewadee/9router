@@ -20,8 +20,8 @@
  */
 
 import { proxyAwareFetch } from "../../utils/proxyFetch.js";
-import { PROVIDERS, PROVIDER_OAUTH } from "../../providers/index.js";
-import { resolveWorkBuddyUid } from "../../utils/workbuddyIdentity.js";
+import { PROVIDERS } from "../../providers/index.js";
+import { buildWorkBuddyBillingHeaders } from "../../utils/workbuddyIdentity.js";
 import { U, parseResetTime } from "./shared.js";
 
 const PROVIDER_ID = "codebuddy-cn";
@@ -57,23 +57,14 @@ function billingWallClock(date) {
   return new Date(date.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 19).replace("T", " ");
 }
 
-// WorkBuddy global realm: the client's billing call (single-segment UA, account
-// uid) with the package filter it sends — every package still valid, active or
-// not yet started.
+// WorkBuddy global realm: the desktop client's billing call (single-segment UA,
+// account uid, per-account X-Machine-ID / X-Session-ID) with the package filter
+// it sends — every package still valid, active or not yet started.
 const WORKBUDDY_PROFILE = {
   label: "WorkBuddy",
   defaultPlan: "WorkBuddy",
-  headers: (providerId, providerSpecificData, token) => {
-    const oauth = PROVIDER_OAUTH[providerId] || {};
-    const uid = resolveWorkBuddyUid({ providerSpecificData, accessToken: token });
-    return {
-      "User-Agent": oauth.userAgent,
-      "X-CodeBuddy-Request": "1",
-      "Accept-Language": PROVIDERS[providerId]?.headers?.["Accept-Language"] || "en-US",
-      "X-Domain": oauth.domain,
-      ...(uid ? { "X-User-Id": uid } : {}),
-    };
-  },
+  headers: (providerId, providerSpecificData, token) =>
+    buildWorkBuddyBillingHeaders({ providerSpecificData, accessToken: token }),
   body: () => {
     const now = new Date();
     return JSON.stringify({
@@ -102,10 +93,10 @@ async function getCodeBuddyUsage(providerId, accessToken, apiKey, providerSpecif
       response = await proxyAwareFetch(target, {
         method: "POST",
         headers: {
-          ...profile.headers(providerId, providerSpecificData, token),
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
           Accept: "application/json",
+          ...profile.headers(providerId, providerSpecificData, token),
         },
         body: profile.body(),
       }, proxyOptions);

@@ -1,8 +1,9 @@
 // WorkBuddy International (workbuddy.ai) chat path: same CodeBuddy gateway as
-// codebuddy-intl, but the desktop client fingerprint of the global realm. A wrong
-// User-Agent platform segment is answered 403 code 11140, so the exact string is
-// pinned here. Chat is stream-only; X-Refresh-Token must never ride on a chat call.
-import { describe, it, expect, vi, beforeEach } from "vitest";
+// codebuddy-intl, but the desktop client fingerprint of the global realm (desktop
+// 5.8.4 capture). A wrong User-Agent platform segment is answered 403 code 11140, so
+// the exact string and the exact header set are pinned here. Chat is stream-only;
+// X-Refresh-Token, X-Machine-ID and X-Session-ID must never ride on a chat call.
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const fetchMock = vi.hoisted(() => vi.fn());
 
@@ -12,15 +13,47 @@ vi.mock("../../open-sse/utils/proxyFetch.js", async (importOriginal) => {
 });
 
 import { WorkBuddyExecutor } from "../../open-sse/executors/workbuddy.js";
+import { markLegacyAttempt } from "../../open-sse/executors/codebuddy-base.js";
 import { getExecutor } from "../../open-sse/executors/index.js";
-import { deriveWorkBuddyStableId, jwtSubject, resolveWorkBuddyUid } from "../../open-sse/utils/workbuddyIdentity.js";
+import {
+  deriveWorkBuddyStableId,
+  jwtSubject,
+  resolveWorkBuddyUid,
+  uuidv7Hex,
+  workBuddyBillingUserAgent,
+  workBuddyChatUserAgent,
+  workBuddyClientVersion,
+} from "../../open-sse/utils/workbuddyIdentity.js";
 
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const HEX32 = /^[0-9a-f]{32}$/;
-const HEX36 = /^[0-9a-f]{36}$/;
+const HEX16 = /^[0-9a-f]{16}$/;
+// UUIDv7 without hyphens: version nibble 7 at index 12, variant 8-b at index 16.
+const UUID7_HEX = /^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$/;
+
+const CHAT_UA = "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0";
+const ENV_KEYS = ["WORKBUDDY_CLIENT_VERSION", "WORKBUDDY_CLI_VERSION", "WORKBUDDY_CHAT_UA"];
 
 const jwt = (claims) => `eyJhbGciOiJSUzI1NiJ9.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.sig`;
 const user = (text) => ({ role: "user", content: text });
+
+// Run with WORKBUDDY_* env set (undefined removes the key), restoring the real env afterwards.
+const saved = {};
+const setEnv = (values) => {
+  for (const [key, value] of Object.entries(values)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+};
+
+beforeEach(() => {
+  for (const key of ENV_KEYS) saved[key] = process.env[key];
+  setEnv(Object.fromEntries(ENV_KEYS.map((key) => [key, undefined])));
+});
+
+afterEach(() => {
+  setEnv(saved);
+});
 
 describe("WorkBuddyExecutor chat request", () => {
   const exec = new WorkBuddyExecutor();
@@ -33,38 +66,76 @@ describe("WorkBuddyExecutor chat request", () => {
   });
 
   describe("headers", () => {
-    it("sends the exact WorkBuddy AI desktop User-Agent", () => {
-      expect(headersFor()["User-Agent"]).toBe("WorkBuddy/5.5.4 WorkBuddy AI/5.5.4 CLI/2.137.1");
+    it("sends exactly the desktop 5.8.4 chat header set, nothing more", () => {
+      expect(Object.keys(headersFor()).sort()).toEqual([
+        "Accept",
+        "Accept-Language",
+        "Authorization",
+        "Content-Type",
+        "Origin",
+        "Referer",
+        "User-Agent",
+        "X-Agent-Intent",
+        "X-Agent-Purpose",
+        "X-Agent-Type",
+        "X-B3-Sampled",
+        "X-B3-SpanId",
+        "X-B3-TraceId",
+        "X-CodeBuddy-Request",
+        "X-Conversation-ID",
+        "X-Conversation-Message-ID",
+        "X-Conversation-Request-ID",
+        "X-Domain",
+        "X-IDE-Name",
+        "X-IDE-Type",
+        "X-IDE-Version",
+        "X-Private-Data",
+        "X-Product",
+        "X-Request-ID",
+        "X-Requested-With",
+        "X-Root-Request-ID",
+        "X-Trace-ID",
+        "X-User-Id",
+        "b3",
+        "traceparent",
+      ]);
     });
 
-    it("declares the global realm: Origin/Referer, X-Domain, no enterprise id, en-US", () => {
+    it("sends the exact WorkBuddy desktop User-Agent", () => {
+      expect(headersFor()["User-Agent"]).toBe(CHAT_UA);
+    });
+
+    it("declares the global realm: Origin/Referer, X-Domain, en-US, no enterprise headers for a personal account", () => {
       const h = headersFor();
       expect(h["Origin"]).toBe("https://www.workbuddy.ai");
       expect(h["Referer"]).toBe("https://www.workbuddy.ai/");
       expect(h["X-Domain"]).toBe("www.workbuddy.ai");
-      expect(h["X-No-Enterprise-Id"]).toBe("1");
       expect(h["Accept-Language"]).toBe("en-US");
+      for (const key of ["X-No-Enterprise-Id", "X-Enterprise-Id", "X-Tenant-Id"]) expect(h[key]).toBeUndefined();
     });
 
-    it("sends the client gate headers and the streaming Accept", () => {
+    it("sends the client gate headers and the browser-style Accept", () => {
       const h = headersFor();
       expect(h["X-CodeBuddy-Request"]).toBe("1");
       expect(h["X-Requested-With"]).toBe("XMLHttpRequest");
-      expect(h["Accept"]).toBe("application/json, text/event-stream");
+      expect(h["Accept"]).toBe("application/json, text/plain, */*");
       expect(h["Content-Type"]).toBe("application/json");
     });
 
-    it("sends the usage attribution headers as WorkBuddy", () => {
+    it("sends the desktop's agent and usage attribution headers", () => {
       const h = headersFor();
+      expect(h["X-Agent-Intent"]).toBe("craft");
       expect(h["X-Agent-Purpose"]).toBe("conversation");
+      expect(h["X-Agent-Type"]).toBe("main");
       expect(h["X-IDE-Name"]).toBe("WorkBuddy");
       expect(h["X-IDE-Type"]).toBe("WorkBuddy");
-      expect(h["X-Product"]).toBe("WorkBuddy");
-      expect(h["X-IDE-Version"]).toBe("5.5.4");
+      expect(h["X-IDE-Version"]).toBe("5.8.4");
+      expect(h["X-Private-Data"]).toBe("true");
+      expect(h["X-Product"]).toBe("SaaS");
     });
 
-    it("keeps the Accept streaming even when the caller passes stream=false", () => {
-      expect(exec.buildHeaders(creds, false, "url", "glm-5.3", { messages: [user("hi")] })["Accept"]).toBe("application/json, text/event-stream");
+    it("keeps the same Accept when the caller passes stream=false", () => {
+      expect(exec.buildHeaders(creds, false, "url", "glm-5.3", { messages: [user("hi")] })["Accept"]).toBe("application/json, text/plain, */*");
     });
 
     it("authenticates with the bearer access token and never sends X-Refresh-Token", () => {
@@ -73,52 +144,81 @@ describe("WorkBuddyExecutor chat request", () => {
       expect(Object.keys(h).map((k) => k.toLowerCase())).not.toContain("x-refresh-token");
       expect(JSON.stringify(h)).not.toContain("rt-secret");
     });
+
+    it("carries no device fingerprint on chat: no X-Machine-ID, X-Session-ID or X-Device-Token", () => {
+      const h = headersFor();
+      for (const key of ["X-Machine-ID", "X-Session-ID", "X-Device-Token", "X-No-User-Id"]) expect(h[key]).toBeUndefined();
+    });
+  });
+
+  describe("env overrides", () => {
+    it("WORKBUDDY_CLIENT_VERSION bumps X-IDE-Version and the UA app segments, keeps the CLI segment", () => {
+      setEnv({ WORKBUDDY_CLIENT_VERSION: "5.9.1" });
+      const h = headersFor();
+      expect(h["X-IDE-Version"]).toBe("5.9.1");
+      expect(h["User-Agent"]).toBe("WorkBuddy/5.9.1 workbuddy-ai/5.9.1 CLI/2.161.0");
+    });
+
+    it("WORKBUDDY_CLI_VERSION bumps only the CLI segment", () => {
+      setEnv({ WORKBUDDY_CLI_VERSION: "2.170.3" });
+      expect(headersFor()["User-Agent"]).toBe("WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.170.3");
+    });
+
+    it("WORKBUDDY_CHAT_UA replaces the whole chat UA verbatim and wins over the version vars", () => {
+      setEnv({ WORKBUDDY_CHAT_UA: "WorkBuddy/9.9.9 custom/1 CLI/3.0.0", WORKBUDDY_CLIENT_VERSION: "5.9.1" });
+      const h = headersFor();
+      expect(h["User-Agent"]).toBe("WorkBuddy/9.9.9 custom/1 CLI/3.0.0");
+      expect(h["X-IDE-Version"]).toBe("5.9.1");
+    });
+
+    it("is read per request, so a changed env needs no rebuild or new executor", () => {
+      expect(headersFor()["User-Agent"]).toBe(CHAT_UA);
+      setEnv({ WORKBUDDY_CLIENT_VERSION: "6.0.0" });
+      expect(headersFor()["User-Agent"]).toBe("WorkBuddy/6.0.0 workbuddy-ai/6.0.0 CLI/2.161.0");
+    });
+
+    it("ignores blank values", () => {
+      setEnv({ WORKBUDDY_CLIENT_VERSION: "  ", WORKBUDDY_CHAT_UA: "" });
+      expect(headersFor()["User-Agent"]).toBe(CHAT_UA);
+    });
+
+    it("exposes the same values through the identity helpers (billing UA follows the client version)", () => {
+      expect(workBuddyClientVersion()).toBe("5.8.4");
+      expect(workBuddyChatUserAgent()).toBe(CHAT_UA);
+      expect(workBuddyBillingUserAgent()).toBe("WorkBuddy/5.8.4");
+      setEnv({ WORKBUDDY_CLIENT_VERSION: "5.9.1" });
+      expect(workBuddyBillingUserAgent()).toBe("WorkBuddy/5.9.1");
+    });
   });
 
   describe("account identity", () => {
     it("sends X-User-Id from providerSpecificData.uid", () => {
-      const h = headersFor();
-      expect(h["X-User-Id"]).toBe("uid-111");
-      expect(h["X-No-User-Id"]).toBeUndefined();
+      expect(headersFor()["X-User-Id"]).toBe("uid-111");
     });
 
-    it("falls back to the access token's sub claim, then to X-No-User-Id", () => {
+    it("falls back to the access token's sub claim, then to the hub's \"anonymous\"", () => {
       expect(headersFor({ accessToken: jwt({ sub: "uid-from-jwt" }), connectionId: "c" })["X-User-Id"]).toBe("uid-from-jwt");
       const anon = headersFor({ accessToken: "opaque-token", connectionId: "c" });
-      expect(anon["X-User-Id"]).toBeUndefined();
-      expect(anon["X-No-User-Id"]).toBe("1");
+      expect(anon["X-User-Id"]).toBe("anonymous");
+      expect(anon["X-No-User-Id"]).toBeUndefined();
     });
 
-    it("derives a stable 36-hex X-Machine-ID / X-Session-ID per account", () => {
-      const a1 = headersFor();
-      const a2 = headersFor();
-      expect(a1["X-Machine-ID"]).toMatch(HEX36);
-      expect(a1["X-Session-ID"]).toMatch(HEX36);
-      expect(a1["X-Machine-ID"]).not.toBe(a1["X-Session-ID"]);
-      expect(a2["X-Machine-ID"]).toBe(a1["X-Machine-ID"]);
-      expect(a2["X-Session-ID"]).toBe(a1["X-Session-ID"]);
+    it("adds X-Enterprise-Id and X-Tenant-Id for an enterprise account", () => {
+      const h = headersFor({ ...creds, providerSpecificData: { uid: "uid-111", enterpriseId: "ent-42" } });
+      expect(h["X-Enterprise-Id"]).toBe("ent-42");
+      expect(h["X-Tenant-Id"]).toBe("ent-42");
+      expect(h["X-No-Enterprise-Id"]).toBeUndefined();
     });
+  });
 
-    it("gives different accounts different device and session ids", () => {
-      const a = headersFor({ ...creds, providerSpecificData: { uid: "uid-111" } });
-      const b = headersFor({ ...creds, providerSpecificData: { uid: "uid-222" } });
-      expect(b["X-Machine-ID"]).not.toBe(a["X-Machine-ID"]);
-      expect(b["X-Session-ID"]).not.toBe(a["X-Session-ID"]);
-    });
-
-    it("seeds the ids from the connection id when the uid is unknown, and omits them with no seed", () => {
-      const byConn = (connectionId) => headersFor({ accessToken: "opaque", connectionId });
-      expect(byConn("conn-1")["X-Machine-ID"]).toMatch(HEX36);
-      expect(byConn("conn-1")["X-Machine-ID"]).toBe(byConn("conn-1")["X-Machine-ID"]);
-      expect(byConn("conn-1")["X-Machine-ID"]).not.toBe(byConn("conn-2")["X-Machine-ID"]);
-      const none = headersFor({ accessToken: "opaque" });
-      expect(none["X-Machine-ID"]).toBeUndefined();
-      expect(none["X-Session-ID"]).toBeUndefined();
-    });
-
-    it("matches the reference derivation (sha256 of wb2a:<purpose>:<uid>, first 36 hex)", () => {
-      expect(deriveWorkBuddyStableId("uid-111", "machine")).toBe(headersFor()["X-Machine-ID"]);
-      expect(deriveWorkBuddyStableId("uid-111", "session")).toBe(headersFor()["X-Session-ID"]);
+  describe("stable device id derivation (billing only)", () => {
+    it("is UUID-shaped, stable per seed, and different per seed and purpose", () => {
+      const machine = deriveWorkBuddyStableId("uid-111", "machine");
+      expect(machine).toMatch(UUID_V4);
+      expect(deriveWorkBuddyStableId("uid-111", "machine")).toBe(machine);
+      expect(deriveWorkBuddyStableId("uid-111", "session")).toMatch(UUID_V4);
+      expect(deriveWorkBuddyStableId("uid-111", "session")).not.toBe(machine);
+      expect(deriveWorkBuddyStableId("uid-222", "machine")).not.toBe(machine);
     });
   });
 
@@ -132,30 +232,46 @@ describe("WorkBuddyExecutor chat request", () => {
       expect(headersFor({ ...creds, connectionId: "conn-2" }, { messages: [user("fix the parser")] })["X-Conversation-ID"]).not.toBe(turn1["X-Conversation-ID"]);
     });
 
-    it("mints fresh 32-hex request and message ids on every request", () => {
+    it("mints fresh UUIDv7 request and message ids on every request", () => {
       const a = headersFor();
       const b = headersFor();
       for (const key of ["X-Conversation-Request-ID", "X-Conversation-Message-ID"]) {
-        expect(a[key]).toMatch(HEX32);
+        expect(a[key]).toMatch(UUID7_HEX);
         expect(a[key]).not.toBe(b[key]);
       }
       expect(a["X-Conversation-Request-ID"]).not.toBe(a["X-Conversation-Message-ID"]);
     });
 
-    it("mirrors the ids like the official client: request = message, root/trace = conversation request", () => {
+    it("mirrors the ids like the desktop: request id = message id, root id = conversation request id", () => {
       const h = headersFor();
       expect(h["X-Request-ID"]).toBe(h["X-Conversation-Message-ID"]);
       expect(h["X-Root-Request-ID"]).toBe(h["X-Conversation-Request-ID"]);
-      expect(h["X-Trace-ID"]).toBe(h["X-Conversation-Request-ID"]);
     });
 
-    it("sends B3 trace headers (32-hex trace id, 16-hex span id, sampled)", () => {
+    it("sends the trace family: X-Trace-ID, traceparent, b3 and X-B3-* from one trace/span pair", () => {
       const h = headersFor();
-      expect(h["X-B3-TraceId"]).toMatch(HEX32);
-      expect(h["X-B3-TraceId"]).toBe(h["X-Conversation-Request-ID"]);
-      expect(h["X-B3-SpanId"]).toMatch(/^[0-9a-f]{16}$/);
-      expect(h["X-Conversation-Message-ID"].startsWith(h["X-B3-SpanId"])).toBe(true);
+      const trace = h["X-Trace-ID"];
+      const span = h["X-B3-SpanId"];
+      expect(trace).toMatch(UUID7_HEX);
+      expect(span).toMatch(HEX16);
+      expect(h["X-B3-TraceId"]).toBe(trace);
       expect(h["X-B3-Sampled"]).toBe("1");
+      expect(h["traceparent"]).toBe(`00-${trace}-${span}-01`);
+      expect(h["b3"]).toBe(`${trace}-${span}-1`);
+    });
+
+    it("uses a fresh trace and span on every request, independent of the conversation ids", () => {
+      const a = headersFor();
+      const b = headersFor();
+      expect(b["X-Trace-ID"]).not.toBe(a["X-Trace-ID"]);
+      expect(b["X-B3-SpanId"]).not.toBe(a["X-B3-SpanId"]);
+      expect(a["X-Trace-ID"]).not.toBe(a["X-Conversation-Request-ID"]);
+    });
+
+    it("uuidv7Hex encodes the timestamp in the leading 48 bits", () => {
+      const id = uuidv7Hex(0x0123456789ab);
+      expect(id).toMatch(UUID7_HEX);
+      expect(id.startsWith("0123456789ab7")).toBe(true);
     });
   });
 
@@ -167,12 +283,42 @@ describe("WorkBuddyExecutor chat request", () => {
       }
     });
 
-    it("shares the intl transform: leading system prompt, typed user blocks, reasoning mirror", () => {
+    it("shares the intl transform: typed user blocks, reasoning mirror", () => {
       const out = exec.transformRequest("glm-5.3", { messages: [user("hi")], reasoning_effort: "high" }, false, creds);
-      expect(out.messages[0]).toEqual({ role: "system", content: "You are CodeBuddy Code." });
       expect(out.messages[1].content).toEqual([{ type: "text", text: "hi" }]);
       expect(out.reasoning_effort).toBe("high");
       expect(out.reasoning_summary).toBe("auto");
+    });
+
+    it("never sends the CodeBuddy identity line; a neutral lead stands in when the client sent no system prompt", () => {
+      const out = exec.transformRequest("glm-5.3", { messages: [user("hi")] }, true, creds);
+      expect(out.messages[0]).toEqual({ role: "system", content: "You are a helpful assistant." });
+      expect(JSON.stringify(out.messages)).not.toContain("CodeBuddy");
+    });
+
+    it("passes the client's own system text through alone, without a prepended lead line", () => {
+      const out = exec.transformRequest("glm-5.3", {
+        messages: [{ role: "system", content: "Answer in French." }, user("hi")],
+      }, true, creds);
+      expect(out.messages[0]).toEqual({ role: "system", content: "Answer in French." });
+      expect(out.messages).toHaveLength(2);
+    });
+
+    it("folds system and developer messages into one leading system message", () => {
+      const out = exec.transformRequest("glm-5.3", {
+        messages: [{ role: "system", content: "Rule one." }, { role: "developer", content: "Rule two." }, user("hi")],
+      }, true, creds);
+      expect(out.messages[0]).toEqual({ role: "system", content: "Rule one.\n\nRule two." });
+      expect(out.messages.filter((m) => m.role === "system")).toHaveLength(1);
+    });
+
+    it("sends the hub's minimal neutral prompt on the content-filter legacy re-send", () => {
+      const out = exec.transformRequest("glm-5.3", markLegacyAttempt({
+        messages: [{ role: "system", content: "Answer in French." }, user("hi")],
+      }), true, creds);
+      expect(out.messages[0].content).toBe(
+        "You are a helpful assistant. Respond in the user's language, follow the user's instructions, and be direct and concise.",
+      );
     });
   });
 
@@ -189,13 +335,15 @@ describe("WorkBuddyExecutor chat request", () => {
       expect(url).toBe("https://www.workbuddy.ai/v2/chat/completions");
       expect(opts.method).toBe("POST");
       expect(JSON.parse(opts.body).stream).toBe(true);
-      expect(opts.headers["User-Agent"]).toBe("WorkBuddy/5.5.4 WorkBuddy AI/5.5.4 CLI/2.137.1");
-      expect(opts.headers["Accept"]).toBe("application/json, text/event-stream");
+      expect(opts.headers["User-Agent"]).toBe(CHAT_UA);
+      expect(opts.headers["Accept"]).toBe("application/json, text/plain, */*");
       expect(opts.headers["X-User-Id"]).toBe("uid-111");
-      expect(opts.headers["X-Machine-ID"]).toMatch(HEX36);
+      expect(opts.headers["X-Product"]).toBe("SaaS");
+      expect(opts.headers["X-Machine-ID"]).toBeUndefined();
+      expect(opts.headers["X-Session-ID"]).toBeUndefined();
     });
 
-    it("keeps the same account identity on the content-filter legacy re-send", async () => {
+    it("keeps the same account identity and conversation on the content-filter legacy re-send", async () => {
       fetchMock.mockReset();
       fetchMock
         .mockImplementationOnce(async () => new Response('{"error":{"message":"内容违规","type":"content_policy_violation"}}', { status: 400 }))
@@ -208,7 +356,8 @@ describe("WorkBuddyExecutor chat request", () => {
       });
       expect(fetchMock).toHaveBeenCalledTimes(2);
       const [first, retry] = fetchMock.mock.calls.map(([, opts]) => opts.headers);
-      expect(retry["X-Machine-ID"]).toBe(first["X-Machine-ID"]);
+      expect(retry["X-User-Id"]).toBe(first["X-User-Id"]);
+      expect(retry["User-Agent"]).toBe(first["User-Agent"]);
       expect(retry["X-Conversation-ID"]).toBe(first["X-Conversation-ID"]);
       expect(retry["X-Conversation-Request-ID"]).not.toBe(first["X-Conversation-Request-ID"]);
     });
