@@ -48,7 +48,8 @@ describe("opencode GLM thinking format", () => {
   });
 
   it("does not change other opencode models", () => {
-    for (const model of ["deepseek-v4.1-flash-free", "big-pickle", "space-bunny-free", "glm-5.3"]) {
+    // deepseek-v4.1-flash-free is capped on purpose (capabilities.test.js), so it is not in this list.
+    for (const model of ["big-pickle", "space-bunny-free", "glm-5.3"]) {
       expect(getCapabilitiesForModel("opencode", model)).toEqual(getCapabilitiesForModel(null, model));
     }
   });

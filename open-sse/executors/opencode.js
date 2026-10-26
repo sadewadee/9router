@@ -8,6 +8,8 @@ import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
 import { ANTHROPIC_API_VERSION, OPENCODE_UA, OPENCODE_CLIENT } from "../providers/shared.js";
 import { estimateInputTokens } from "../utils/usageTracking.js";
+import { applyEnvFingerprint } from "../utils/opencodeEnvFingerprint.js";
+import { opencodeTlsFetch, isOpencodeTlsEnabled } from "../services/opencodeTlsClient.js";
 import {
   normalizeResponsesInput,
   clampResponsesCallId,
@@ -538,6 +540,19 @@ function freeMaxInputTokens() {
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : DEFAULT_FREE_MAX_INPUT_TOKENS;
 }
 
+// A relay pool (Cloudflare Worker / Vercel / Deno) opens its own TLS connection to
+// opencode.ai, so the ClientHello the free gate checks is the platform's, never ours,
+// and every request answers 429 FreeUsageLimitError. Nothing to do per request but say so once.
+let warnedRelay = false;
+
+function warnRelayBypassesTls({ proxyOptions, log } = {}) {
+  if (warnedRelay || !proxyOptions?.vercelRelayUrl || !isOpencodeTlsEnabled()) return;
+  warnedRelay = true;
+  const warning = "relay proxy pool bypasses TLS impersonation: the free lane will answer 429 FreeUsageLimitError. Point the opencode provider strategy at a plain HTTP/SOCKS proxy pool, or at no pool";
+  if (log?.warn) log.warn("OPENCODE", warning);
+  else console.warn(`[OPENCODE] ${warning}`);
+}
+
 export class OpenCodeExecutor extends BaseExecutor {
   constructor() {
     super("opencode", PROVIDERS.opencode);
@@ -593,8 +608,10 @@ export class OpenCodeExecutor extends BaseExecutor {
       // bash/glob/grep/read (verified live 2026-09-18; extras are allowed).
       // cloakOpencodeTools appends only missing names, so this is idempotent.
       cloakOpencodeTools(body, true, credentials);
+      applyEnvFingerprint(body, true);
     } else if (body && typeof body === "object") {
       cloakOpencodeTools(body, false, credentials);
+      applyEnvFingerprint(body, false, { claude: isMessagesModel(model || body.model) });
     }
     // Anthropic-format /messages bodies reject unknown fields, so no cache key there.
     const session = credentials?.[SESSION_FIELD];
@@ -637,11 +654,16 @@ export class OpenCodeExecutor extends BaseExecutor {
     };
   }
 
+  // The free gate keys on the TLS ClientHello, so a native Node fetch is refused no
+  // matter how faithful the body is. Route direct and plain-proxy (HTTP/SOCKS) egress
+  // through the impersonating client (proxyAwareFetch hands it the proxy to tunnel
+  // through); it declines to native fetch when wreq-js is absent or switched off.
   async execute(args) {
     const refused = this.refuseOversizedRequest(args);
     if (refused) return refused;
+    warnRelayBypassesTls(args);
     const credentials = this.prepareRequestCredentials(args);
-    const result = await super.execute({ ...args, credentials });
+    const result = await super.execute({ ...args, credentials, directFetch: opencodeTlsFetch });
     if (args?.credentials && credentials?._opencodeToolNameMap) {
       args.credentials._opencodeToolNameMap = credentials._opencodeToolNameMap;
     }

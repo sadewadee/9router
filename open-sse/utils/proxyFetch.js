@@ -291,6 +291,19 @@ async function directFetch(url, options, targetUrl) {
 }
 
 /**
+ * Hand a request to the caller's own transport (options.directFetch, e.g. opencode's
+ * TLS-impersonating client) before the native path. The transport resolves to null to
+ * decline (disabled, runtime dependency absent, unsupported proxy scheme) and the
+ * native path carries on. Host pinning is native-only, so a pinned host skips it.
+ * `proxyUrl` is the plain HTTP/SOCKS proxy to tunnel through, null for direct egress;
+ * relay pools never get here (they rewrite the request before any of this).
+ */
+async function tryCustomTransport(customFetch, url, options, proxyUrl, targetUrl) {
+  if (!customFetch || getHostOverrideIp(targetUrl)) return null;
+  return customFetch(url, options, { proxyUrl });
+}
+
+/**
  * One-line reason for a failed proxy attempt. fetch() reports every network
  * failure as "fetch failed"; the useful part (ECONNREFUSED, proxy 407, ...) is
  * in `cause`. Never include the proxy URL here — it carries credentials.
@@ -360,7 +373,9 @@ async function createBypassRequest(parsedUrl, realIP, options) {
   });
 }
 
-export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
+export async function proxyAwareFetch(url, rawOptions = {}, proxyOptions = null) {
+  // `directFetch` is ours, not undici's: keep it out of every fetch() call below.
+  const { directFetch: customFetch, ...options } = rawOptions;
   const targetUrl = typeof url === "string" ? url : url.toString();
 
   // Vercel relay: forward request via relay headers.
@@ -407,6 +422,8 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
 
   if (proxyUrl) {
     try {
+      const custom = await tryCustomTransport(customFetch, url, options, proxyUrl, targetUrl);
+      if (custom) return custom;
       const dispatcher = await getProxyDispatcher(proxyUrl, targetUrl);
       return await originalFetch(url, { ...options, dispatcher });
     } catch (proxyError) {
@@ -415,13 +432,15 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
         throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${describeProxyError(proxyError)}`);
       }
       console.warn(`[ProxyFetch] Proxy failed, falling back to direct: ${describeProxyError(proxyError)}`);
-      return directFetch(url, options, targetUrl);
+      return (await tryCustomTransport(customFetch, url, options, null, targetUrl))
+        || directFetch(url, options, targetUrl);
     }
   }
 
   // got-scraping disabled — use native fetch directly
   // (Re-enable per-host by wrapping with tryGotScrapingFetch when needed)
-  return directFetch(url, options, targetUrl);
+  return (await tryCustomTransport(customFetch, url, options, null, targetUrl))
+    || directFetch(url, options, targetUrl);
 }
 
 /**

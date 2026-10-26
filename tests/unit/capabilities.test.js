@@ -3,6 +3,17 @@ import { getCapabilitiesForModel } from "../../open-sse/providers/capabilities.j
 
 describe("getCapabilitiesForModel", () => {
 
+  it("caps oc/deepseek-v4.1-flash-free at the real backend limit (~330k) instead of 1M", () => {
+    const caps = getCapabilitiesForModel("opencode", "deepseek-v4.1-flash-free");
+    // The OpenCode Free backend rejects prompts above ~330k tokens (decolua/9router#5097);
+    // clients size their compaction budget from the published window.
+    expect(caps).toMatchObject({ vision: true, reasoning: true, contextWindow: 330000, maxOutput: 128000 });
+    expect(caps.maxOutput).toBeLessThanOrEqual(caps.contextWindow);
+    // the keyed lane and the generic id keep the full window
+    expect(getCapabilitiesForModel("opencode-go", "deepseek-v4.1-flash").contextWindow).toBe(1000000);
+    expect(getCapabilitiesForModel(undefined, "deepseek-v4.1-flash").contextWindow).toBe(1000000);
+  });
+
   it("reports DeepSeek V4.1-Flash ids as vision-capable without dropping their thinking/context", () => {
     const v41 = { vision: true, reasoning: true, thinkingFormat: "deepseek", contextWindow: 1000000, maxOutput: 384000 };
     expect(getCapabilitiesForModel(undefined, "deepseek-v4.1-flash")).toMatchObject(v41);
