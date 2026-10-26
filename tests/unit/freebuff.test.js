@@ -149,15 +149,17 @@ function installUpstream(overrides = {}) {
     version: "2026-10-27.1",
     issuedAt: Date.now(),
     refreshAt: Date.now() + 5 * 60_000,
+    // Live shape: opaque "m-<10hex>" keys with "fbm1..." handles, plus the legacy ids the router
+    // still accepts as aliases.
     rows: [
-      { key: "mimo/mimo-v2.5", handle: "mimo-free", displayName: "MiMo Free", tagline: "", badges: [], multimodal: false, premium: false, dataUse: "service", access: "open", sortOrder: 1 },
-      { key: "upstage/solar-pro4", handle: "solar-pro", displayName: "Solar Pro", tagline: "", badges: [], multimodal: true, premium: true, dataUse: "training", access: "locked", sortOrder: 2 },
+      { key: "m-00032eaeec", handle: "fbm1.AAEmimoKey", displayName: "MiMo Free (live key)", tagline: "", badges: [], multimodal: false, premium: false, dataUse: "service", access: "open", sortOrder: 1 },
+      { key: "mimo/mimo-v2.5", handle: "fbm1.AAEmimoAlias", displayName: "MiMo Free", tagline: "", badges: [], multimodal: false, premium: false, dataUse: "service", access: "open", sortOrder: 2 },
+      { key: "z-ai/glm-5.3-flash", handle: "fbm1.AAEglmAlias", displayName: "GLM 5.3 Flash", tagline: "", badges: [], multimodal: false, premium: false, dataUse: "service", access: "open", sortOrder: 3 },
+      { key: "upstage/solar-pro4", handle: "fbm1.AAEsolar", displayName: "Solar Pro", tagline: "", badges: [], multimodal: true, premium: true, dataUse: "training", access: "locked", sortOrder: 4 },
     ],
-    plansUrl: "https://freebuff.com/plans",
+    plansUrl: "https://www.codebuff.com/plans",
     fetchId: "fetch-test-1",
   };
-  // The server resolves an admission model handle back to its canonical key.
-  const MODEL_BY_HANDLE = { "mimo-free": "mimo/mimo-v2.5", "solar-pro": "upstage/solar-pro4" };
   const handlers = {
     deviceKeys: () => json({ keyId: "key-test-1" }),
     catalog: () => json(catalogBody),
@@ -165,7 +167,7 @@ function installUpstream(overrides = {}) {
       json({
         status: "active",
         instanceId: `srv-${++instanceSeq}`,
-        model: MODEL_BY_HANDLE[headers["x-freebuff-model"]] || headers["x-freebuff-model"],
+        model: headers["x-freebuff-model"], // the server echoes the admitted key
         remainingMs: 600_000,
       }),
     session: () => json({ status: "none" }),
@@ -345,10 +347,14 @@ describe("registration", () => {
     expect(getExecutor("freebuff").getProvider()).toBe("freebuff");
   });
 
-  it("uses the chat completions endpoint as base URL", () => {
+  it("uses the chat completions endpoint as base URL and puts every API call on www.codebuff.com", () => {
     expect(PROVIDERS.freebuff.baseUrl).toBe("https://www.codebuff.com/api/v1/chat/completions");
     expect(executor.buildUrl()).toBe(CHAT_URL);
     expect(PROVIDER_ID_TO_ALIAS.freebuff).toBe("cb");
+    // Live-verified: freebuff.com is the landing page only; its API answers 404 HTML.
+    expect(DEVICE_KEYS_URL).toBe("https://www.codebuff.com/api/v1/freebuff/device-keys");
+    expect(CATALOG_URL).toBe("https://www.codebuff.com/api/v1/freebuff/models");
+    expect(SESSION_ADMISSION_URL).toBe("https://www.codebuff.com/api/v1/freebuff/session/admission");
   });
 
   it("leads the model list with the upstream fallback model", () => {
@@ -611,22 +617,22 @@ describe("tools handling", () => {
 // ---------------------------------------------------------------------------
 
 describe("execute: signed handshake", () => {
-  it("registers the device key per origin, then catalogs, admits, starts and chats (in order)", async () => {
+  it("registers the device key on the api origin, then catalogs, admits, starts and chats (in order)", async () => {
     installUpstream();
     const result = await executor.execute(makeExecuteArgs());
     expect(result.response.status).toBe(200);
 
     const order = allCalls().map((c) => c.url);
     expect(order).toEqual([
-      DEVICE_KEYS_URL, // freebuff.com scope (catalog signing)
+      DEVICE_KEYS_URL, // every endpoint lives on www.codebuff.com (live-verified)
       CATALOG_URL,
-      DEVICE_KEYS_URL.replace("https://freebuff.com", "https://www.codebuff.com"), // codebuff scope
       SESSION_ADMISSION_URL,
       AGENT_RUNS_URL,
       CHAT_URL,
     ]);
 
     for (const register of callsTo(DEVICE_KEYS_URL, "POST")) {
+      expect(register.url).toBe("https://www.codebuff.com/api/v1/freebuff/device-keys");
       expect(register.headers.Authorization).toMatch(/^Bearer fb-test-token-/);
       expect(register.body.publicKey).toBe(testRecord.publicKey);
       expect(register.body.client).toBe("cli");
@@ -650,7 +656,7 @@ describe("execute: signed handshake", () => {
     expect(admission.headers["x-freebuff-client-version"]).toBe(cliVersion());
     expect(admission.headers["x-fb-timezone"]).toBeTruthy();
     expect(admission.headers["x-freebuff-env"]).toBe(clientEnv());
-    expect(admission.headers["x-freebuff-model"]).toBe("mimo-free"); // catalog handle, rOA
+    expect(admission.headers["x-freebuff-model"]).toBe("mimo/mimo-v2.5"); // live catalog row key
     expect(admission.headers["x-freebuff-wallet-spend-limit"]).toBe("session");
     expect(admission.headers["x-freebuff-catalog-fetch"]).toBe("fetch-test-1");
     expect(admission.headers["x-freebuff-catalog-protocol"]).toBe("1");
@@ -701,13 +707,51 @@ describe("execute: signed handshake", () => {
     expect(start.headers["User-Agent"]).toBe(sessionUserAgent());
   });
 
-  it("answers a clean 400 for a model without a known agent id, without any upstream call", async () => {
+  it("answers a clean 502 invalid_model for a model the catalog does not list (no admission attempt)", async () => {
     installUpstream();
     const result = await executor.execute(makeExecuteArgs({ model: "cb/who/dis" }));
-    expect(result.response.status).toBe(400);
+    expect(result.response.status).toBe(502);
     const body = await result.response.json();
-    expect(body.error.code).toBe("model_not_supported");
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(body.error.code).toBe("invalid_model");
+    // Only the registration and the catalog ran; the admission was never attempted.
+    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(0);
+    expect(callsTo(CATALOG_URL, "GET")).toHaveLength(1);
+  });
+
+  it("routes a live catalog key with the generic codebuff root agent (passthrough)", async () => {
+    installUpstream();
+    const result = await executor.execute(makeExecuteArgs({ model: "m-00032eaeec" }));
+    expect(result.response.status).toBe(200);
+    await drain(result.response);
+    const start = agentRunCalls("START")[0];
+    expect(start.body.agentId).toBe("codebuff"); // live-verified default root agent
+    const chat = callsTo(CHAT_URL, "POST")[0];
+    expect(chat.body.model).toBe("m-00032eaeec");
+    expect(chat.body.codebuff_metadata.freebuff_instance_id).toMatch(/^srv-\d+$/);
+  });
+
+  it("keeps the static agent map for legacy ids that match", async () => {
+    installUpstream();
+    const result = await executor.execute(makeExecuteArgs({ model: "z-ai/glm-5.3-flash", body: { messages: [] } }));
+    expect(await drain(result.response)).toContain("hi");
+    expect(agentRunCalls("START")[0].body.agentId).toBe("base3-free-glm-5-3-flash");
+  });
+
+  it("maps HTTP 402 out-of-credits to a billing error with a machine-readable code", async () => {
+    installUpstream({ chat: () => json({ message: "Out of credits. Please add credits at https://www.codebuff.com/usage." }, { status: 402 }) });
+    const result = await executor.execute(makeExecuteArgs());
+    expect(result.response.status).toBe(402);
+    const body = await result.response.json();
+    expect(body.error.code).toBe("out_of_credits");
+    expect(body.error.type).toBe("billing_error");
+    expect(callsTo(CHAT_URL, "POST")).toHaveLength(1); // billing is not retried
+  });
+
+  it("maps a 402 from agent-run START to out_of_credits too", async () => {
+    installUpstream({ start: () => json({ message: "Out of credits" }, { status: 402 }) });
+    const result = await executor.execute(makeExecuteArgs());
+    expect(result.response.status).toBe(402);
+    expect((await result.response.json()).error.code).toBe("out_of_credits");
   });
 
   it("strips a thinking suffix such as (high) from the model", async () => {
@@ -782,7 +826,12 @@ describe("device key persistence", () => {
     installUpstream();
     const result = await executor.execute(makeExecuteArgs({ credentials }));
     expect(await drain(result.response)).toContain("hi");
-    expect(callsTo(DEVICE_KEYS_URL, "POST")).toHaveLength(0);
+    // The stored key was reused (no fresh keypair); a registration may still be needed when the
+    // stored record carries no registration for this origin.
+    const restartRegisters = callsTo(DEVICE_KEYS_URL, "POST");
+    for (const register of restartRegisters) {
+      expect(register.body.publicKey).toBe(stored.publicKey);
+    }
     const chat = callsTo(CHAT_URL, "POST")[0];
     expect(
       await verifyDeviceSig({ url: CHAT_URL, method: "POST", headers: chat.headers, body: JSON.stringify(chat.body), fetchId: "fetch-test-1" }, stored),
@@ -801,10 +850,14 @@ describe("device key persistence", () => {
     const result = await executor.execute(makeExecuteArgs());
     expect(await drain(result.response)).toContain("hi");
     expect(chatCalls).toBe(2);
-    // The catalog was refetched and the forgotten scope re-registered after the forget.
+    // The catalog was refetched and the forgotten scope re-registered after the forget (single
+    // api origin: 1 initial + 1 re-register).
     expect(callsTo(CATALOG_URL, "GET").length).toBeGreaterThanOrEqual(2);
     const registerPosts = allCalls().filter((c) => c.method === "POST" && String(c.url).endsWith("/api/v1/freebuff/device-keys"));
-    expect(registerPosts.length).toBeGreaterThanOrEqual(3); // 2 initial scopes + 1 re-register
+    expect(registerPosts.length).toBeGreaterThanOrEqual(2);
+    for (const register of registerPosts) {
+      expect(register.body.publicKey).toBe(testRecord.publicKey); // same key, fresh registration
+    }
   });
 
   it("refetches the catalog when the gate says it went stale", async () => {
@@ -874,11 +927,11 @@ describe("freebuff catalog cache", () => {
     delete process.env.FREEBUFF_CATALOG_TTL_MS;
   });
 
-  it("resolves the admission model through the row handle (rOA)", () => {
-    const catalog = { rows: [{ key: "mimo/mimo-v2.5", handle: "mimo-free" }] };
-    expect(resolveAdmissionModel(catalog, "mimo/mimo-v2.5")).toBe("mimo-free");
-    expect(resolveAdmissionModel(catalog, "unknown/key")).toBe("unknown/key");
-    expect(resolveAdmissionModel(null, "unknown/key")).toBe("unknown/key");
+  it("resolves the admission model through the live catalog row key (never a fabricated handle)", () => {
+    const catalog = { rows: [{ key: "m-00032eaeec", handle: "fbm1.AAE..." }] };
+    expect(resolveAdmissionModel(catalog, "m-00032eaeec")).toBe("m-00032eaeec");
+    expect(resolveAdmissionModel(catalog, "unknown/key")).toBeNull();
+    expect(resolveAdmissionModel(null, "m-00032eaeec")).toBeNull(); // passthrough is the caller's job
   });
 });
 
@@ -1652,7 +1705,7 @@ describe("cloud-run lane (desktop protocol)", () => {
     expect(admission.headers["x-freebuff-instance-id"]).toMatch(/^byok-[0-9a-f-]{36}$/);
     expect(admission.headers["x-freebuff-multi-session"]).toBe("1");
     expect(admission.headers["x-freebuff-purchase-continuity"]).toBe("1");
-    expect(admission.headers["x-freebuff-model"]).toBe("mimo-free");
+    expect(admission.headers["x-freebuff-model"]).toBe("mimo/mimo-v2.5");
     expect(admission.headers["x-freebuff-wallet-spend-limit"]).toBe("session");
     expect(admission.headers["x-freebuff-env"]).toBeUndefined(); // no CLI fingerprint on the desktop lane
     expect(await verifyDeviceSig({ url: SESSION_ADMISSION_URL, method: "POST", headers: admission.headers, fetchId: "fetch-test-1" })).toBe(true);
@@ -1679,7 +1732,7 @@ describe("cloud-run lane (desktop protocol)", () => {
     expect(runPost.body.workspaceId).toMatch(/^[0-9a-f-]{36}$/);
     expect(runPost.body.runId).toMatch(/^[0-9a-f-]{36}$/);
     expect(runPost.body.instanceId).toMatch(/^srv-\d+$/); // server-assigned instance id from admission
-    expect(runPost.body.model).toBe("mimo-free"); // catalog handle
+    expect(runPost.body.model).toBe("mimo/mimo-v2.5"); // live catalog key
     expect(runPost.body.prompt).toContain("user: hello");
     expect(runPost.body.agentMode).toBe("chat");
     expect(runPost.body.injectAgentsMd).toBe(false);

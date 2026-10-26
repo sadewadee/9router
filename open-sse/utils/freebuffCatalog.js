@@ -1,18 +1,23 @@
-// Freebuff model catalog (GET https://freebuff.com/api/v1/freebuff/models), protocol of the
-// official CLI 0.2.34 and Desktop 0.0.188. The response carries the routable model rows and a
-// `fetchId` that chat and session calls must echo back (x-freebuff-catalog-fetch) and fold into
-// the device-key signature. 9router registers the device key before the first request, so every
-// catalog call goes out signed (the CLI's very first fetch is unsigned because it has no key yet).
+// Freebuff model catalog (GET {FREEBUFF_API_BASE}/api/v1/freebuff/models — live base is
+// https://www.codebuff.com), protocol of the official CLI 0.2.34 and Desktop 0.0.188. The
+// response carries the routable model rows and a `fetchId` that chat and session calls must echo
+// back (x-freebuff-catalog-fetch) and fold into the device-key signature. 9router registers the
+// device key before the first request, so every catalog call goes out signed (the CLI's very
+// first fetch is unsigned because it has no key yet).
 //
-// Response shape (zod H6L in the CLI): { protocol: 1, version, issuedAt, refreshAt, rows: [...],
-// recommendedKey?, fallbackKey?, plansUrl, sections?, fetchId? }. Rows are gated by `opensAt`
-// (Mg): only rows whose opensAt has passed are visible. Desktop rows additionally carry
-// `handle` = "m-" + fnv32a-double digest of "key:<modelId>" — opaque ids the cloud-run lane and
-// admission headers use; the digest is reproduced here as a fallback for catalog-less requests.
+// Response shape (zod H6L in the CLI, live-verified 2026-10-27): { protocol: 1, version,
+// issuedAt, refreshAt, rows: [...], recommendedKey?, fallbackKey?, plansUrl, sections?, fetchId? }.
+// Rows are gated by `opensAt` (Mg): only rows whose opensAt has passed are visible. Live rows are
+// keyed "m-<10hex>" with "fbm1..." opaque handles — request model fields must come from these
+// rows; the legacy fnv digest below is diagnostic only.
 
 import { createHash } from "node:crypto";
 
-export const FREEBUFF_API_BASE = "https://freebuff.com";
+// Live-verified (2026-10-27 probe): EVERY Freebuff API endpoint lives on www.codebuff.com —
+// device-keys, models catalog, session/admission, chat and cloud-runs. freebuff.com is the
+// landing page only (its /api/* answers 404 HTML). Override FREEBUFF_API_BASE to repoint the
+// whole surface (read at module load, so a restart is enough).
+export const FREEBUFF_API_BASE = (process.env.FREEBUFF_API_BASE || "https://www.codebuff.com").replace(/\/$/, "");
 export const CATALOG_URL = `${FREEBUFF_API_BASE}/api/v1/freebuff/models`;
 export const DEVICE_KEYS_URL = `${FREEBUFF_API_BASE}/api/v1/freebuff/device-keys`;
 
@@ -108,13 +113,15 @@ export function invalidateFreebuffCatalog(tokenHash = null) {
   }
 }
 
-// rOA (CLI) / catalog.handleFor (Desktop): the admission and cloud-run headers carry the row's
-// handle when the key matches. Without a matching row the CLI sends the plain key (rOA fallback),
-// while the Desktop falls back to the deterministic compiled-by-default handle.
-export function resolveAdmissionModel(catalog, modelKey, { desktop = false } = {}) {
+// The admission (x-freebuff-model) and cloud-run model fields must be a key straight from the
+// live catalog (rows are keyed "m-<10hex>"; handles are "fbm1..." opaque tokens). Live probe:
+// anything else — including the legacy fnv-derived handle — is rejected with 409
+// freebuff_catalog_stale. No row for the model -> null; the caller answers 502 invalid_model
+// instead of guessing. Callers should prefer row.key; row.handle is passed through only when a
+// row carries one the server currently accepts.
+export function resolveAdmissionModel(catalog, modelKey) {
   const row = visibleRows(catalog).find((candidate) => candidate.key === modelKey);
-  if (row?.handle) return row.handle;
-  return desktop ? freebuffHandleFor(modelKey) : modelKey;
+  return row ? row.key || row.handle || null : null;
 }
 
 async function fetchOnce({ token, deviceKey, accountId, client, proxyFetch, proxyOptions, signal, log }) {

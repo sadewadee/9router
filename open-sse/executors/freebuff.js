@@ -22,7 +22,6 @@ import {
   CATALOG_FETCH_HEADER,
   CLIENT_CLI,
   CLIENT_DESKTOP,
-  freebuffHandleFor,
 } from "../utils/freebuffCatalog.js";
 
 /**
@@ -57,7 +56,10 @@ import {
  * Device-key signing covers chat, session calls and the catalog (string-to-sign
  * "freebuff-device-v1\n..." with the catalog fetchId); agent-runs stay Bearer-only, like the CLI.
  *
- * Second execution lane (Desktop 0.0.188 protocol, see ~/fb-desktop-20261027/REPORT-DESKTOP.md):
+ * Second execution lane (Desktop 0.0.188 protocol, see ~/fb-desktop-20261027/REPORT-DESKTOP.md).
+ * EXPERIMENTAL: the live probe (2026-10-27) saw the desktop admission answer 409
+ * freebuff_catalog_stale twice despite a fresh catalog fetch — root cause unknown, so the lane
+ * stays opt-in (default remains cli-chat) and admissions are logged at debug level.
  * connections with providerSpecificData.freebuffExecMode = "cloud-run" (or env
  * FREEBUFF_EXEC_MODE=cloud-run) skip /chat/completions entirely and ride the hosted path:
  *   a. Same device key machinery, but registered with client:"desktop" (separate keypair).
@@ -488,10 +490,14 @@ function upstreamError(result, fallbackCode) {
     data?.message ||
     (typeof data?.error === "object" && data.error?.message) ||
     (text ? text.slice(0, 300) : `HTTP ${status}`);
-  return new FreebuffHttpError(status, code, `Freebuff: ${message}`, {
+  // HTTP 402 "Out of credits" (live-verified): an account condition, not a protocol failure —
+  // surface the machine-readable code so 9router's combo/fallback logic moves to another account.
+  const error = new FreebuffHttpError(status, status === 402 ? "out_of_credits" : code, `Freebuff: ${message}`, {
     retryAfterSec: retryAfterSecOf(resp, data),
     upstream: data ?? (text ? text.slice(0, 300) : undefined),
   });
+  if (status === 402) error.type = "billing_error";
+  return error;
 }
 
 function queuedError(instanceId, position, queueDepth, retryAfterSec) {
@@ -701,22 +707,42 @@ function interpretSession(result, model, fallbackInstanceId) {
   });
 }
 
+// x-freebuff-model / cloud-run model must be a live catalog key. Without a matching row the
+// upstream answers 409 freebuff_catalog_stale (live-verified), so answer a clean 502 instead of
+// guessing; with no catalog at all the key passes through and upstream decides.
+function resolveModelForAdmission(catalog, model) {
+  if (!catalog) return model;
+  const resolved = resolveAdmissionModel(catalog, model);
+  if (!resolved) {
+    throw new FreebuffHttpError(
+      502,
+      "invalid_model",
+      `Freebuff: model "${model}" is not in the current catalog. Fetch /v1/models for the routable keys.`,
+      { type: "invalid_request_error" },
+    );
+  }
+  return resolved;
+}
+
 // POST the admission. CLI lane: no client-minted instance id (the server assigns one, and the
 // answer travels back in interpretSession). Desktop lane: instance id + multi-session go out per
 // REPORT-DESKTOP.md §6.
 async function admitOnce(token, model, ctx) {
+  // The model header follows the model being admitted (it can differ from the request's after a
+  // model_locked redirect), resolved through the catalog each time.
+  const admissionModel = resolveModelForAdmission(ctx.catalog, model);
   let headers;
   if (ctx.lane === CLIENT_DESKTOP) {
     headers = buildDesktopSessionHeaders("POST", token, {
       instanceId: ctx.desktopInstanceId,
-      model: ctx.admissionModel,
+      model: admissionModel,
       hasCatalog: ctx.hasCatalog,
       fetchId: ctx.fetchId,
       attemptId: ctx.desktopAttemptId,
     });
   } else {
     headers = buildSessionHeaders("POST", token, {
-      model: ctx.admissionModel,
+      model: admissionModel,
       hasCatalog: ctx.hasCatalog,
       fetchId: ctx.fetchId,
     });
@@ -729,6 +755,8 @@ async function admitOnce(token, model, ctx) {
     fetchId: ctx.fetchId,
   });
   const result = await callJson(SESSION_ADMISSION_URL, { method: "POST", headers, signal: ctx.signal }, ctx.proxyOptions);
+  // Full body at debug level: the live probe needed it to diagnose the desktop-lane 409s.
+  ctx.log?.debug?.("FREEBUFF", `Admission ${result.status}: ${(result.text || "").slice(0, 800)}`);
   // The CLI treats 404/405 on the admission route as a hard "update your client".
   if (result.status === 404 || result.status === 405) {
     throw new FreebuffHttpError(502, "session_admission_unsupported", `Freebuff: session admission answered ${result.status}`, {
@@ -1558,11 +1586,13 @@ export class FreebuffExecutor extends BaseExecutor {
       try {
         ctx.hasCatalog = Boolean(catalog);
         ctx.fetchId = fetchId;
-        // Desktop uses the opaque handle (catalog row, else the deterministic digest).
-        ctx.admissionModel = catalog ? resolveAdmissionModel(catalog, targetModel, { desktop: true }) : freebuffHandleFor(targetModel);
+        ctx.catalog = catalog;
+        // Live rows are keyed "m-<10hex>": the model field must come from the catalog. No row ->
+        // 502 invalid_model (the legacy fnv handle is rejected server-side).
+        ctx.admissionModel = resolveModelForAdmission(catalog, targetModel);
 
         session = await getFreebuffSession(token, targetModel, ctx);
-        submission = buildCloudSubmission({ body, model: ctx.admissionModel, instanceId: session.instanceId, stream });
+        submission = buildCloudSubmission({ body, model: session.resolvedModel || ctx.admissionModel, instanceId: session.instanceId, stream });
         runId = submission.runId;
         submissionStr = JSON.stringify(submission);
       } catch (err) {
@@ -1634,14 +1664,6 @@ export class FreebuffExecutor extends BaseExecutor {
     }
 
     const targetModel = resolveModel(model);
-    if (!FREEBUFF_AGENT_ID_BY_MODEL[targetModel]) {
-      const supported = Object.keys(FREEBUFF_AGENT_ID_BY_MODEL).join(", ");
-      return fail(
-        new FreebuffHttpError(400, "model_not_supported", `Unsupported Freebuff model "${targetModel}". Supported: ${supported}`, {
-          type: "invalid_request_error",
-        }),
-      );
-    }
     const tokenHash = tokenHashOf(token);
     const accountId = accountIdOf(credentials);
     const deviceKey = getDeviceKeyManager(credentials, { log }, CLIENT_CLI);
@@ -1649,7 +1671,8 @@ export class FreebuffExecutor extends BaseExecutor {
     const ctx = { proxyOptions: directEgressOptions(proxyOptions, log), signal, log, deviceKey, accountId, lane: CLIENT_CLI };
     const catalogCtx = { token, deviceKey, accountId, client: CLIENT_CLI, proxyFetch: proxyAwareFetch, proxyOptions: ctx.proxyOptions, log };
 
-    // Catalog first (cached): its fetchId is bound into the admission and chat signatures.
+    // Catalog first (cached): its fetchId is bound into the admission and chat signatures, and the
+    // live rows decide whether the model is routable at all.
     let catalog = await getFreebuffCatalog(catalogCtx);
     let fetchId = cachedFetchId(tokenHash, CLIENT_CLI);
 
@@ -1662,18 +1685,13 @@ export class FreebuffExecutor extends BaseExecutor {
       try {
         ctx.hasCatalog = Boolean(catalog);
         ctx.fetchId = fetchId;
-        // Admission model header resolves through the catalog (rOA: handle when known).
-        ctx.admissionModel = catalog ? resolveAdmissionModel(catalog, targetModel) : targetModel;
+        ctx.catalog = catalog;
+        ctx.admissionModel = resolveModelForAdmission(catalog, targetModel);
 
         session = await getFreebuffSession(token, targetModel, ctx);
-        const agentId = FREEBUFF_AGENT_ID_BY_MODEL[session.resolvedModel];
-        if (!agentId) {
-          throw new FreebuffHttpError(
-            502,
-            "model_not_supported",
-            `Freebuff served the session on "${session.resolvedModel}", which this proxy cannot run`,
-          );
-        }
+        // The static map still covers the legacy ids; every other (live catalog) key rides the
+        // generic "codebuff" root agent (live-verified START + chat accept it).
+        const agentId = FREEBUFF_AGENT_ID_BY_MODEL[session.resolvedModel] || "codebuff";
         startFailed = true;
         lease = await acquireAgentRun(token, agentId, ctx);
         startFailed = false;
@@ -1742,6 +1760,11 @@ export class FreebuffExecutor extends BaseExecutor {
             fetchId = cachedFetchId(tokenHash, CLIENT_CLI);
           }
           continue;
+        }
+        // 402 billing must carry the machine-readable code for 9router's fallback logic instead
+        // of the raw upstream body.
+        if (response.status === 402) {
+          return fail(upstreamError({ resp: response, status: response.status, data: parseJson(errText), text: errText }, "out_of_credits"), chatHeaders);
         }
         return { response, url, headers: chatHeaders, transformedBody: JSON.parse(bodyStr) };
       }
