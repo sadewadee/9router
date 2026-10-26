@@ -268,8 +268,12 @@ export const PROVIDER_CAPABILITIES = {
   // ("[unknown_parameter] ... unknown field \"thinking\""). Without this entry the
   // generic *glm-5.3* pattern resolves to the z.ai format (thinking +
   // reasoning_effort); pin it to openai (reasoning_effort only). Verified 2026-10-18.
+  // deepseek-v4.1-flash-free: the backend rejects prompts above ~330k tokens
+  // (decolua/9router#5097) although /v1/models would publish the 1M of the pattern
+  // table. Cap the window so clients compact instead of hard-failing mid-session.
   "opencode": {
     "glm-5.3-flash-free": { vision: true, reasoning: true, thinkingFormat: "openai", contextWindow: 1000000, maxOutput: 32000 },
+    "deepseek-v4.1-flash-free": { vision: true, reasoning: true, thinkingFormat: "deepseek", contextWindow: 330000, maxOutput: 128000 },
   },
   // Qoder — upstream exposes opaque internal ids (dfmodel, kmodel, …); the
   // registry `name` is display-only and capability lookup matches on the raw
