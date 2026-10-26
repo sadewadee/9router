@@ -3,25 +3,70 @@ import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import { FETCH_CONNECT_TIMEOUT_MS } from "../config/runtimeConfig.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
+import {
+  FreebuffDeviceKeyManager,
+  isDeviceKeyError,
+  DEVICE_KEY_HEADER,
+  DEVICE_SIG_HEADER,
+  DEVICE_TS_HEADER,
+} from "../utils/freebuffDeviceKey.js";
+import {
+  getFreebuffCatalog,
+  cachedFetchId,
+  invalidateFreebuffCatalog,
+  resolveAdmissionModel,
+  tokenHashOf,
+  CATALOG_URL,
+  DEVICE_KEYS_URL,
+  FREEBUFF_API_BASE,
+  CATALOG_FETCH_HEADER,
+  CLIENT_CLI,
+  CLIENT_DESKTOP,
+  freebuffHandleFor,
+} from "../utils/freebuffCatalog.js";
 
 /**
  * Freebuff (codebuff.com) free-mode executor.
  *
- * The free chat endpoint only answers a "CLI-like" handshake (protocol taken from the
- * official Freebuff CLI, v0.0.200):
- *   1. POST /api/v1/freebuff/session/admission  -> free session { instanceId, model, remainingMs }
- *   2. POST /api/v1/agent-runs {action:"START"}  -> runId (agent id resolved from the model)
- *   3. POST /api/v1/chat/completions with codebuff_metadata {run_id, client_id, cost_mode:"free",
- *      freebuff_instance_id} and a leading system message that opens with the canonical Buffy prompt
+ * The chat endpoint only answers a "CLI-like" handshake. Protocol taken from the official
+ * Freebuff CLI 0.2.34 (device-key Ed25519 signing, model catalog + fetchId binding, per-endpoint
+ * user agents); see ~/fb-proto-20261027/REPORT-CLI.md for the reconstruction.
+ *   0. Ensure an Ed25519 device key exists for the token and is registered (POST freebuff.com
+ *      /api/v1/freebuff/device-keys, persisted on the provider connection), then fetch the signed
+ *      model catalog (GET /api/v1/freebuff/models) and keep its fetchId.
+ *   1. POST /api/v1/freebuff/session/admission (codebuff.com, signed; x-freebuff-model +
+ *      x-freebuff-wallet-spend-limit: "session", no client-minted instance id) -> session
+ *      { instanceId (server-assigned), model, remainingMs }
+ *   2. POST /api/v1/agent-runs {action:"START"} -> runId (agent id resolved from the model)
+ *   3. POST /api/v1/chat/completions (signed; ai-sdk UA, x-freebuff-sse-gzip-recovery,
+ *      x-freebuff-catalog-fetch) with codebuff_metadata {run_id, client_id,
+ *      freebuff_instance_id, freebuff_client_env} and a leading system message that opens with
+ *      the canonical Buffy prompt
  *   4. POST /api/v1/agent-runs {action:"FINISH"} for a run that is done (best effort)
  *
  * Session and run lifecycle (in-memory, per token):
  *   - One free session per token. A request for another model first releases the old session
- *     (DELETE /api/v1/freebuff/session/attempt), otherwise a `limited` tier with slotLimit 1 keeps the
- *     old slot for an hour and the next admission fails with purchase_capacity.
+ *     (DELETE /api/v1/freebuff/session with the assigned instance id, signed), otherwise a
+ *     `limited` tier with slotLimit 1 keeps the old slot for an hour and the next admission
+ *     fails with purchase_capacity. An idle session is released after FREEBUFF_SESSION_IDLE_MS
+ *     (default 10 minutes) so the single slot does not stay occupied.
  *   - One agent run per (token, agent), reused across requests and rotated after
  *     FREEBUFF_RUN_ROTATION_MS (default 6h). A rotated run drains: FINISH goes out once its last
  *     in-flight request is done. FREEBUFF_RUN_ROTATION_MS=0 restores START/FINISH on every request.
+ *
+ * Device-key signing covers chat, session calls and the catalog (string-to-sign
+ * "freebuff-device-v1\n..." with the catalog fetchId); agent-runs stay Bearer-only, like the CLI.
+ *
+ * Second execution lane (Desktop 0.0.188 protocol, see ~/fb-desktop-20261027/REPORT-DESKTOP.md):
+ * connections with providerSpecificData.freebuffExecMode = "cloud-run" (or env
+ * FREEBUFF_EXEC_MODE=cloud-run) skip /chat/completions entirely and ride the hosted path:
+ *   a. Same device key machinery, but registered with client:"desktop" (separate keypair).
+ *   b. Signed catalog with x-freebuff-client: desktop; the model id becomes an opaque
+ *      "m-xxxxxxxxxx" handle (deterministic fnv32a-double digest, reproduced verbatim).
+ *   c. Signed desktop admission (x-freebuff-client/-install-id, multi-session, instance id).
+ *   d. POST /api/v1/cloud/runs (Bearer only — cloud runs are NOT device-signed in 0.0.188) and
+ *      JSON polling of GET /api/v1/cloud/runs/{id}?after=<cursor>; chunk events are adapted into
+ *      an OpenAI-shaped chat response (SSE frames when the caller asked for a stream).
  *
  * Egress must be direct: Codebuff detects the CF-Worker header Cloudflare stamps on Worker
  * subrequests, so relay pools (Cloudflare/Vercel/Deno) are ignored for this provider.
@@ -32,12 +77,112 @@ const CHAT_URL = `${BASE_URL}/api/v1/chat/completions`;
 const AGENT_RUNS_URL = `${BASE_URL}/api/v1/agent-runs`;
 const SESSION_URL = `${BASE_URL}/api/v1/freebuff/session`;
 const SESSION_ADMISSION_URL = `${BASE_URL}/api/v1/freebuff/session/admission`;
-const SESSION_ATTEMPT_URL = `${BASE_URL}/api/v1/freebuff/session/attempt`;
+const SESSION_ATTEMPT_URL = `${SESSION_URL}/attempt`;
+const CLOUD_RUNS_URL = `${BASE_URL}/api/v1/cloud/runs`;
 
-// User-Agent sent on every Codebuff call. Override with env FREEBUFF_USER_AGENT.
-const DEFAULT_USER_AGENT = "Freebuff-CLI/0.0.200";
-function getUserAgent() {
-  return process.env.FREEBUFF_USER_AGENT || DEFAULT_USER_AGENT;
+// Desktop lane identity (REPORT-DESKTOP.md §9). The install id is derived deterministically from
+// the token so it survives restarts without extra persistence.
+const DEFAULT_DESKTOP_VERSION = "0.0.188";
+const CLOUD_QUESTIONS_HEADER = "x-freebuff-cloud-questions";
+const PRODUCT_CONTEXT_HEADER = "X-Freebuff-Product-Context";
+const HEADER_INSTALL_ID = "x-freebuff-install-id";
+const HEADER_CLIENT = "x-freebuff-client";
+const CLOUD_POLL_INTERVAL_MS_DEFAULT = 500;
+const CLOUD_RUN_TIMEOUT_MS_DEFAULT = 120_000;
+
+function desktopVersion() {
+  return process.env.FREEBUFF_DESKTOP_VERSION || DEFAULT_DESKTOP_VERSION;
+}
+
+function desktopUserAgent() {
+  return `Freebuff-Desktop/${desktopVersion()}`;
+}
+
+function installIdFor(token) {
+  const hex = createHash("sha256").update(`freebuff-install:${token}`).digest("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+// Execution lane per connection: providerSpecificData.freebuffExecMode wins, then the global env
+// default. "cli-chat" rides /chat/completions, "cloud-run" rides the desktop hosted path.
+function resolveExecMode(credentials = {}) {
+  const raw = String(credentials?.providerSpecificData?.freebuffExecMode || process.env.FREEBUFF_EXEC_MODE || "cli-chat").trim();
+  return raw === "cloud-run" ? "cloud-run" : "cli-chat";
+}
+
+function laneFor(mode) {
+  return mode === "cloud-run" ? CLIENT_DESKTOP : CLIENT_CLI;
+}
+
+// Session/catalog headers shared by every Freebuff CLI call.
+const HEADER_INSTANCE = "x-freebuff-instance-id";
+const HEADER_MODEL = "x-freebuff-model";
+const HEADER_WALLET_SPEND_LIMIT = "x-freebuff-wallet-spend-limit";
+const HEADER_MULTI_SESSION = "x-freebuff-multi-session";
+const HEADER_PURCHASE_CONTINUITY = "x-freebuff-purchase-continuity";
+const HEADER_ATTEMPT = "x-freebuff-desktop-attempt-id";
+const HEADER_TIMEZONE = "x-fb-timezone";
+const HEADER_ENV = "x-freebuff-env";
+const HEADER_CLIENT_VERSION = "x-freebuff-client-version";
+const HEADER_CATALOG_PROTOCOL = "x-freebuff-catalog-protocol";
+const HEADER_HEARTBEAT = "x-freebuff-heartbeat";
+const HEADER_INCLUDE_UNUSED_RATE_LIMITS = "x-freebuff-include-unused-rate-limits";
+const HEADER_COMPACT_SESSION = "x-freebuff-compact-session";
+const HEADER_GZIP_RECOVERY = "x-freebuff-sse-gzip-recovery";
+const HEADER_ACTING_USER = "x-freebuff-acting-user-id";
+const CLI_CLAIM_PREFIX = "cli:";
+
+// Chat UA mirrors the ai-sdk openai-compatible provider; session calls use the CLI UA. The
+// 0.2.34 linux-x64 binary ships MV="0.0.0-test" verbatim (release builds may inject another
+// value), so that is the default; both are env-tunable.
+const DEFAULT_CLI_VERSION = "0.2.34";
+const DEFAULT_AISDK_VERSION = "0.0.0-test";
+
+function cliVersion() {
+  return process.env.FREEBUFF_CLI_VERSION || DEFAULT_CLI_VERSION;
+}
+
+function aiSdkVersion() {
+  return process.env.FREEBUFF_AISDK_VERSION || DEFAULT_AISDK_VERSION;
+}
+
+function chatUserAgent() {
+  return process.env.FREEBUFF_USER_AGENT || `ai-sdk/openai-compatible/${aiSdkVersion()}/codebuff`;
+}
+
+function sessionUserAgent() {
+  return `Freebuff-CLI/${cliVersion()}`;
+}
+
+// Synthetic stand-in for the CLI terminal fingerprint (x-freebuff-env / freebuff_client_env,
+// "v1;k=v;..." shape). A server has no TTY, so the values describe a plain node run; override
+// with FREEBUFF_CLIENT_ENV when a capture of a real CLI is available.
+function clientEnv() {
+  const override = process.env.FREEBUFF_CLIENT_ENV;
+  if (override) return override;
+  const tz = process.env.TZ;
+  const parts = [
+    "v1",
+    "in=1",
+    "out=1",
+    "tp=none",
+    "term=1",
+    "ct=1",
+    "sz=80x24",
+    "ci=0",
+    "ssh=0",
+    "l=node",
+    "p=node",
+    "g=node",
+    "osc=na",
+    `tzo=${tz ? 1 : 0}`,
+    "px=0",
+    "tls=0",
+    "ca=0",
+    "cde=0",
+  ];
+  if (tz) parts.push(`stz=${tz}`);
+  return parts.join(";");
 }
 
 // Fallback model = FALLBACK_FREEBUFF_MODEL_ID upstream (unmetered, always open).
@@ -50,48 +195,45 @@ export const FREEBUFF_ROOT_OPENING = "You are Buffy, the coding agent behind Cod
 const ROOT_SYSTEM_PROMPT =
   `${FREEBUFF_ROOT_OPENING} You help users with software engineering tasks: fixing bugs, adding functionality, refactoring, and explaining code.`;
 
-// Model -> free-mode root agent id (FREEBUFF_CLI_BASE3_AGENT_ID_BY_MODEL upstream). The server pins
-// each root agent to exactly one model, so an unknown model cannot be resolved (400, no passthrough).
+// Model -> free-mode root agent id, from the CLI 0.2.34 binary (FREEBUFF_CLI_BASE3_AGENT_ID_BY_MODEL
+// upstream; union of both build variants). The server pins each root agent to exactly one model.
 export const FREEBUFF_AGENT_ID_BY_MODEL = {
   "mimo/mimo-v2.5": "base3-free-mimo",
   "mimo/mimo-v2.6-pro": "base3-free-mimo-2-6-pro",
   "z-ai/glm-5.3-flash": "base3-free-glm-5-3-flash",
   "z-ai/glm-5.2": "base3-free-glm",
   "deepseek/deepseek-v4-flash": "base3-free-deepseek-flash",
+  "deepseek/deepseek-v4-flash-fast": "base3-fast-free-deepseek-flash",
   "deepseek/deepseek-v4-pro": "base3-free-deepseek",
   "openai/gpt-6-luna": "base3-free-luna-6",
   "openai/gpt-5.6-luna": "base3-free-luna",
+  "openai/gpt-6.1-sol": "base3-free-gpt-6-1-sol",
+  "openai/gpt-5.6-luna-es": "base3-free-luna-es",
+  "google/gemini-3.8-flash": "base3-free-gemini-3-8-flash",
+  "google/gemini-4-argon": "base3-free-gemini-4-argon",
   "upstage/solar-mini4": "base3-free-solar-mini4",
   "upstage/solar-pro4": "base3-free-solar-pro4",
   "stealth/space-bunny-alpha": "base3-free-space-bunny-alpha",
   "stealth/ox-alpha": "base3-free-ox-alpha",
   "minimax/minimax-m3": "base3-free-minimax-m3",
-  "google/gemini-3.8-flash": "base3-free-gemini-3-8-flash",
+  "crof/kimi-k3-eco": "base3-free-kimi-k3-eco",
   "meta/muse-spark-1.2-contributor": "base3-free-muse-spark",
   "meta/muse-spark-1.3-contributor": "base3-free-muse-spark-1-3",
 };
-
-// Wire headers of the free-session endpoints (common/src/constants/freebuff-models.ts).
-const HEADER_MODEL = "x-freebuff-model";
-const HEADER_INSTANCE = "x-freebuff-instance-id";
-const HEADER_WALLET_SPEND_LIMIT = "x-freebuff-wallet-spend-limit";
-const HEADER_FIRST_TAB_DISCOUNT = "x-freebuff-first-tab-discount";
-const HEADER_MULTI_SESSION = "x-freebuff-multi-session";
-const HEADER_PURCHASE_CONTINUITY = "x-freebuff-purchase-continuity";
-const HEADER_ATTEMPT = "x-freebuff-desktop-attempt-id";
-const HEADER_TIMEZONE = "x-fb-timezone";
 
 // Session/agent-run calls get the same 20s budget the official CLI gives them.
 const SESSION_FETCH_TIMEOUT_MS = 20_000;
 const SESSION_EXPIRY_MARGIN_MS = 60_000;
 const DEFAULT_SESSION_TTL_MS = 3_600_000;
-const DISABLED_SESSION_TTL_MS = 300_000;
 const QUEUED_RETRY_MIN_SEC = 1;
 const QUEUED_RETRY_MAX_SEC = 30;
 const REFUSAL_RETRY_AFTER_SEC = 30;
 const MAX_CACHED_SESSIONS = 200;
+const MAX_CACHED_KEYS = 400;
 const DEFAULT_RUN_ROTATION_MS = 6 * 3_600_000;
-const CLI_CLAIM_PREFIX = "cli:";
+// Release an idle session's slot after this much inactivity (design decision; not part of the
+// wire protocol). 0 disables.
+const DEFAULT_SESSION_IDLE_MS = 10 * 60_000;
 
 // Gate codes on /chat/completions that mean "your free session is gone": forget it and re-admit.
 const SESSION_INVALID_CODES = new Set([
@@ -132,8 +274,83 @@ const drainingRuns = new Set();
 // Single in-flight START per run key so concurrent requests share one agent run.
 const inflightRunStarts = new Map();
 
+// Device-key managers per token: sha1(token) -> FreebuffDeviceKeyManager.
+const deviceKeys = new Map();
+// Idle-release timers per token hash.
+const idleTimers = new Map();
+
 // Relay pool URLs already warned about (one warning per relay per process).
 const warnedRelays = new Set();
+
+// Overridable persistence of the device-key record onto the provider connection.
+let deviceKeyPersister = null;
+export function setFreebuffDeviceKeyPersister(fn) {
+  deviceKeyPersister = fn;
+}
+
+// Device-key records live on the connection: freebuffDeviceKey (cli lane) and
+// freebuffDeviceKeyDesktop (cloud-run lane) — one keypair per mode, since the registration is
+// scoped to a client type ("cli" vs "desktop").
+const DEVICE_KEY_FIELD_BY_LANE = {
+  [CLIENT_CLI]: "freebuffDeviceKey",
+  [CLIENT_DESKTOP]: "freebuffDeviceKeyDesktop",
+};
+
+async function persistDeviceKeyRecord(credentials, record, lane = CLIENT_CLI) {
+  if (!credentials?.connectionId) return;
+  try {
+    if (deviceKeyPersister) {
+      await deviceKeyPersister(credentials.connectionId, record, credentials, lane);
+      return;
+    }
+    const { updateProviderConnection } = await import("@/lib/db/repos/connectionsRepo.js");
+    await updateProviderConnection(credentials.connectionId, {
+      providerSpecificData: {
+        ...(credentials.providerSpecificData || {}),
+        [DEVICE_KEY_FIELD_BY_LANE[lane] || DEVICE_KEY_FIELD_BY_LANE[CLIENT_CLI]]: record,
+      },
+    });
+  } catch {
+    // Persistence is best effort: an unregistered key only costs a re-register next round.
+  }
+}
+
+function pruneDeviceKeys() {
+  if (deviceKeys.size <= MAX_CACHED_KEYS) return;
+  for (const key of deviceKeys.keys()) {
+    deviceKeys.delete(key);
+    if (deviceKeys.size <= MAX_CACHED_KEYS) break;
+  }
+}
+
+// One manager (one keypair) per token and lane. The record comes from the connection's
+// providerSpecificData when it was persisted by an earlier run; registrations carry the lane's
+// client type ("cli" or "desktop"). Registration traffic rides the same proxyAwareFetch egress
+// (and therefore the same test mocks) as every other upstream call.
+function getDeviceKeyManager(credentials, ctx, lane = CLIENT_CLI) {
+  const token = tokenOf(credentials);
+  const key = `${sessionKey(token)}|${lane}`;
+  let manager = deviceKeys.get(key);
+  if (!manager) {
+    const field = DEVICE_KEY_FIELD_BY_LANE[lane] || DEVICE_KEY_FIELD_BY_LANE[CLIENT_CLI];
+    const stored = credentials?.providerSpecificData?.[field];
+    manager = new FreebuffDeviceKeyManager({
+      record: stored && typeof stored.privateKey === "string" ? stored : null,
+      persist: (record) => persistDeviceKeyRecord(credentials, record, lane),
+      fetchImpl: (url, init) => proxyAwareFetch(url, init, ctx?.proxyOptions ?? null),
+      log: ctx?.log,
+      client: lane,
+    });
+    deviceKeys.set(key, manager);
+    pruneDeviceKeys();
+  }
+  return manager;
+}
+
+function accountIdOf(credentials) {
+  const id = credentials?.providerSpecificData?.userId;
+  return typeof id === "string" && id ? id : null;
+}
 
 export class FreebuffHttpError extends Error {
   constructor(status, code, message, { retryAfterSec, upstream, type } = {}) {
@@ -168,16 +385,19 @@ function sessionKey(token) {
   return createHash("sha1").update(token).digest("hex");
 }
 
-function runKey(token, agentId) {
-  return `${sessionKey(token)}:${agentId}`;
-}
-
 // Read at request time (not import time) so a restart is enough to flip it. 0 = a run per request.
 function runRotationMs() {
   const raw = String(process.env.FREEBUFF_RUN_ROTATION_MS ?? "").trim();
   if (!raw) return DEFAULT_RUN_ROTATION_MS;
   const ms = Number(raw);
   return Number.isFinite(ms) && ms >= 0 ? Math.floor(ms) : DEFAULT_RUN_ROTATION_MS;
+}
+
+function sessionIdleMs() {
+  const raw = String(process.env.FREEBUFF_SESSION_IDLE_MS ?? "").trim();
+  if (!raw) return DEFAULT_SESSION_IDLE_MS;
+  const ms = Number(raw);
+  return Number.isFinite(ms) && ms >= 0 ? Math.floor(ms) : DEFAULT_SESSION_IDLE_MS;
 }
 
 function isTruthyEnv(name) {
@@ -187,6 +407,12 @@ function isTruthyEnv(name) {
 // Read at request time (not import time) so a restart is enough to flip it.
 function shouldFoldTools() {
   return isTruthyEnv("FREEBUFF_FOLD_TOOLS");
+}
+
+// Optional cost_mode for codebuff_metadata (CLI: normal mode omits the field entirely).
+function costModeOverride() {
+  const raw = String(process.env.FREEBUFF_COST_MODE ?? "").trim();
+  return raw || null;
 }
 
 // 13-char base36 id, like the official SDK's Math.random().toString(36).substring(2, 15).
@@ -224,15 +450,6 @@ function directEgressOptions(proxyOptions, log) {
   }
   const { vercelRelayUrl, ...rest } = proxyOptions;
   return rest;
-}
-
-function jsonHeaders(token, extra = {}) {
-  return {
-    Authorization: `Bearer ${token}`,
-    "User-Agent": getUserAgent(),
-    Accept: "application/json",
-    ...extra,
-  };
 }
 
 function parseJson(text) {
@@ -303,16 +520,34 @@ function pruneSessions() {
   }
 }
 
+function clearIdleTimer(token) {
+  const timer = idleTimers.get(sessionKey(token));
+  if (timer) {
+    clearTimeout(timer);
+    idleTimers.delete(sessionKey(token));
+  }
+}
+
 // Forget a session the upstream reports as gone (nothing to release). With an instance id only that
 // session is dropped, so a stale failure cannot wipe the fresh session a model switch just opened.
 function clearSessionCache(token = null, instanceId = null) {
   if (!token) {
+    for (const key of [...sessions.keys()]) clearIdleTimerByHash(key);
     sessions.clear();
     return;
   }
   const key = sessionKey(token);
   if (instanceId && sessions.get(key)?.instanceId !== instanceId) return;
+  clearIdleTimer(token);
   sessions.delete(key);
+}
+
+function clearIdleTimerByHash(key) {
+  const timer = idleTimers.get(key);
+  if (timer) {
+    clearTimeout(timer);
+    idleTimers.delete(key);
+  }
 }
 
 function clearRunCache() {
@@ -321,8 +556,103 @@ function clearRunCache() {
   inflightRunStarts.clear();
 }
 
+function clearDeviceKeyCache() {
+  deviceKeys.clear();
+}
+
+// URL of a session call, per the CLI: POST goes to /admission; DELETE only lands on /attempt for
+// client-minted "cli:" claims — a server-assigned instance id ends via plain DELETE /session.
+function sessionUrlFor(method, instanceId = "") {
+  const claim = typeof instanceId === "string" && instanceId.startsWith(CLI_CLAIM_PREFIX) ? instanceId.slice(CLI_CLAIM_PREFIX.length) : undefined;
+  if (method === "POST") return SESSION_ADMISSION_URL;
+  if (method === "DELETE" && claim) return SESSION_ATTEMPT_URL;
+  return SESSION_URL;
+}
+
+// Session-header factory, mirroring the CLI's RWA: auth + tz + env fingerprint + client version,
+// multi-session/heartbeat markers only around "cli:" claims, catalog protocol/fetch when a
+// catalog is known, admission's model + wallet limit, and never a client-minted instance id on a
+// fresh POST. Signing is applied by the caller (it needs the exact target URL).
+function buildSessionHeaders(method, token, { instanceId = "", model = null, hasCatalog = false, fetchId = "", compact = false } = {}) {
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "User-Agent": sessionUserAgent(),
+    Accept: "application/json",
+    [HEADER_TIMEZONE]: localTimeZone(),
+    [HEADER_ENV]: clientEnv(),
+  };
+  const version = cliVersion();
+  if (version) headers[HEADER_CLIENT_VERSION] = version;
+
+  const claim = typeof instanceId === "string" && instanceId.startsWith(CLI_CLAIM_PREFIX) ? instanceId.slice(CLI_CLAIM_PREFIX.length) : undefined;
+  const multi = Boolean(claim);
+  if (multi) {
+    headers[HEADER_MULTI_SESSION] = "1";
+    headers[HEADER_PURCHASE_CONTINUITY] = "1";
+    if (method !== "GET") headers[HEADER_ATTEMPT] = claim;
+    if (method === "GET") {
+      headers[HEADER_HEARTBEAT] = "1";
+      if (!compact) headers[HEADER_INCLUDE_UNUSED_RATE_LIMITS] = "1";
+    }
+  }
+  if (hasCatalog) {
+    headers[HEADER_CATALOG_PROTOCOL] = "1";
+    if (fetchId) headers[CATALOG_FETCH_HEADER] = fetchId;
+  }
+  if ((multi || method !== "POST") && instanceId) headers[HEADER_INSTANCE] = instanceId;
+  if (method === "GET" && compact) headers[HEADER_COMPACT_SESSION] = "1";
+  if (method === "POST") {
+    if (model) headers[HEADER_MODEL] = model;
+    headers[HEADER_WALLET_SPEND_LIMIT] = "session";
+  }
+  return headers;
+}
+
+// Sign a session call into an existing header object. The scope follows the target URL's origin,
+// like the CLI's gWA.
+async function signInto(headers, deviceKey, { token, accountId, method, url, body, fetchId }) {
+  if (!deviceKey) return;
+  const sigHeaders = await deviceKey.headers({
+    token,
+    accountId,
+    apiHost: new URL(url).origin,
+    method,
+    url,
+    body,
+    fetchId: fetchId || "",
+  });
+  Object.assign(headers, sigHeaders);
+}
+
+// Desktop admission/session headers (REPORT-DESKTOP.md §6): client + install id + client version,
+// instance id and multi-session always sent, model + wallet limit on POST. Signed by the caller.
+function buildDesktopSessionHeaders(method, token, { instanceId = "", model = null, hasCatalog = false, fetchId = "", attemptId = null } = {}) {
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "User-Agent": desktopUserAgent(),
+    Accept: "application/json",
+    [HEADER_TIMEZONE]: localTimeZone(),
+    [HEADER_CLIENT]: CLIENT_DESKTOP,
+    [HEADER_INSTALL_ID]: installIdFor(token),
+    [HEADER_CLIENT_VERSION]: desktopVersion(),
+    [HEADER_INSTANCE]: instanceId,
+    [HEADER_MULTI_SESSION]: "1",
+    [HEADER_PURCHASE_CONTINUITY]: "1",
+  };
+  if (hasCatalog) {
+    headers[HEADER_CATALOG_PROTOCOL] = "1";
+    if (fetchId) headers[CATALOG_FETCH_HEADER] = fetchId;
+  }
+  if (method === "POST") {
+    if (model) headers[HEADER_MODEL] = model;
+    headers[HEADER_WALLET_SPEND_LIMIT] = "session";
+  }
+  if (attemptId) headers[HEADER_ATTEMPT] = attemptId;
+  return headers;
+}
+
 // Normalise one admission (or queue poll) answer into a session state or throw a FreebuffHttpError.
-function interpretSession(result, model, claimId, multi) {
+function interpretSession(result, model, fallbackInstanceId) {
   const { status, ok, data, text } = result;
   const upstreamStatus = data?.status;
 
@@ -335,7 +665,6 @@ function interpretSession(result, model, claimId, multi) {
       instanceId: data.instanceId,
       model: data.model || model,
       ttlMs: sessionTtlMs(data),
-      multi: multi && data.instanceId.startsWith(CLI_CLAIM_PREFIX),
     };
   }
   if (ok && upstreamStatus === "queued") {
@@ -343,7 +672,7 @@ function interpretSession(result, model, claimId, multi) {
     const retryAfterSec = Math.min(Math.max(waitSec, QUEUED_RETRY_MIN_SEC), QUEUED_RETRY_MAX_SEC);
     return {
       type: "queued",
-      instanceId: data.instanceId || claimId,
+      instanceId: data.instanceId || fallbackInstanceId || "",
       position: data.position,
       queueDepth: data.queueDepth,
       retryAfterSec,
@@ -356,6 +685,7 @@ function interpretSession(result, model, claimId, multi) {
   if (!ok) {
     const error = upstreamError(result, upstreamStatus || "freebuff_session_failed");
     if (!error.retryAfterSec && [429, 503].includes(error.status)) error.retryAfterSec = REFUSAL_RETRY_AFTER_SEC;
+    if (isDeviceKeyError(error.message)) error.code = "device_key_invalid";
     throw error;
   }
   // A refusal delivered inside a 2xx body still needs a real HTTP status for 9router's fallback logic.
@@ -371,48 +701,68 @@ function interpretSession(result, model, claimId, multi) {
   });
 }
 
-// POST the admission (CLI multi-session claim). Falls back to the legacy single-session route on
-// 404/405 (servers without the dedicated admission route).
+// POST the admission. CLI lane: no client-minted instance id (the server assigns one, and the
+// answer travels back in interpretSession). Desktop lane: instance id + multi-session go out per
+// REPORT-DESKTOP.md §6.
 async function admitOnce(token, model, ctx) {
-  const attemptId = randomUUID();
-  const claimId = `${CLI_CLAIM_PREFIX}${attemptId}`;
-  const headers = jsonHeaders(token, {
-    [HEADER_TIMEZONE]: localTimeZone(),
-    [HEADER_FIRST_TAB_DISCOUNT]: "0",
-    [HEADER_MODEL]: model,
-    [HEADER_WALLET_SPEND_LIMIT]: "0",
-    [HEADER_MULTI_SESSION]: "1",
-    [HEADER_PURCHASE_CONTINUITY]: "1",
-    [HEADER_ATTEMPT]: attemptId,
-    [HEADER_INSTANCE]: claimId,
-  });
-  let result = await callJson(SESSION_ADMISSION_URL, { method: "POST", headers, signal: ctx.signal }, ctx.proxyOptions);
-  let multi = true;
-
-  if (result.status === 404 || result.status === 405) {
-    ctx.log?.debug?.("FREEBUFF", `Admission route answered ${result.status}, using legacy session route`);
-    const legacyHeaders = jsonHeaders(token, { "Content-Type": "application/json", [HEADER_MODEL]: model });
-    result = await callJson(
-      SESSION_URL,
-      { method: "POST", headers: legacyHeaders, body: "{}", signal: ctx.signal },
-      ctx.proxyOptions,
-    );
-    multi = false;
-    // No session route at all: the waiting room is off, chat needs no instance id.
-    if (result.status === 404) return { type: "disabled" };
+  let headers;
+  if (ctx.lane === CLIENT_DESKTOP) {
+    headers = buildDesktopSessionHeaders("POST", token, {
+      instanceId: ctx.desktopInstanceId,
+      model: ctx.admissionModel,
+      hasCatalog: ctx.hasCatalog,
+      fetchId: ctx.fetchId,
+      attemptId: ctx.desktopAttemptId,
+    });
+  } else {
+    headers = buildSessionHeaders("POST", token, {
+      model: ctx.admissionModel,
+      hasCatalog: ctx.hasCatalog,
+      fetchId: ctx.fetchId,
+    });
   }
-  const state = interpretSession(result, model, claimId, multi);
-  // Releasing the claim later must send the very pair of ids this admission used.
-  if (multi && (state.type === "active" || state.type === "queued")) Object.assign(state, { attemptId, claimId });
-  return state;
+  await signInto(headers, ctx.deviceKey, {
+    token,
+    accountId: ctx.accountId,
+    method: "POST",
+    url: SESSION_ADMISSION_URL,
+    fetchId: ctx.fetchId,
+  });
+  const result = await callJson(SESSION_ADMISSION_URL, { method: "POST", headers, signal: ctx.signal }, ctx.proxyOptions);
+  // The CLI treats 404/405 on the admission route as a hard "update your client".
+  if (result.status === 404 || result.status === 405) {
+    throw new FreebuffHttpError(502, "session_admission_unsupported", `Freebuff: session admission answered ${result.status}`, {
+      upstream: { status: result.status },
+    });
+  }
+  return interpretSession(result, model);
 }
 
-// Poll a queued session by instance id (only used for servers that still queue).
+// Poll a queued session by instance id.
 async function pollQueued(token, entry, model, ctx) {
-  const headers = jsonHeaders(token, { [HEADER_INSTANCE]: entry.instanceId });
-  const result = await callJson(SESSION_URL, { method: "GET", headers, signal: ctx.signal }, ctx.proxyOptions);
+  const url = sessionUrlFor("GET", entry.instanceId);
+  const headers =
+    entry.lane === CLIENT_DESKTOP
+      ? buildDesktopSessionHeaders("GET", token, {
+          instanceId: entry.instanceId,
+          hasCatalog: ctx.hasCatalog,
+          fetchId: ctx.fetchId,
+        })
+      : buildSessionHeaders("GET", token, {
+          instanceId: entry.instanceId,
+          hasCatalog: ctx.hasCatalog,
+          fetchId: ctx.fetchId,
+        });
+  await signInto(headers, ctx.deviceKey, {
+    token,
+    accountId: ctx.accountId,
+    method: "GET",
+    url,
+    fetchId: ctx.fetchId,
+  });
+  const result = await callJson(url, { method: "GET", headers, signal: ctx.signal }, ctx.proxyOptions);
   if (result.status === 404) return { type: "restart", status: "none" };
-  return interpretSession(result, model, entry.instanceId, entry.instanceId.startsWith(CLI_CLAIM_PREFIX));
+  return interpretSession(result, model, entry.instanceId);
 }
 
 async function resolveSession(token, model, ctx, cached, allowModelLockRetry = true) {
@@ -443,13 +793,11 @@ async function resolveSession(token, model, ctx, cached, allowModelLockRetry = t
 
   // Models this entry answers for: the requested one (also across a queue poll) and the one it really runs.
   const serves = new Set([model, ...(cached?.type === "queued" ? cached.serves : [])]);
-  // The claim ids come from the admission, or from the queued claim a poll just promoted.
-  const claimSource = state.attemptId ? state : cached?.type === "queued" ? cached : null;
-  const claim = claimSource ? { attemptId: claimSource.attemptId, claimId: claimSource.claimId } : {};
 
   if (state.type === "queued") {
     sessions.set(key, {
       type: "queued",
+      lane: ctx.lane,
       model,
       serves,
       instanceId: state.instanceId,
@@ -457,14 +805,16 @@ async function resolveSession(token, model, ctx, cached, allowModelLockRetry = t
       position: state.position,
       queueDepth: state.queueDepth,
       retryAfterSec: state.retryAfterSec,
-      ...claim,
     });
     throw queuedError(state.instanceId, state.position, state.queueDepth, state.retryAfterSec);
   }
+  if (state.type === "restart") {
+    throw new FreebuffHttpError(502, "freebuff_session_failed", "Freebuff: the session could not be started (no session row)");
+  }
   if (state.type === "disabled") {
-    const entry = { type: "disabled", instanceId: "", model, serves, multi: false, expiresAt: Date.now() + DISABLED_SESSION_TTL_MS };
+    const entry = { type: "disabled", lane: ctx.lane, instanceId: "", model, serves, expiresAt: Date.now() + 300_000 };
     sessions.set(key, entry);
-    return { instanceId: "", resolvedModel: model, multi: false };
+    return { instanceId: "", resolvedModel: model };
   }
   if (state.type !== "active") {
     throw new FreebuffHttpError(502, "freebuff_session_failed", `Freebuff: could not open a free session (${state.status || state.type})`);
@@ -472,32 +822,78 @@ async function resolveSession(token, model, ctx, cached, allowModelLockRetry = t
 
   const expiresAt = Date.now() + Math.max(1000, state.ttlMs - SESSION_EXPIRY_MARGIN_MS);
   serves.add(state.model);
-  const entry = { type: "active", instanceId: state.instanceId, model: state.model, serves, multi: state.multi, expiresAt, ...claim };
+  const entry = { type: "active", lane: ctx.lane, instanceId: state.instanceId, model: state.model, serves, expiresAt, lastUsedAt: Date.now() };
   pruneSessions();
   sessions.set(key, entry);
-  return { instanceId: entry.instanceId, resolvedModel: entry.model, multi: entry.multi };
+  scheduleIdleRelease(token, entry, ctx);
+  return { instanceId: entry.instanceId, resolvedModel: entry.model };
 }
 
-// Give the slot of a free session back before another model is admitted: DELETE /session/attempt with
-// the claim's own attempt/instance headers (the refund is automatic). Best effort: a failure is logged
+// Give an occupied slot back before another model is admitted (or when the session went idle):
+// DELETE with the assigned instance id, signed. Server-assigned ids end via plain DELETE
+// /session; only "cli:" claims would take the /attempt route. Best effort: a failure is logged
 // and never fails the request that triggered the switch.
-async function releaseSession(token, entry, nextModel, ctx) {
+async function releaseSession(token, entry, nextModel, ctx = {}) {
   const key = sessionKey(token);
   if (sessions.get(key) === entry) sessions.delete(key);
+  clearIdleTimer(token);
   ctx.log?.info?.("FREEBUFF", `Releasing the ${entry.model} session before admitting ${nextModel}`);
   // The old session's runs are not going to be used again; end them once their requests are done.
-  if (entry.type === "active") retireRuns(token, FREEBUFF_AGENT_ID_BY_MODEL[entry.model]);
-  // Claims from the legacy session route carry no attempt id and cannot be released this way.
-  if (!entry.attemptId) return;
-  const headers = jsonHeaders(token, { [HEADER_ATTEMPT]: entry.attemptId, [HEADER_INSTANCE]: entry.claimId });
+  if (entry.type === "active" && entry.lane !== CLIENT_DESKTOP) retireRuns(token, FREEBUFF_AGENT_ID_BY_MODEL[entry.model]);
+  if (!entry.instanceId) return;
+  const url = sessionUrlFor("DELETE", entry.instanceId);
+  const headers =
+    entry.lane === CLIENT_DESKTOP
+      ? buildDesktopSessionHeaders("DELETE", token, {
+          instanceId: entry.instanceId,
+          hasCatalog: ctx.hasCatalog,
+          fetchId: ctx.fetchId,
+        })
+      : buildSessionHeaders("DELETE", token, {
+          instanceId: entry.instanceId,
+          hasCatalog: ctx.hasCatalog,
+          fetchId: ctx.fetchId,
+        });
+  await signInto(headers, ctx.deviceKey, {
+    token,
+    accountId: ctx.accountId,
+    method: "DELETE",
+    url,
+    fetchId: ctx.fetchId,
+  });
   try {
-    const result = await callJson(SESSION_ATTEMPT_URL, { method: "DELETE", headers }, ctx.proxyOptions);
+    const result = await callJson(url, { method: "DELETE", headers }, ctx.proxyOptions);
     if (!result.ok && result.status !== 404) {
       ctx.log?.warn?.("FREEBUFF", `Releasing the ${entry.model} session answered ${result.status}`);
     }
   } catch (err) {
     ctx.log?.warn?.("FREEBUFF", `Releasing the ${entry.model} session failed: ${err?.message || err}`);
   }
+}
+
+// Release a session's slot after FREEBUFF_SESSION_IDLE_MS without activity, so the single free
+// slot does not stay occupied for its whole hour (the stuck-slot bug of the old executor).
+function scheduleIdleRelease(token, entry, ctx = {}) {
+  clearIdleTimer(token);
+  const idleMs = sessionIdleMs();
+  if (!(idleMs > 0) || entry.type !== "active") return;
+  const timer = setTimeout(
+    async () => {
+      idleTimers.delete(sessionKey(token));
+      const current = sessions.get(sessionKey(token));
+      if (current !== entry) return;
+      sessions.delete(sessionKey(token));
+      try {
+        await releaseSession(token, entry, "(idle)", ctx);
+        ctx.log?.info?.("FREEBUFF", `Released the idle ${entry.model} session after ${Math.round(idleMs / 1000)}s`);
+      } catch {
+        // best effort — the slot expires server-side anyway
+      }
+    },
+    idleMs,
+  );
+  timer.unref?.();
+  idleTimers.set(sessionKey(token), timer);
 }
 
 // Session for a token: cached until near expiry; one shared in-flight admission per token. The token
@@ -514,12 +910,16 @@ async function getFreebuffSession(token, model = DEFAULT_MODEL, ctx = {}) {
 
     const now = Date.now();
     const cached = sessions.get(key);
-    const serves = cached?.serves.has(model) === true;
+    // A cached entry only serves when it was opened on the same lane: the release/admission
+    // header styles differ between the CLI and desktop flows.
+    const serves = cached?.serves.has(model) === true && cached.lane === (ctx.lane || CLIENT_CLI);
     if (serves && cached.type === "active" && now < cached.expiresAt) {
-      return { instanceId: cached.instanceId, resolvedModel: cached.model, multi: cached.multi };
+      cached.lastUsedAt = now;
+      scheduleIdleRelease(token, cached, ctx);
+      return { instanceId: cached.instanceId, resolvedModel: cached.model };
     }
     if (serves && cached.type === "disabled" && now < cached.expiresAt) {
-      return { instanceId: "", resolvedModel: cached.model, multi: false };
+      return { instanceId: "", resolvedModel: cached.model };
     }
     if (serves && cached.type === "queued" && now < cached.retryAtMs) {
       throw queuedError(cached.instanceId, cached.position, cached.queueDepth, Math.max(1, Math.ceil((cached.retryAtMs - now) / 1000)));
@@ -538,11 +938,18 @@ async function getFreebuffSession(token, model = DEFAULT_MODEL, ctx = {}) {
 }
 
 async function startAgentRun(token, agentId, ctx = {}) {
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "User-Agent": sessionUserAgent(),
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+  if (ctx.accountId) headers[HEADER_ACTING_USER] = ctx.accountId;
   const result = await callJson(
     AGENT_RUNS_URL,
     {
       method: "POST",
-      headers: jsonHeaders(token, { "Content-Type": "application/json" }),
+      headers,
       body: JSON.stringify({ action: "START", agentId, ancestorRunIds: [] }),
       signal: ctx.signal,
     },
@@ -558,13 +965,20 @@ async function startAgentRun(token, agentId, ctx = {}) {
 }
 
 // Best effort: the call is issued synchronously, failures are swallowed.
-function finishAgentRun(token, runId, status = "completed", ctx = {}, errorMessage = "", { totalSteps = 1 } = {}) {
+function finishAgentRun(token, runId, status = "completed", ctx = {}, errorMessage = "", { totalSteps = 1, accountId = null } = {}) {
   if (!runId) return Promise.resolve();
   const payload = { action: "FINISH", runId, status, totalSteps, directCredits: 0, totalCredits: 0, steps: [] };
   if (errorMessage) payload.errorMessage = String(errorMessage).slice(0, 5000);
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "User-Agent": sessionUserAgent(),
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+  if (accountId || ctx.accountId) headers[HEADER_ACTING_USER] = accountId || ctx.accountId;
   return callJson(
     AGENT_RUNS_URL,
-    { method: "POST", headers: jsonHeaders(token, { "Content-Type": "application/json" }), body: JSON.stringify(payload) },
+    { method: "POST", headers, body: JSON.stringify(payload) },
     ctx.proxyOptions,
   ).catch(() => {});
 }
@@ -585,6 +999,10 @@ function retireRuns(token, agentId) {
   activeRuns.delete(key);
   drainingRuns.add(run);
   finishIfReady(run);
+}
+
+function runKey(token, agentId) {
+  return `${sessionKey(token)}:${agentId}`;
 }
 
 // START a run and make it the current one for its (token, agent); the run it replaces starts draining.
@@ -669,7 +1087,7 @@ function ensureRootOpening(messages) {
   const msgs = Array.isArray(messages) ? [...messages] : [];
   const first = msgs[0];
   if (first?.role === "system" && messageText(first.content).trimStart().startsWith(FREEBUFF_ROOT_OPENING)) {
-    return msgs;
+    return Array.isArray(messages) ? messages : msgs;
   }
   msgs.unshift({ role: "system", content: ROOT_SYSTEM_PROMPT });
   return msgs;
@@ -739,9 +1157,11 @@ function normalizeToolSchemas(tools) {
   });
 }
 
-// Build the /chat/completions body. Caller fields are passed through (tools included) except the
-// ones this handshake owns: model, messages, stream, codebuff_metadata and provider.
-function buildChatBody(body, { model, runId, instanceId, multi, stream }) {
+// Build the /chat/completions body in the CLI 0.2.34 shape ($3H + RZA): caller fields pass
+// through, but model, messages, stream, codebuff_metadata and provider belong to the handshake.
+// codebuff_metadata order follows the CLI spread: extra (instance/env) first, then run_id,
+// client_id, and the conditional n / cost_mode / cache_debug_correlation.
+function buildChatBody(body, { model, runId, instanceId = "", reasoningEffort = null, stream = true, costMode = null } = {}) {
   const out = { ...(body || {}) };
   delete out.codebuff_metadata;
   delete out.provider;
@@ -762,21 +1182,57 @@ function buildChatBody(body, { model, runId, instanceId, multi, stream }) {
   if (out.max_tokens == null && out.max_completion_tokens != null) out.max_tokens = out.max_completion_tokens;
   delete out.max_completion_tokens;
 
-  const metadata = { run_id: runId, client_id: generateClientId(), cost_mode: "free" };
+  // RZA: multi-session/surface markers only for client-minted "cli:" claims — a server-assigned
+  // instance id travels alone.
+  const metadata = {};
   if (instanceId) {
     metadata.freebuff_instance_id = instanceId;
-    // Claims minted by admitOnce() live in the CLI multi-session store; the gate needs to know.
-    if (multi) Object.assign(metadata, { freebuff_multi_session: "1", surface: "cli" });
+    if (String(instanceId).startsWith(CLI_CLAIM_PREFIX)) {
+      metadata.freebuff_multi_session = "1";
+      metadata.surface = "cli";
+    }
   }
+  if (reasoningEffort) metadata.freebuff_reasoning_effort = String(reasoningEffort);
+  metadata.freebuff_client_env = clientEnv();
+  metadata.run_id = runId;
+  metadata.client_id = generateClientId();
+  const mode = costMode ?? costModeOverride();
+  if (mode) metadata.cost_mode = mode;
 
-  return {
-    ...out,
-    model,
-    messages,
-    stream: stream !== false,
-    codebuff_metadata: metadata,
-    provider: { data_collection: "deny" },
+  out.model = model;
+  out.messages = messages;
+  out.stream = stream !== false;
+  if (out.stream && out.stream_options == null) out.stream_options = { include_usage: true };
+  out.codebuff_metadata = metadata;
+  out.provider = { order: null, allow_fallbacks: true };
+  return out;
+}
+
+// Chat headers, mirroring the CLI provider factory + YWA: ai-sdk user agent, gzip recovery,
+// acting user, catalog fetch binding, and the device-key signature over this exact body.
+async function buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, deviceKey }) {
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${token}`,
+    "User-Agent": chatUserAgent(),
+    Accept: stream ? "text/event-stream" : "application/json",
+    [HEADER_GZIP_RECOVERY]: "1",
   };
+  if (accountId) headers[HEADER_ACTING_USER] = accountId;
+  if (fetchId) headers[CATALOG_FETCH_HEADER] = fetchId;
+  if (deviceKey) {
+    const sigHeaders = await deviceKey.headers({
+      token,
+      accountId,
+      apiHost: new URL(CHAT_URL).origin,
+      method: "POST",
+      url: CHAT_URL,
+      body: bodyStr,
+      fetchId: fetchId || "",
+    });
+    Object.assign(headers, sigHeaders);
+  }
+  return headers;
 }
 
 async function readErrorBody(response) {
@@ -788,10 +1244,13 @@ async function readErrorBody(response) {
 }
 
 // What a rejected chat call asks us to renew before one retry: "session" (re-admit), "run" (fresh
-// START, the session is fine) or null (pass the error through).
+// START, the session is fine), "catalog" (stale catalog: refetch for a fresh fetchId) or
+// "devicekey" (the registered key is unknown: forget it so the next round re-registers).
 function gateRetryKind(status, errText) {
   const data = parseJson(errText);
   const code = typeof data?.error === "string" ? data.error : "";
+  if (code === "freebuff_catalog_stale") return "catalog";
+  if (isDeviceKeyError(errText)) return "devicekey";
   if (code === "freebuff_update_required" || (code && SESSION_INVALID_CODES.has(code))) return "session";
   // The run vanished server side (a long-lived run can expire); a fresh START fixes it.
   if (status === 400 && /runid not (found|running)/i.test(errText)) return "run";
@@ -842,10 +1301,14 @@ function wrapStreamWithCleanup(response, onDone) {
 }
 
 // Token check used by the dashboard "test connection" button: GET /session is free (no admission).
-export async function probeFreebuffToken(token, proxyOptions = null, { signal } = {}) {
+export async function probeFreebuffToken(token, proxyOptions = null, { signal, deviceKey = null, accountId = null } = {}) {
   if (!token) return { valid: false, status: 0, error: "No token" };
   try {
-    const result = await callJson(SESSION_URL, { method: "GET", headers: jsonHeaders(token), signal }, directEgressOptions(proxyOptions));
+    const headers = buildSessionHeaders("GET", token);
+    if (deviceKey) {
+      await signInto(headers, deviceKey, { token, accountId, method: "GET", url: SESSION_URL });
+    }
+    const result = await callJson(SESSION_URL, { method: "GET", headers, signal }, directEgressOptions(proxyOptions));
     if (result.status === 401) return { valid: false, status: 401, error: "Token invalid or revoked" };
     // The token is fine but free mode refuses this account or this server's region.
     const refusal = result.data?.status;
@@ -857,6 +1320,158 @@ export async function probeFreebuffToken(token, proxyOptions = null, { signal } 
   } catch (err) {
     return { valid: false, status: 0, error: err.message };
   }
+}
+
+// ---------------------------------------------------------------------------
+// cloud-run lane (Desktop 0.0.188 protocol)
+// ---------------------------------------------------------------------------
+
+function cloudPollIntervalMs() {
+  const raw = Number(process.env.FREEBUFF_CLOUD_POLL_MS);
+  return Number.isFinite(raw) && raw >= 50 ? Math.floor(raw) : CLOUD_POLL_INTERVAL_MS_DEFAULT;
+}
+
+function cloudRunTimeoutMs() {
+  const raw = Number(process.env.FREEBUFF_CLOUD_RUN_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : CLOUD_RUN_TIMEOUT_MS_DEFAULT;
+}
+
+// Flatten a chat-completions conversation into the single prompt string a cloud run expects.
+function promptFromMessages(messages) {
+  const msgs = Array.isArray(messages) ? messages : [];
+  const lastUser = [...msgs].reverse().find((m) => m?.role === "user");
+  const parts = msgs.map((m) => {
+    const text = messageText(m?.content);
+    if (!text) return "";
+    return `${m.role}: ${text}`;
+  });
+  const transcript = parts.filter(Boolean).join("\n\n");
+  return { prompt: transcript || messageText(lastUser?.content) || "", displayPrompt: messageText(lastUser?.content) };
+}
+
+// The POST /api/v1/cloud/runs submission (REPORT-DESKTOP.md §5). Fields the desktop fills from
+// its workspace state (github, seed, terminalSessionIds, mission, byok/agent) have no 9router
+// counterpart and are simply absent; a 400 "Invalid cloud run request" retry only drops `github`,
+// which we never send.
+function buildCloudSubmission({ body, model, instanceId }) {
+  const { prompt, displayPrompt } = promptFromMessages(body?.messages);
+  const threadId = randomUUID();
+  const effort = body?.reasoning_effort ? String(body.reasoning_effort) : undefined;
+  return {
+    workspaceId: threadId,
+    runId: randomUUID(),
+    instanceId: instanceId || `byok-${threadId}`,
+    prompt,
+    terminalSessionIds: [],
+    displayPrompt: displayPrompt || prompt,
+    chatTitle: (displayPrompt || prompt).slice(0, 80),
+    model,
+    ...(effort ? { effort } : {}),
+    agentMode: "chat",
+    injectAgentsMd: false,
+    images: [],
+  };
+}
+
+// Text of one polled event. Chunk payloads have been seen as {text} in the desktop bundle; be
+// liberal in what we accept.
+function cloudChunkText(payload) {
+  if (typeof payload === "string") return payload;
+  return payload?.text ?? payload?.content ?? payload?.delta ?? "";
+}
+
+function chatCompletionBody(content, model) {
+  return {
+    id: `chatcmpl-${randomUUID()}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+  };
+}
+
+function sseFrame(payload) {
+  return `data: ${JSON.stringify(payload)}\n\n`;
+}
+
+// Adapt cloud-run chunk events into an SSE response the 9router stream pipeline understands.
+function sseResponseFromEvents(events, model) {
+  const id = `chatcmpl-${randomUUID()}`;
+  const stream = new ReadableStream({
+    start(controller) {
+      const encoder = new TextEncoder();
+      const push = (obj) => controller.enqueue(encoder.encode(sseFrame(obj)));
+      push({ id, object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+      for (const event of events) {
+        const text = cloudChunkText(event.payload);
+        if (text) push({ id, object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: text }, finish_reason: null }] });
+      }
+      push({ id, object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+      controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
+  return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
+// Poll GET /api/v1/cloud/runs/{runId}?after=<cursor> until the run completes, fails or the budget
+// runs out; then render the collected chunk events as a chat response. On client abort the cloud
+// run is cancelled best effort.
+async function pollCloudRun({ token, runId, signal, proxyOptions, log, model }) {
+  const budgetMs = cloudRunTimeoutMs();
+  const deadline = Date.now() + budgetMs;
+  const intervalMs = cloudPollIntervalMs();
+  const chunks = [];
+  let cursor = null;
+  let status = "queued";
+
+  while (Date.now() < deadline) {
+    if (signal?.aborted) {
+      await proxyAwareFetch(`${CLOUD_RUNS_URL}/${runId}/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({}),
+      }, proxyOptions).catch(() => {});
+      return { error: new FreebuffHttpError(499, "client_disconnected", "Freebuff cloud run aborted by the client") };
+    }
+
+    const url = cursor ? `${CLOUD_RUNS_URL}/${runId}?after=${encodeURIComponent(cursor)}` : `${CLOUD_RUNS_URL}/${runId}`;
+    const result = await callJson(url, { method: "GET", headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } }, proxyOptions);
+    if (!result.ok) {
+      return { error: upstreamError(result, "cloud_run_poll_failed") };
+    }
+
+    const events = Array.isArray(result.data?.events) ? result.data.events : [];
+    for (const event of events) {
+      if (typeof event?.id === "string" || typeof event?.id === "number") cursor = String(event.id);
+      if (event?.kind === "chunk") chunks.push(event);
+    }
+    status = result.data?.status || (result.data?.done ? "completed" : status);
+
+    if (status === "completed" || status === "failed") {
+      if (status === "failed") {
+        const message = result.data?.errorMessage || result.data?.error || "cloud run failed";
+        return { error: new FreebuffHttpError(502, "cloud_run_failed", `Freebuff: ${message}`, { upstream: result.data ?? undefined }) };
+      }
+      const content = chunks.map((event) => cloudChunkText(event.payload)).join("");
+      const response = model?.stream
+        ? sseResponseFromEvents(chunks, model.model)
+        : new Response(JSON.stringify(chatCompletionBody(content, model?.model || "")), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+      return { response };
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+
+  await proxyAwareFetch(`${CLOUD_RUNS_URL}/${runId}/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({}),
+  }, proxyOptions).catch(() => {});
+  return { error: new FreebuffHttpError(504, "cloud_run_timeout", `Freebuff cloud run did not finish within ${Math.round(budgetMs / 1000)}s`) };
 }
 
 export class FreebuffExecutor extends BaseExecutor {
@@ -872,13 +1487,14 @@ export class FreebuffExecutor extends BaseExecutor {
     return {
       "Content-Type": "application/json",
       Authorization: `Bearer ${tokenOf(credentials)}`,
-      "User-Agent": getUserAgent(),
+      "User-Agent": chatUserAgent(),
       Accept: stream ? "text/event-stream" : "application/json",
+      [HEADER_GZIP_RECOVERY]: "1",
     };
   }
 
   transformRequest(model, body, stream) {
-    return buildChatBody(body, { model: resolveModel(model), runId: undefined, instanceId: "", multi: false, stream });
+    return buildChatBody(body, { model: resolveModel(model), runId: undefined, instanceId: "", stream });
   }
 
   // Surface Codebuff's machine-readable code ("free_mode_cli_required", "country_blocked", ...).
@@ -893,10 +1509,124 @@ export class FreebuffExecutor extends BaseExecutor {
     return { status: response.status, message };
   }
 
-  async execute({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
+  async execute(options) {
+    const mode = resolveExecMode(options.credentials);
+    if (mode === "cloud-run") return this.executeCloudRun(options);
+    return this.executeCliChat(options);
+  }
+
+  // Desktop hosted lane: signed catalog + admission, then POST /api/v1/cloud/runs and adapt the
+  // JSON event polling into an OpenAI-shaped chat response (see REPORT-DESKTOP.md §5).
+  async executeCloudRun({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
+    const fail = (error) => ({
+      response: error.toResponse(),
+      url: CLOUD_RUNS_URL,
+      headers: {},
+      transformedBody: error.toBody(),
+    });
+
+    const token = tokenOf(credentials);
+    if (!token) {
+      return fail(new FreebuffHttpError(401, "unauthorized", "Freebuff requires an auth token", { type: "authentication_error" }));
+    }
+    const targetModel = resolveModel(model);
+    const tokenHash = tokenHashOf(token);
+    const accountId = accountIdOf(credentials);
+    const deviceKey = getDeviceKeyManager(credentials, { log }, CLIENT_DESKTOP);
+
+    const ctx = {
+      proxyOptions: directEgressOptions(proxyOptions, log),
+      signal,
+      log,
+      deviceKey,
+      accountId,
+      lane: CLIENT_DESKTOP,
+      // Desktop admissions carry a client-side instance id (freeMode.instanceId analogue).
+      desktopInstanceId: `byok-${randomUUID()}`,
+      desktopAttemptId: randomUUID(),
+    };
+    const catalogCtx = { token, deviceKey, accountId, client: CLIENT_DESKTOP, proxyFetch: proxyAwareFetch, proxyOptions: ctx.proxyOptions, log };
+
+    let catalog = await getFreebuffCatalog(catalogCtx);
+    let fetchId = cachedFetchId(tokenHash, CLIENT_DESKTOP);
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let session;
+      let runId = "";
+      let submissionStr = "";
+      let submission;
+      try {
+        ctx.hasCatalog = Boolean(catalog);
+        ctx.fetchId = fetchId;
+        // Desktop uses the opaque handle (catalog row, else the deterministic digest).
+        ctx.admissionModel = catalog ? resolveAdmissionModel(catalog, targetModel, { desktop: true }) : freebuffHandleFor(targetModel);
+
+        session = await getFreebuffSession(token, targetModel, ctx);
+        submission = buildCloudSubmission({ body, model: ctx.admissionModel, instanceId: session.instanceId, stream });
+        runId = submission.runId;
+        submissionStr = JSON.stringify(submission);
+      } catch (err) {
+        if (err instanceof FreebuffHttpError) {
+          log?.debug?.("FREEBUFF", `Cloud session initialization refused (${err.status} ${err.code})`);
+          return fail(err);
+        }
+        throw err;
+      }
+
+      const headers = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+        [CLOUD_QUESTIONS_HEADER]: "1",
+        [PRODUCT_CONTEXT_HEADER]: JSON.stringify({ originApp: "desktop" }),
+      };
+      log?.debug?.("FETCH", `FREEBUFF -> ${CLOUD_RUNS_URL} | model=${ctx.admissionModel} run=${runId} | body=${submissionStr.length}B`);
+
+      let response;
+      try {
+        response = await proxyAwareFetch(CLOUD_RUNS_URL, { method: "POST", headers, body: submissionStr, signal }, ctx.proxyOptions);
+      } catch (error) {
+        if (error.name === "AbortError" && !signal?.aborted) throw new Error("Freebuff cloud run connect failed");
+        throw error;
+      }
+
+      if (!response.ok) {
+        const errText = await readErrorBody(response);
+        const code = parseJson(errText)?.error;
+        // 409 freebuff_catalog_stale -> refresh the catalog once, retry with the fresh handle.
+        if (attempt === 0 && (code === "freebuff_catalog_stale" || response.status === 409 && /catalog_stale/i.test(errText))) {
+          log?.debug?.("FREEBUFF", "Cloud run reported a stale catalog, refreshing and retrying");
+          invalidateFreebuffCatalog(tokenHash);
+          catalog = await getFreebuffCatalog({ ...catalogCtx, force: true });
+          fetchId = cachedFetchId(tokenHash, CLIENT_DESKTOP);
+          continue;
+        }
+        return fail(upstreamError({ resp: response, status: response.status, data: parseJson(errText), text: errText }, "cloud_run_failed"));
+      }
+
+      // Poll the run's events and adapt them into a chat-shaped response.
+      const adapted = await pollCloudRun({
+        token,
+        runId,
+        signal,
+        proxyOptions: ctx.proxyOptions,
+        log,
+        model: { stream, model: ctx.admissionModel },
+      });
+      if (adapted.error) return fail(adapted.error);
+      return { response: adapted.response, url: CLOUD_RUNS_URL, headers, transformedBody: submission };
+    }
+
+    throw new Error("Freebuff cloud run failed");
+  }
+
+  async executeCliChat({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
     const url = this.buildUrl();
-    const headers = this.buildHeaders(credentials, stream);
-    const fail = (error) => ({ response: error.toResponse(), url, headers, transformedBody: error.toBody() });
+    const fail = (error, headers = {}) => ({
+      response: error.toResponse(),
+      url,
+      headers,
+      transformedBody: error.toBody(),
+    });
 
     const token = tokenOf(credentials);
     if (!token) {
@@ -912,14 +1642,29 @@ export class FreebuffExecutor extends BaseExecutor {
         }),
       );
     }
+    const tokenHash = tokenHashOf(token);
+    const accountId = accountIdOf(credentials);
+    const deviceKey = getDeviceKeyManager(credentials, { log }, CLIENT_CLI);
 
-    const ctx = { proxyOptions: directEgressOptions(proxyOptions, log), signal, log };
+    const ctx = { proxyOptions: directEgressOptions(proxyOptions, log), signal, log, deviceKey, accountId, lane: CLIENT_CLI };
+    const catalogCtx = { token, deviceKey, accountId, client: CLIENT_CLI, proxyFetch: proxyAwareFetch, proxyOptions: ctx.proxyOptions, log };
+
+    // Catalog first (cached): its fetchId is bound into the admission and chat signatures.
+    let catalog = await getFreebuffCatalog(catalogCtx);
+    let fetchId = cachedFetchId(tokenHash, CLIENT_CLI);
 
     for (let attempt = 0; attempt < 2; attempt++) {
       let session;
       let lease = null;
       let startFailed = false;
+      let bodyStr = "";
+      let chatHeaders;
       try {
+        ctx.hasCatalog = Boolean(catalog);
+        ctx.fetchId = fetchId;
+        // Admission model header resolves through the catalog (rOA: handle when known).
+        ctx.admissionModel = catalog ? resolveAdmissionModel(catalog, targetModel) : targetModel;
+
         session = await getFreebuffSession(token, targetModel, ctx);
         const agentId = FREEBUFF_AGENT_ID_BY_MODEL[session.resolvedModel];
         if (!agentId) {
@@ -932,12 +1677,22 @@ export class FreebuffExecutor extends BaseExecutor {
         startFailed = true;
         lease = await acquireAgentRun(token, agentId, ctx);
         startFailed = false;
+
+        const transformedBody = buildChatBody(body, {
+          model: session.resolvedModel,
+          runId: lease.runId,
+          instanceId: session.instanceId,
+          reasoningEffort: body?.reasoning_effort ?? null,
+          stream,
+        });
+        bodyStr = JSON.stringify(transformedBody);
+        chatHeaders = await buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, deviceKey });
       } catch (err) {
         if (err instanceof FreebuffHttpError) {
           // A START that reports a dead session (not our own queued answer) gets one fresh admission.
           if (startFailed && attempt === 0 && SESSION_INVALID_CODES.has(err.code)) {
             log?.debug?.("FREEBUFF", `Agent run START reported ${err.code}, re-admitting`);
-            clearSessionCache(token, session.instanceId);
+            clearSessionCache(token, session?.instanceId);
             continue;
           }
           log?.debug?.("FREEBUFF", `Session/run initialization refused (${err.status} ${err.code})`);
@@ -945,23 +1700,7 @@ export class FreebuffExecutor extends BaseExecutor {
         }
         throw err;
       }
-
       const runId = lease.runId;
-      let transformedBody;
-      let bodyStr;
-      try {
-        transformedBody = buildChatBody(body, {
-          model: session.resolvedModel,
-          runId,
-          instanceId: session.instanceId,
-          multi: session.multi,
-          stream,
-        });
-        bodyStr = JSON.stringify(transformedBody);
-      } catch (error) {
-        lease.release("failed", error.message);
-        throw error;
-      }
       log?.debug?.("FETCH", `FREEBUFF -> ${url} | model=${session.resolvedModel} runId=${runId} | body=${bodyStr.length}B`);
 
       // Abort if upstream doesn't return response headers within the connection timeout.
@@ -972,7 +1711,7 @@ export class FreebuffExecutor extends BaseExecutor {
 
       let response;
       try {
-        response = await proxyAwareFetch(url, { method: "POST", headers, body: bodyStr, signal: mergedSignal }, ctx.proxyOptions);
+        response = await proxyAwareFetch(url, { method: "POST", headers: chatHeaders, body: bodyStr, signal: mergedSignal }, ctx.proxyOptions);
       } catch (error) {
         clearTimeout(connectTimer);
         lease.release("failed", error.message);
@@ -985,19 +1724,30 @@ export class FreebuffExecutor extends BaseExecutor {
 
       if (!response.ok) {
         const errText = await readErrorBody(response);
-        const retry = attempt === 0 ? gateRetryKind(response.status, errText) : null;
+        let retry = attempt === 0 ? gateRetryKind(response.status, errText) : null;
+        // An unknown device key invalidates the registration and the fetchId binding.
+        if (isDeviceKeyError(errText)) {
+          deviceKey.forgetRegistration({ token, accountId, apiHost: new URL(CHAT_URL).origin });
+          invalidateFreebuffCatalog(tokenHash);
+          retry = attempt === 0 ? "devicekey" : null;
+        }
         if (retry === "run") lease.invalidate();
-        lease.release("failed", `${response.status} ${errText.slice(0, 200)}`);
+        else lease.release("failed", `${response.status} ${errText.slice(0, 200)}`);
         if (retry) {
           log?.debug?.("FREEBUFF", `Chat gate rejected the request (${response.status}), renewing the ${retry}`);
           if (retry === "session") clearSessionCache(token, session.instanceId);
+          if (retry === "catalog" || retry === "devicekey") {
+            invalidateFreebuffCatalog(tokenHash);
+            catalog = await getFreebuffCatalog({ ...catalogCtx, force: true });
+            fetchId = cachedFetchId(tokenHash, CLIENT_CLI);
+          }
           continue;
         }
-        return { response, url, headers, transformedBody };
+        return { response, url, headers: chatHeaders, transformedBody: JSON.parse(bodyStr) };
       }
 
       const wrapped = wrapStreamWithCleanup(response, (status, message) => lease.release(status, message));
-      return { response: wrapped, url, headers, transformedBody };
+      return { response: wrapped, url, headers: chatHeaders, transformedBody: JSON.parse(bodyStr) };
     }
 
     throw new Error("Freebuff execution failed");
@@ -1015,25 +1765,74 @@ export const __test__ = {
   wrapStreamWithCleanup,
   directEgressOptions,
   generateClientId,
+  clientEnv,
   clearSessionCache,
   clearRunCache,
+  clearDeviceKeyCache,
+  clearIdleTimers: () => {
+    for (const key of [...idleTimers.keys()]) clearIdleTimerByHash(key);
+  },
   runRotationMs,
+  sessionIdleMs,
   resolveModel,
   tokenOf,
+  sessionKey,
   sessions,
   activeRuns,
   drainingRuns,
   warnedRelays,
+  deviceKeys,
+  invalidateFreebuffCatalog,
+  cachedFetchId,
+  buildSessionHeaders,
+  buildDesktopSessionHeaders,
+  buildCloudSubmission,
+  promptFromMessages,
+  cloudChunkText,
+  chatCompletionBody,
+  resolveExecMode,
+  installIdFor,
+  desktopVersion,
+  desktopUserAgent,
+  laneFor,
+  sessionUrlFor,
+  gateRetryKind,
+  buildChatHeaders,
   ROOT_SYSTEM_PROMPT,
+  FREEBUFF_ROOT_OPENING,
   DEFAULT_MODEL,
-  DEFAULT_USER_AGENT,
+  FREEBUFF_AGENT_ID_BY_MODEL,
+  chatUserAgent,
+  sessionUserAgent,
+  cliVersion,
+  aiSdkVersion,
+  setFreebuffDeviceKeyPersister,
+  persistDeviceKeyRecord,
+  getDeviceKeyManager,
+  HEADER_GZIP_RECOVERY,
+  HEADER_ACTING_USER,
+  HEADER_INSTALL_ID,
+  HEADER_CLIENT,
+  DEVICE_KEY_HEADER,
+  DEVICE_SIG_HEADER,
+  DEVICE_TS_HEADER,
+  DEFAULT_CLI_VERSION,
+  DEFAULT_AISDK_VERSION,
+  DEFAULT_DESKTOP_VERSION,
   DEFAULT_RUN_ROTATION_MS,
+  DEFAULT_SESSION_IDLE_MS,
+  CLOUD_POLL_INTERVAL_MS_DEFAULT,
+  CLOUD_RUN_TIMEOUT_MS_DEFAULT,
   BASE_URL,
   CHAT_URL,
   AGENT_RUNS_URL,
   SESSION_URL,
   SESSION_ADMISSION_URL,
   SESSION_ATTEMPT_URL,
+  CLOUD_RUNS_URL,
+  FREEBUFF_BASE: FREEBUFF_API_BASE,
+  CATALOG_URL,
+  DEVICE_KEYS_URL,
 };
 
 export default FreebuffExecutor;

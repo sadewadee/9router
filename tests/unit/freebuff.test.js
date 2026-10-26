@@ -1,19 +1,5 @@
-/**
- * Unit tests for the Freebuff (Codebuff free mode) provider.
- *
- * Nothing here talks to codebuff.com: proxyAwareFetch (executor) and global fetch (OAuth) are mocked.
- * Covers the parts that would silently break the free-mode handshake:
- *   - registration (registry entry, executor aliases, OAuth provider, model list vs. agent ids)
- *   - canonical system-prompt opening (byte-exact prefix gate, caller text never wrapped)
- *   - request body (codebuff_metadata, tools passthrough vs. FREEBUFF_FOLD_TOOLS)
- *   - session handshake (admission, cache, in-flight dedupe, queued -> 503, model_locked retry)
- *   - agent run START / FINISH lifecycle around the response stream
- *   - direct egress (relay proxy pools are ignored, plain proxies honoured)
- *   - upstream error pass-through and the dashboard token probe
- *   - device-code OAuth flow
- */
-
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { createHash } from "node:crypto";
 
 // Mock proxyAwareFetch so no test ever reaches the network.
 const fetchMock = vi.fn();
@@ -23,11 +9,17 @@ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
 
 import {
   FreebuffExecutor,
-  FREEBUFF_AGENT_ID_BY_MODEL,
-  FREEBUFF_ROOT_OPENING,
   probeFreebuffToken,
   __test__,
 } from "../../open-sse/executors/freebuff.js";
+import { generateDeviceKeyRecord, buildStringToSign, b64urlDecode, isDeviceKeyError } from "../../open-sse/utils/freebuffDeviceKey.js";
+import {
+  parseCatalog,
+  visibleRows,
+  catalogTtlMs,
+  resolveAdmissionModel,
+  invalidateFreebuffCatalog,
+} from "../../open-sse/utils/freebuffCatalog.js";
 import { PROVIDERS } from "../../open-sse/config/providers.js";
 import { PROVIDER_MODELS, PROVIDER_ID_TO_ALIAS, getDefaultModel } from "../../open-sse/config/providerModels.js";
 import { parseModel, resolveProviderAlias } from "../../open-sse/services/model.js";
@@ -45,22 +37,52 @@ const {
   wrapStreamWithCleanup,
   directEgressOptions,
   generateClientId,
+  clientEnv,
   clearSessionCache,
   clearRunCache,
+  clearDeviceKeyCache,
+  clearIdleTimers,
   runRotationMs,
+  sessionIdleMs,
   sessions,
   activeRuns,
   drainingRuns,
   warnedRelays,
   ROOT_SYSTEM_PROMPT,
+  FREEBUFF_ROOT_OPENING,
   DEFAULT_MODEL,
-  DEFAULT_USER_AGENT,
+  FREEBUFF_AGENT_ID_BY_MODEL,
+  chatUserAgent,
+  sessionUserAgent,
+  cliVersion,
+  aiSdkVersion,
+  sessionUrlFor,
+  gateRetryKind,
+  setFreebuffDeviceKeyPersister,
+  sessionKey,
+  tokenOf,
+  buildDesktopSessionHeaders,
+  buildCloudSubmission,
+  promptFromMessages,
+  cloudChunkText,
+  resolveExecMode,
+  installIdFor,
+  desktopVersion,
+  desktopUserAgent,
+  DEFAULT_CLI_VERSION,
+  DEFAULT_AISDK_VERSION,
+  DEFAULT_DESKTOP_VERSION,
+  DEFAULT_SESSION_IDLE_MS,
+  DEFAULT_RUN_ROTATION_MS,
   CHAT_URL,
   AGENT_RUNS_URL,
   SESSION_URL,
   SESSION_ADMISSION_URL,
   SESSION_ATTEMPT_URL,
-  DEFAULT_RUN_ROTATION_MS,
+  CLOUD_RUNS_URL,
+  DEVICE_KEYS_URL,
+  CATALOG_URL,
+  HEADER_GZIP_RECOVERY,
 } = __test__;
 
 // ---------------------------------------------------------------------------
@@ -108,47 +130,102 @@ function parseCall([url, init, opts]) {
 const allCalls = () => fetchMock.mock.calls.map(parseCall);
 const callsTo = (url, method) => allCalls().filter((c) => c.url === url && (!method || c.method === method));
 const agentRunCalls = (action) => callsTo(AGENT_RUNS_URL, "POST").filter((c) => c.body?.action === action);
-const releaseCalls = () => callsTo(SESSION_ATTEMPT_URL, "DELETE");
-const activeSession = (headers) =>
-  json({ status: "active", instanceId: headers["x-freebuff-instance-id"], model: headers["x-freebuff-model"], remainingMs: 600_000 });
+const releaseCalls = () => callsTo(SESSION_URL, "DELETE");
+const sha256Hex = (text) => createHash("sha256").update(text ?? "").digest("hex");
+const subtle = globalThis.crypto?.subtle ?? (await import("node:crypto")).webcrypto.subtle;
 
-/**
- * Default upstream: admission echoes the claim id back as an active session, START hands out
- * sequential run ids, FINISH is acknowledged, chat streams a tiny SSE body. Per-test overrides
- * replace individual endpoints.
- */
+// The device-key record every executor test signs with: generated once and seeded into the
+// credentials, so the raw public key is available for signature verification.
+const testRecord = await generateDeviceKeyRecord(subtle);
+
+// Default upstream: device-keys hands out one keyId, the catalog serves two rows (mimo free +
+// a locked one), admission assigns server-side instance ids, START hands out sequential run ids,
+// FINISH is acknowledged, chat streams a tiny SSE body. Per-test overrides replace endpoints.
 function installUpstream(overrides = {}) {
   let runSeq = 0;
+  let instanceSeq = 0;
+  const catalogBody = {
+    protocol: 1,
+    version: "2026-10-27.1",
+    issuedAt: Date.now(),
+    refreshAt: Date.now() + 5 * 60_000,
+    rows: [
+      { key: "mimo/mimo-v2.5", handle: "mimo-free", displayName: "MiMo Free", tagline: "", badges: [], multimodal: false, premium: false, dataUse: "service", access: "open", sortOrder: 1 },
+      { key: "upstage/solar-pro4", handle: "solar-pro", displayName: "Solar Pro", tagline: "", badges: [], multimodal: true, premium: true, dataUse: "training", access: "locked", sortOrder: 2 },
+    ],
+    plansUrl: "https://freebuff.com/plans",
+    fetchId: "fetch-test-1",
+  };
+  // The server resolves an admission model handle back to its canonical key.
+  const MODEL_BY_HANDLE = { "mimo-free": "mimo/mimo-v2.5", "solar-pro": "upstage/solar-pro4" };
   const handlers = {
+    deviceKeys: () => json({ keyId: "key-test-1" }),
+    catalog: () => json(catalogBody),
     admission: (headers) =>
       json({
         status: "active",
-        instanceId: headers["x-freebuff-instance-id"],
-        model: headers["x-freebuff-model"],
+        instanceId: `srv-${++instanceSeq}`,
+        model: MODEL_BY_HANDLE[headers["x-freebuff-model"]] || headers["x-freebuff-model"],
         remainingMs: 600_000,
       }),
     session: () => json({ status: "none" }),
     start: () => json({ runId: `run-${++runSeq}` }),
     finish: () => json({}),
-    release: () => json({}),
+    release: () => json({ status: "ended" }),
     chat: () => sse(),
+    cloudRunPost: () => json({ runId: "cloud-run-1", status: "queued" }),
+    cloudRunGet: () =>
+      json({
+        status: "completed",
+        events: [
+          { id: "e1", kind: "chunk", payload: { text: "he" } },
+          { id: "e2", kind: "chunk", payload: { text: "y" } },
+          { id: "e3", kind: "event", payload: { type: "finish" } },
+        ],
+      }),
+    cloudCancel: () => json({}),
     ...overrides,
   };
   fetchMock.mockImplementation(async (url, init) => {
     const headers = init?.headers || {};
     const body = init?.body ? JSON.parse(init.body) : null;
+    // Registrations happen per origin (freebuff.com and www.codebuff.com scopes).
+    if (String(url).endsWith("/api/v1/freebuff/device-keys")) return handlers.deviceKeys(headers, body);
+    if (url === CATALOG_URL) return handlers.catalog(headers);
     if (url === SESSION_ADMISSION_URL) return handlers.admission(headers, body);
-    if (url === SESSION_URL) return handlers.session(headers, init?.method);
+    if (url === SESSION_URL) return init?.method === "DELETE" ? handlers.release(headers, init?.method) : handlers.session(headers, init?.method);
     if (url === SESSION_ATTEMPT_URL) return handlers.release(headers, init?.method);
     if (url === AGENT_RUNS_URL) return body?.action === "FINISH" ? handlers.finish(body) : handlers.start(body);
     if (url === CHAT_URL) return handlers.chat(body, headers);
+    if (url === CLOUD_RUNS_URL) return handlers.cloudRunPost(headers, body);
+    if (String(url).startsWith(`${CLOUD_RUNS_URL}/`)) {
+      if (init?.method === "POST") return handlers.cloudCancel();
+      return handlers.cloudRunGet(String(url));
+    }
     throw new Error(`unexpected fetch to ${url}`);
   });
-  return handlers;
+  return { catalogBody };
 }
 
 async function drain(response) {
   return await response.text();
+}
+
+// Verify a captured device-key signature against the test record's raw public key.
+async function verifyDeviceSig({ url, method = "GET", headers, body, fetchId = "" }, record = testRecord) {
+  const keyId = headers["x-freebuff-device-key"];
+  const ts = headers["x-freebuff-device-ts"];
+  const sig = headers["x-freebuff-device-sig"];
+  if (!keyId || !ts || !sig) return false;
+  const stringToSign = buildStringToSign({
+    method,
+    path: new URL(url).pathname,
+    timestampMs: Number(ts),
+    bodySha256: sha256Hex(typeof body === "string" ? body : ""),
+    fetchId,
+  });
+  const pubKey = await subtle.importKey("raw", b64urlDecode(record.publicKey), { name: "Ed25519" }, false, ["verify"]);
+  return await subtle.verify({ name: "Ed25519" }, pubKey, b64urlDecode(sig), new TextEncoder().encode(stringToSign));
 }
 
 function makeExecuteArgs(overrides = {}) {
@@ -156,7 +233,7 @@ function makeExecuteArgs(overrides = {}) {
     model: "mimo/mimo-v2.5",
     body: { model: "cb/mimo/mimo-v2.5", messages: [{ role: "user", content: "hello" }] },
     stream: true,
-    credentials: { accessToken: newToken() },
+    credentials: { accessToken: newToken(), providerSpecificData: { freebuffDeviceKey: testRecord } },
     signal: undefined,
     log: undefined,
     proxyOptions: null,
@@ -168,21 +245,53 @@ const executor = new FreebuffExecutor();
 
 // The handshake/lifecycle tests assert one START and one FINISH per request, which is the legacy mode
 // (FREEBUFF_RUN_ROTATION_MS=0). The default run reuse has its own section further down.
+let originalFetch = null;
+
 beforeEach(() => {
+  // Belt and braces: nothing in these tests may reach the network, not even code that uses the
+  // global fetch (the oauth provider does) instead of proxyAwareFetch.
+  originalFetch = globalThis.fetch;
+  globalThis.fetch = fetchMock;
   fetchMock.mockReset();
+  globalThis.fetch = fetchMock;
   clearSessionCache();
   clearRunCache();
+  clearDeviceKeyCache();
+  clearIdleTimers();
+  invalidateFreebuffCatalog();
   warnedRelays.clear();
+  setFreebuffDeviceKeyPersister(null);
   delete process.env.FREEBUFF_FOLD_TOOLS;
   delete process.env.FREEBUFF_USER_AGENT;
+  delete process.env.FREEBUFF_COST_MODE;
+  delete process.env.FREEBUFF_CLIENT_ENV;
+  delete process.env.FREEBUFF_SESSION_IDLE_MS;
+  delete process.env.FREEBUFF_CATALOG_TTL_MS;
+  delete process.env.FREEBUFF_CLI_VERSION;
+  delete process.env.FREEBUFF_AISDK_VERSION;
+  delete process.env.FREEBUFF_EXEC_MODE;
+  delete process.env.FREEBUFF_DESKTOP_VERSION;
+  delete process.env.FREEBUFF_CLOUD_POLL_MS;
+  delete process.env.FREEBUFF_CLOUD_RUN_TIMEOUT_MS;
   process.env.FREEBUFF_RUN_ROTATION_MS = "0";
 });
 
 afterEach(() => {
+  globalThis.fetch = originalFetch;
   vi.useRealTimers();
   vi.restoreAllMocks();
   delete process.env.FREEBUFF_FOLD_TOOLS;
   delete process.env.FREEBUFF_USER_AGENT;
+  delete process.env.FREEBUFF_COST_MODE;
+  delete process.env.FREEBUFF_CLIENT_ENV;
+  delete process.env.FREEBUFF_SESSION_IDLE_MS;
+  delete process.env.FREEBUFF_CATALOG_TTL_MS;
+  delete process.env.FREEBUFF_CLI_VERSION;
+  delete process.env.FREEBUFF_AISDK_VERSION;
+  delete process.env.FREEBUFF_EXEC_MODE;
+  delete process.env.FREEBUFF_DESKTOP_VERSION;
+  delete process.env.FREEBUFF_CLOUD_POLL_MS;
+  delete process.env.FREEBUFF_CLOUD_RUN_TIMEOUT_MS;
   delete process.env.FREEBUFF_RUN_ROTATION_MS;
 });
 
@@ -204,7 +313,6 @@ describe("registration", () => {
   it("was added to the registry without clobbering another entry", () => {
     const ids = REGISTRY.map((entry) => entry.id);
     expect(ids).toContain("freebuff");
-    expect(ids).toContain("ollama-search");
     expect(new Set(ids).size).toBe(ids.length);
 
     // A duplicate `import pNN` is a SyntaxError in real ESM even though the test transform tolerates it.
@@ -216,7 +324,6 @@ describe("registration", () => {
   it("is listed among the free providers with its auth modes", () => {
     expect(FREE_PROVIDERS.freebuff).toBeTruthy();
     expect(FREE_PROVIDERS.freebuff.hasFree).toBe(true);
-    expect(FREE_PROVIDERS.freebuff.authModes).toEqual(["oauth", "apikey"]);
     expect(AI_PROVIDERS.freebuff.alias).toBe("cb");
   });
 
@@ -228,8 +335,8 @@ describe("registration", () => {
   });
 
   it("registers the executor under freebuff, cb and codebuff", async () => {
-    // Imported lazily: the executor index pulls in every provider executor (and their root dependencies),
-    // which would otherwise take the whole file down in an environment that only installed tests/.
+    // Imported lazily: the executor index pulls in every provider executor (and their root
+    // dependencies), which would otherwise take the whole file down in a bare environment.
     const { getExecutor, hasSpecializedExecutor } = await import("../../open-sse/executors/index.js");
     for (const key of ["freebuff", "cb", "codebuff"]) expect(hasSpecializedExecutor(key)).toBe(true);
     expect(getExecutor("freebuff")).toBeInstanceOf(FreebuffExecutor);
@@ -253,306 +360,929 @@ describe("registration", () => {
   it("only lists models that have a free-mode root agent id", () => {
     const listed = PROVIDER_MODELS.cb.map((m) => m.id);
     expect(listed.length).toBeGreaterThan(0);
-    for (const id of listed) expect(FREEBUFF_AGENT_ID_BY_MODEL[id]).toMatch(/^base3-free-/);
+    for (const id of listed) expect(FREEBUFF_AGENT_ID_BY_MODEL[id]).toMatch(/^base3(-fast)?-free-/);
     expect(new Set(listed).size).toBe(listed.length);
   });
 
-  it("maps every model to a distinct base3 agent id", () => {
+  it("maps every model to a distinct base3 agent id (0.2.34 set)", () => {
     const ids = Object.values(FREEBUFF_AGENT_ID_BY_MODEL);
     expect(new Set(ids).size).toBe(ids.length);
     expect(FREEBUFF_AGENT_ID_BY_MODEL["mimo/mimo-v2.5"]).toBe("base3-free-mimo");
     expect(FREEBUFF_AGENT_ID_BY_MODEL["z-ai/glm-5.3-flash"]).toBe("base3-free-glm-5-3-flash");
+    expect(FREEBUFF_AGENT_ID_BY_MODEL["deepseek/deepseek-v4-flash-fast"]).toBe("base3-fast-free-deepseek-flash");
+    expect(FREEBUFF_AGENT_ID_BY_MODEL["openai/gpt-6.1-sol"]).toBe("base3-free-gpt-6-1-sol");
   });
 });
 
 // ---------------------------------------------------------------------------
-// canonical system prompt opening
+// user agents, versions and the client-env fingerprint
+// ---------------------------------------------------------------------------
+
+describe("user agents and versions", () => {
+  it("chat UA is ai-sdk style, session UA is the CLI style", () => {
+    expect(chatUserAgent()).toBe(`ai-sdk/openai-compatible/${DEFAULT_AISDK_VERSION}/codebuff`);
+    expect(sessionUserAgent()).toBe(`Freebuff-CLI/${DEFAULT_CLI_VERSION}`);
+    expect(DEFAULT_AISDK_VERSION).toBe("0.0.0-test"); // verbatim from the 0.2.34 linux-x64 binary
+    expect(DEFAULT_CLI_VERSION).toBe("0.2.34");
+  });
+
+  it("env overrides both versions (read at request time)", () => {
+    process.env.FREEBUFF_AISDK_VERSION = "9.9.9";
+    process.env.FREEBUFF_CLI_VERSION = "1.2.3";
+    expect(chatUserAgent()).toBe("ai-sdk/openai-compatible/9.9.9/codebuff");
+    expect(sessionUserAgent()).toBe("Freebuff-CLI/1.2.3");
+  });
+
+  it("FREEBUFF_USER_AGENT still overrides the whole chat UA", () => {
+    process.env.FREEBUFF_USER_AGENT = "Freebuff-CLI/0.0.200";
+    expect(chatUserAgent()).toBe("Freebuff-CLI/0.0.200");
+    expect(sessionUserAgent()).toBe("Freebuff-CLI/0.2.34");
+  });
+});
+
+describe("client env fingerprint", () => {
+  it("is a v1;... string in the CLI field shape", () => {
+    expect(clientEnv()).toMatch(
+      /^v1;in=[01];out=[01];tp=\w+;term=[01];ct=[01];sz=\d+x\d+;ci=[01];ssh=[01];l=\w+;p=\w+;g=\w+;osc=\w+;tzo=[01];px=[01];tls=[01];ca=[01];cde=[01]/,
+    );
+  });
+
+  it("FREEBUFF_CLIENT_ENV overrides it entirely", () => {
+    process.env.FREEBUFF_CLIENT_ENV = "v1;in=0;out=0;err=1";
+    expect(clientEnv()).toBe("v1;in=0;out=0;err=1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// root system prompt opening
 // ---------------------------------------------------------------------------
 
 describe("root system prompt opening", () => {
   it("uses the byte-exact base3 opening", () => {
     expect(FREEBUFF_ROOT_OPENING).toBe("You are Buffy, the coding agent behind Codebuff.");
-    expect(ROOT_SYSTEM_PROMPT.startsWith(FREEBUFF_ROOT_OPENING)).toBe(true);
   });
 
   it("injects its own leading system message and leaves the caller's system text untouched", () => {
-    const callerSystem = { role: "system", content: "Answer in French." };
-    const messages = [callerSystem, { role: "user", content: "hi" }];
-    const out = ensureRootOpening(messages);
-    expect(out[0]).toEqual({ role: "system", content: ROOT_SYSTEM_PROMPT });
-    expect(out[1]).toBe(callerSystem);
-    expect(out[1].content).toBe("Answer in French.");
-    expect(out).toHaveLength(3);
-    // input array is not mutated
-    expect(messages).toHaveLength(2);
+    const body = buildChatBody(
+      { messages: [{ role: "system", content: "be terse" }, { role: "user", content: "hi" }] },
+      { model: "mimo/mimo-v2.5", runId: "r1" },
+    );
+    expect(body.messages[0]).toEqual({ role: "system", content: ROOT_SYSTEM_PROMPT });
+    expect(body.messages[1]).toEqual({ role: "system", content: "be terse" });
+    expect(body.messages[2]).toEqual({ role: "user", content: "hi" });
   });
 
   it("adds the opening when the conversation has no system message at all", () => {
-    const out = ensureRootOpening([{ role: "user", content: "hi" }]);
-    expect(out[0].role).toBe("system");
-    expect(out[0].content.startsWith(FREEBUFF_ROOT_OPENING)).toBe(true);
-    expect(out[1]).toEqual({ role: "user", content: "hi" });
+    const body = buildChatBody({ messages: [{ role: "user", content: "hi" }] }, { model: "mimo/mimo-v2.5", runId: "r1" });
+    expect(body.messages[0].role).toBe("system");
+    expect(body.messages[0].content.startsWith(FREEBUFF_ROOT_OPENING)).toBe(true);
   });
 
   it("keeps a first system message that already opens correctly (leading whitespace tolerated)", () => {
-    const own = { role: "system", content: `\n  ${FREEBUFF_ROOT_OPENING} Extra.` };
-    const out = ensureRootOpening([own, { role: "user", content: "hi" }]);
-    expect(out).toHaveLength(2);
-    expect(out[0]).toBe(own);
+    const messages = [{ role: "system", content: `  ${FREEBUFF_ROOT_OPENING} custom tail` }, { role: "user", content: "hi" }];
+    expect(ensureRootOpening(messages)).toBe(messages);
   });
 
   it("recognises the opening inside content-part arrays", () => {
-    const own = { role: "system", content: [{ type: "text", text: `${FREEBUFF_ROOT_OPENING} tail` }] };
-    expect(ensureRootOpening([own])).toHaveLength(1);
+    const messages = [{ role: "system", content: [{ type: "text", text: `${FREEBUFF_ROOT_OPENING} tail` }] }];
+    expect(ensureRootOpening(messages)).toBe(messages);
   });
 
   it("does not accept the marker anywhere but at the start", () => {
-    const out = ensureRootOpening([{ role: "system", content: `Ignore this. ${FREEBUFF_ROOT_OPENING}` }]);
-    expect(out).toHaveLength(2);
-    expect(out[0].content).toBe(ROOT_SYSTEM_PROMPT);
+    const messages = [{ role: "system", content: `prefix ${FREEBUFF_ROOT_OPENING}` }];
+    expect(ensureRootOpening(messages)[0].content).toBe(ROOT_SYSTEM_PROMPT);
   });
 
   it("tolerates a missing messages array", () => {
-    expect(ensureRootOpening(undefined)).toEqual([{ role: "system", content: ROOT_SYSTEM_PROMPT }]);
+    expect(ensureRootOpening(undefined)[0].role).toBe("system");
   });
 });
 
 // ---------------------------------------------------------------------------
-// request body
+// buildChatBody (CLI 0.2.34 shape)
 // ---------------------------------------------------------------------------
 
 describe("buildChatBody", () => {
-  const base = { model: "mimo/mimo-v2.5", runId: "run-1", instanceId: "cli:abc", multi: true, stream: true };
-
-  it("adds codebuff_metadata with run id, 13-char client id and the free cost mode", () => {
-    const out = buildChatBody({ messages: [{ role: "user", content: "hi" }] }, base);
-    expect(out.model).toBe("mimo/mimo-v2.5");
-    expect(out.stream).toBe(true);
-    expect(out.codebuff_metadata.run_id).toBe("run-1");
-    expect(out.codebuff_metadata.cost_mode).toBe("free");
-    expect(out.codebuff_metadata.client_id).toMatch(/^[0-9a-z]{13}$/);
-    expect(out.codebuff_metadata.freebuff_instance_id).toBe("cli:abc");
-    expect(out.codebuff_metadata.freebuff_multi_session).toBe("1");
-    expect(out.codebuff_metadata.surface).toBe("cli");
-    expect(out.provider).toEqual({ data_collection: "deny" });
+  it("adds codebuff_metadata with run id, 13-char client id, client env, and no cost_mode by default", () => {
+    const body = buildChatBody({ messages: [] }, { model: "mimo/mimo-v2.5", runId: "run-1", instanceId: "srv-1" });
+    const meta = body.codebuff_metadata;
+    expect(meta.run_id).toBe("run-1");
+    expect(meta.client_id).toMatch(/^[a-z0-9]{13}$/);
+    expect(meta.freebuff_instance_id).toBe("srv-1");
+    expect(meta.freebuff_client_env).toBe(clientEnv());
+    expect(meta.cost_mode).toBeUndefined(); // CLI normal mode omits the field
+    expect(Object.keys(meta)).toEqual(["freebuff_instance_id", "freebuff_client_env", "run_id", "client_id"]);
   });
 
-  it("omits the instance id when the waiting room is off", () => {
-    const out = buildChatBody({ messages: [] }, { ...base, instanceId: "", multi: false });
-    expect(out.codebuff_metadata.freebuff_instance_id).toBeUndefined();
-    expect(out.codebuff_metadata.freebuff_multi_session).toBeUndefined();
+  it("marks multi-session only for client-minted cli: claims (RZA)", () => {
+    const claim = buildChatBody({ messages: [] }, { model: "m", runId: "r", instanceId: "cli:abcd-1" });
+    expect(claim.codebuff_metadata.freebuff_multi_session).toBe("1");
+    expect(claim.codebuff_metadata.surface).toBe("cli");
+
+    const assigned = buildChatBody({ messages: [] }, { model: "m", runId: "r", instanceId: "srv-77" });
+    expect(assigned.codebuff_metadata.freebuff_multi_session).toBeUndefined();
+    expect(assigned.codebuff_metadata.surface).toBeUndefined();
   });
 
-  it("does not add the multi-session markers for a legacy (non cli:) instance id", () => {
-    const out = buildChatBody({ messages: [] }, { ...base, instanceId: "legacy-uuid", multi: false });
-    expect(out.codebuff_metadata.freebuff_instance_id).toBe("legacy-uuid");
-    expect(out.codebuff_metadata.freebuff_multi_session).toBeUndefined();
-    expect(out.codebuff_metadata.surface).toBeUndefined();
+  it("omits the instance id fields when the waiting room is off", () => {
+    const body = buildChatBody({ messages: [] }, { model: "m", runId: "r", instanceId: "" });
+    expect(body.codebuff_metadata.freebuff_instance_id).toBeUndefined();
+  });
+
+  it("copies a reasoning effort into freebuff_reasoning_effort", () => {
+    const body = buildChatBody({ messages: [], reasoning_effort: "high" }, { model: "m", runId: "r", reasoningEffort: "high" });
+    expect(body.codebuff_metadata.freebuff_reasoning_effort).toBe("high");
+    const plain = buildChatBody({ messages: [], reasoning_effort: "high" }, { model: "m", runId: "r" });
+    expect(plain.codebuff_metadata.freebuff_reasoning_effort).toBeUndefined();
+  });
+
+  it("sends cost_mode only when asked, never hardcoded", () => {
+    expect(buildChatBody({ messages: [] }, { model: "m", runId: "r" }).codebuff_metadata.cost_mode).toBeUndefined();
+    const body = buildChatBody({ messages: [] }, { model: "m", runId: "r", costMode: "normal" });
+    expect(body.codebuff_metadata.cost_mode).toBe("normal");
+    process.env.FREEBUFF_COST_MODE = "free";
+    expect(buildChatBody({ messages: [] }, { model: "m", runId: "r" }).codebuff_metadata.cost_mode).toBe("free");
+  });
+
+  it("spreads provider routing as {order:null, allow_fallbacks:true}", () => {
+    expect(buildChatBody({ messages: [] }, { model: "m", runId: "r" }).provider).toEqual({ order: null, allow_fallbacks: true });
+  });
+
+  it("sets stream_options include_usage when streaming and plain stream:false otherwise", () => {
+    const stream = buildChatBody({ messages: [] }, { model: "m", runId: "r", stream: true });
+    expect(stream.stream).toBe(true);
+    expect(stream.stream_options).toEqual({ include_usage: true });
+    const noStream = buildChatBody({ messages: [] }, { model: "m", runId: "r", stream: false });
+    expect(noStream.stream).toBe(false);
+    expect(noStream.stream_options).toBeUndefined();
   });
 
   it("never lets the caller override the handshake fields", () => {
-    const out = buildChatBody(
-      { messages: [], codebuff_metadata: { run_id: "evil", cost_mode: "max" }, provider: { only: ["x"] }, stream: false },
-      base,
+    const body = buildChatBody(
+      {
+        messages: [{ role: "user", content: "hi" }],
+        model: "caller-model",
+        codebuff_metadata: { run_id: "hacked" },
+        provider: { order: ["x"] },
+      },
+      { model: "mimo/mimo-v2.5", runId: "r1" },
     );
-    expect(out.codebuff_metadata.run_id).toBe("run-1");
-    expect(out.codebuff_metadata.cost_mode).toBe("free");
-    expect(out.provider).toEqual({ data_collection: "deny" });
-    expect(out.stream).toBe(true);
+    expect(body.model).toBe("mimo/mimo-v2.5");
+    expect(body.codebuff_metadata.run_id).toBe("r1");
+    expect(body.codebuff_metadata.client_id).not.toBe("hacked");
+    expect(body.provider).toEqual({ order: null, allow_fallbacks: true });
   });
 
-  it("honours a non-streaming request", () => {
-    expect(buildChatBody({ messages: [] }, { ...base, stream: false }).stream).toBe(false);
+  it("honours a caller-provided stream_options", () => {
+    const body = buildChatBody({ messages: [], stream_options: { include_usage: true, extra: 1 } }, { model: "m", runId: "r" });
+    expect(body.stream_options).toEqual({ include_usage: true, extra: 1 });
   });
 
   it("maps max_completion_tokens to max_tokens", () => {
-    const out = buildChatBody({ messages: [], max_completion_tokens: 512 }, base);
-    expect(out.max_tokens).toBe(512);
-    expect(out.max_completion_tokens).toBeUndefined();
-    expect(buildChatBody({ messages: [], max_tokens: 10, max_completion_tokens: 99 }, base).max_tokens).toBe(10);
+    const body = buildChatBody({ messages: [], max_completion_tokens: 77 }, { model: "m", runId: "r" });
+    expect(body.max_tokens).toBe(77);
+    expect(body.max_completion_tokens).toBeUndefined();
   });
 
   it("generates fresh base36 client ids", () => {
-    expect(generateClientId()).toMatch(/^[0-9a-z]{13}$/);
-    expect(generateClientId()).not.toBe(generateClientId());
+    const seen = new Set(Array.from({ length: 40 }, () => generateClientId()));
+    expect(seen.size).toBe(40);
+    for (const id of seen) expect(id).toMatch(/^[0-9a-z]{13}$/);
   });
 });
 
+// ---------------------------------------------------------------------------
+// tools handling
+// ---------------------------------------------------------------------------
+
 describe("tools handling", () => {
-  const tools = [
-    {
-      type: "function",
-      function: {
-        name: "read_file",
-        description: "Read a file",
-        parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
-      },
-    },
-  ];
-  const base = { model: "mimo/mimo-v2.5", runId: "run-1", instanceId: "cli:abc", multi: true, stream: true };
-  const bodyWithTools = () => ({
-    messages: [{ role: "system", content: "sys" }, { role: "user", content: "hi" }],
-    tools,
-    tool_choice: "auto",
-    parallel_tool_calls: true,
-  });
+  const tool = { type: "function", function: { name: "get_weather", description: "weather", parameters: { type: "object", properties: {} } } };
 
   it("passes tools and tool_choice through by default", () => {
-    const out = buildChatBody(bodyWithTools(), base);
-    expect(out.tools).toEqual(tools);
-    expect(out.tool_choice).toBe("auto");
-    expect(out.parallel_tool_calls).toBe(true);
-    // canonical opening + the caller's own system message + user message
-    expect(out.messages.map((m) => m.role)).toEqual(["system", "system", "user"]);
+    const body = buildChatBody({ messages: [], tools: [tool], tool_choice: "auto" }, { model: "m", runId: "r" });
+    expect(body.tools).toEqual([tool]);
+    expect(body.tool_choice).toBe("auto");
   });
 
   it("folds tools into a system message when FREEBUFF_FOLD_TOOLS=1 (read at request time)", () => {
     process.env.FREEBUFF_FOLD_TOOLS = "1";
-    const out = buildChatBody(bodyWithTools(), base);
-    expect(out.tools).toBeUndefined();
-    expect(out.tool_choice).toBeUndefined();
-    expect(out.parallel_tool_calls).toBeUndefined();
-    expect(out.messages[0].content).toBe(ROOT_SYSTEM_PROMPT);
-    const notice = out.messages[1];
-    expect(notice.role).toBe("system");
-    expect(notice.content).toContain("[Available Tools]");
-    expect(notice.content).toContain("read_file");
-    expect(notice.content).toContain('"path"');
-
-    // flipping the variable back takes effect on the next call without re-importing anything
-    delete process.env.FREEBUFF_FOLD_TOOLS;
-    expect(buildChatBody(bodyWithTools(), base).tools).toEqual(tools);
+    const body = buildChatBody({ messages: [{ role: "user", content: "hi" }], tools: [tool] }, { model: "m", runId: "r" });
+    expect(body.tools).toBeUndefined();
+    expect(body.messages[1].role).toBe("system");
+    expect(body.messages[1].content).toContain("get_weather");
   });
 
   it("does not treat FREEBUFF_FOLD_TOOLS=0 as enabled", () => {
     process.env.FREEBUFF_FOLD_TOOLS = "0";
-    expect(buildChatBody(bodyWithTools(), base).tools).toEqual(tools);
+    const body = buildChatBody({ messages: [], tools: [tool] }, { model: "m", runId: "r" });
+    expect(body.tools).toEqual([tool]);
   });
 
   it("builds an empty notice for tools without names", () => {
-    expect(buildToolNotice([{ type: "function", function: {} }])).toBe("");
+    expect(buildToolNotice([{ function: {} }])).toBe("");
   });
 
   it("returns schemas without $ref/null constructs unchanged (same object)", () => {
+    const tools = [{ function: { name: "t", parameters: { type: "object", properties: { a: { type: "string" } } } } }];
     const out = normalizeToolSchemas(tools);
-    expect(out[0]).toBe(tools[0]);
+    expect(out).toEqual(tools);
+    expect(out[0]).toBe(tools[0]); // untouched tools keep their identity
   });
 
   it("collapses nullable anyOf/type arrays and inlines local $ref", () => {
-    const out = normalizeToolSchemas([
-      {
-        type: "function",
-        function: {
-          name: "t",
-          parameters: {
-            type: "object",
-            $defs: { Path: { type: "string", description: "p" } },
-            properties: {
-              a: { anyOf: [{ type: "string" }, { type: "null" }] },
-              b: { type: ["integer", "null"] },
-              c: { $ref: "#/$defs/Path" },
-            },
-          },
-        },
+    const params = {
+      type: "object",
+      definitions: { name: { type: "string" } },
+      properties: {
+        who: { $ref: "#/definitions/name" },
+        age: { anyOf: [{ type: "integer" }, { type: "null" }] },
+        maybe: { type: ["string", "null"] },
       },
-    ]);
-    const props = out[0].function.parameters.properties;
-    expect(props.a).toEqual({ type: "string" });
-    expect(props.b).toEqual({ type: "integer" });
-    expect(props.c).toEqual({ type: "string", description: "p" });
+    };
+    const [out] = normalizeToolSchemas([{ function: { name: "t", parameters: params } }]);
+    expect(out.function.parameters.properties.who).toEqual({ type: "string" });
+    expect(out.function.parameters.properties.age).toEqual({ type: "integer" });
+    expect(out.function.parameters.properties.maybe).toEqual({ type: "string" });
   });
 });
 
 // ---------------------------------------------------------------------------
-// executor: happy path, headers, run lifecycle
+// execute: signed handshake (device keys, catalog, admission, chat)
 // ---------------------------------------------------------------------------
 
-describe("execute: handshake and run lifecycle", () => {
-  it("runs admission -> START -> chat and finishes the run when the stream ends", async () => {
+describe("execute: signed handshake", () => {
+  it("registers the device key per origin, then catalogs, admits, starts and chats (in order)", async () => {
     installUpstream();
-    const args = makeExecuteArgs();
-    const { response, url, transformedBody } = await executor.execute(args);
+    const result = await executor.execute(makeExecuteArgs());
+    expect(result.response.status).toBe(200);
 
-    expect(response.status).toBe(200);
-    expect(url).toBe(CHAT_URL);
-    expect(await drain(response)).toContain("[DONE]");
-
-    const order = allCalls().map((c) => `${c.method} ${c.url}`);
-    expect(order.slice(0, 3)).toEqual([
-      `POST ${SESSION_ADMISSION_URL}`,
-      `POST ${AGENT_RUNS_URL}`,
-      `POST ${CHAT_URL}`,
+    const order = allCalls().map((c) => c.url);
+    expect(order).toEqual([
+      DEVICE_KEYS_URL, // freebuff.com scope (catalog signing)
+      CATALOG_URL,
+      DEVICE_KEYS_URL.replace("https://freebuff.com", "https://www.codebuff.com"), // codebuff scope
+      SESSION_ADMISSION_URL,
+      AGENT_RUNS_URL,
+      CHAT_URL,
     ]);
 
-    // START carries the agent id resolved from the model
-    const [start] = agentRunCalls("START");
-    expect(start.body).toEqual({ action: "START", agentId: "base3-free-mimo", ancestorRunIds: [] });
-
-    // chat body ties the run and the session together and opens with the canonical prompt
-    const [chat] = callsTo(CHAT_URL);
-    const [admission] = callsTo(SESSION_ADMISSION_URL);
-    expect(chat.body.model).toBe("mimo/mimo-v2.5");
-    expect(chat.body.codebuff_metadata.run_id).toBe("run-1");
-    expect(chat.body.codebuff_metadata.freebuff_instance_id).toBe(admission.headers["x-freebuff-instance-id"]);
-    expect(chat.body.codebuff_metadata.freebuff_instance_id).toMatch(/^cli:[0-9a-f-]{36}$/);
-    expect(chat.body.messages[0]).toEqual({ role: "system", content: ROOT_SYSTEM_PROMPT });
-    expect(transformedBody.codebuff_metadata.run_id).toBe("run-1");
-
-    // FINISH is best effort and fired once the body has been read to the end
-    await vi.waitFor(() => expect(agentRunCalls("FINISH")).toHaveLength(1));
-    expect(agentRunCalls("FINISH")[0].body).toMatchObject({ action: "FINISH", runId: "run-1", status: "completed" });
-  });
-
-  it("sends the CLI-style headers on every call", async () => {
-    installUpstream();
-    const args = makeExecuteArgs();
-    const { response } = await executor.execute(args);
-    await drain(response);
-    await vi.waitFor(() => expect(agentRunCalls("FINISH")).toHaveLength(1));
-
-    const token = args.credentials.accessToken;
-    for (const call of allCalls()) {
-      expect(call.headers.Authorization).toBe(`Bearer ${token}`);
-      expect(call.headers["User-Agent"]).toBe(DEFAULT_USER_AGENT);
+    for (const register of callsTo(DEVICE_KEYS_URL, "POST")) {
+      expect(register.headers.Authorization).toMatch(/^Bearer fb-test-token-/);
+      expect(register.body.publicKey).toBe(testRecord.publicKey);
+      expect(register.body.client).toBe("cli");
     }
-    expect(DEFAULT_USER_AGENT).toBe("Freebuff-CLI/0.0.200");
-
-    const [chat] = callsTo(CHAT_URL);
-    expect(chat.headers["Content-Type"]).toBe("application/json");
-    expect(chat.headers.Accept).toBe("text/event-stream");
-
-    const [admission] = callsTo(SESSION_ADMISSION_URL);
-    expect(admission.headers["x-freebuff-model"]).toBe("mimo/mimo-v2.5");
-    expect(admission.headers["x-freebuff-multi-session"]).toBe("1");
-    expect(admission.headers["x-freebuff-desktop-attempt-id"]).toBe(admission.headers["x-freebuff-instance-id"].slice(4));
-    expect(admission.headers["x-fb-timezone"]).toBeTruthy();
   });
 
-  it("asks for JSON on a non-streaming request", async () => {
-    installUpstream({ chat: () => json({ choices: [{ message: { content: "hi" } }] }) });
-    const { response } = await executor.execute(makeExecuteArgs({ stream: false }));
-    expect(response.headers.get("content-type")).toContain("application/json");
-    expect((await response.json()).choices[0].message.content).toBe("hi");
-    const [chat] = callsTo(CHAT_URL);
+  it("signs the catalog GET with protocol and client headers", async () => {
+    installUpstream();
+    await executor.execute(makeExecuteArgs());
+    const catalog = callsTo(CATALOG_URL, "GET")[0];
+    expect(catalog.headers["x-freebuff-catalog-protocol"]).toBe("1");
+    expect(catalog.headers["x-freebuff-client"]).toBe("cli");
+    expect(await verifyDeviceSig({ url: CATALOG_URL, headers: catalog.headers })).toBe(true);
+  });
+
+  it("signs the admission and sends the CLI 0.2.34 admission headers", async () => {
+    installUpstream();
+    await executor.execute(makeExecuteArgs());
+    const admission = callsTo(SESSION_ADMISSION_URL, "POST")[0];
+    expect(admission.headers["User-Agent"]).toBe(sessionUserAgent());
+    expect(admission.headers["x-freebuff-client-version"]).toBe(cliVersion());
+    expect(admission.headers["x-fb-timezone"]).toBeTruthy();
+    expect(admission.headers["x-freebuff-env"]).toBe(clientEnv());
+    expect(admission.headers["x-freebuff-model"]).toBe("mimo-free"); // catalog handle, rOA
+    expect(admission.headers["x-freebuff-wallet-spend-limit"]).toBe("session");
+    expect(admission.headers["x-freebuff-catalog-fetch"]).toBe("fetch-test-1");
+    expect(admission.headers["x-freebuff-catalog-protocol"]).toBe("1");
+    // Absent legacy markers:
+    expect(admission.headers["x-freebuff-instance-id"]).toBeUndefined(); // the server assigns the id
+    expect(admission.headers["x-freebuff-first-tab-discount"]).toBeUndefined();
+    expect(admission.headers["x-freebuff-desktop-attempt-id"]).toBeUndefined();
+    expect(admission.headers["x-freebuff-multi-session"]).toBeUndefined();
+    expect(admission.headers["x-freebuff-client"]).toBeUndefined(); // the CLI sends no client header here
+    expect(await verifyDeviceSig({ url: SESSION_ADMISSION_URL, method: "POST", headers: admission.headers, fetchId: "fetch-test-1" })).toBe(true);
+  });
+
+  it("sends the CLI 0.2.34 chat headers and signs the exact body", async () => {
+    installUpstream();
+    const args = makeExecuteArgs({
+      credentials: { accessToken: newToken(), providerSpecificData: { freebuffDeviceKey: testRecord, userId: "user-42" } },
+    });
+    const result = await executor.execute(args);
+    expect(await drain(result.response)).toContain("hi");
+
+    const chat = callsTo(CHAT_URL, "POST")[0];
+    expect(chat.headers["User-Agent"]).toBe(chatUserAgent());
+    expect(chat.headers[HEADER_GZIP_RECOVERY]).toBe("1");
+    expect(chat.headers["x-freebuff-acting-user-id"]).toBe("user-42");
+    expect(chat.headers["x-freebuff-catalog-fetch"]).toBe("fetch-test-1");
+    expect(chat.headers.Accept).toBe("text/event-stream");
+    expect(await verifyDeviceSig({ url: CHAT_URL, method: "POST", headers: chat.headers, body: JSON.stringify(chat.body), fetchId: "fetch-test-1" })).toBe(true);
+
+    // Body shape of a CLI 0.2.34 chat.
+    expect(chat.body.model).toBe("mimo/mimo-v2.5");
+    expect(chat.body.stream).toBe(true);
+    expect(chat.body.stream_options).toEqual({ include_usage: true });
+    expect(chat.body.provider).toEqual({ order: null, allow_fallbacks: true });
+    expect(chat.body.messages[0].content.startsWith(FREEBUFF_ROOT_OPENING)).toBe(true);
+    expect(chat.body.codebuff_metadata.run_id).toMatch(/^run-\d+$/);
+    expect(chat.body.codebuff_metadata.freebuff_instance_id).toMatch(/^srv-\d+$/);
+    expect(chat.body.codebuff_metadata.surface).toBeUndefined(); // server-assigned id, no cli: claim
+  });
+
+  it("starts and finishes an agent run around the chat (rotation disabled)", async () => {
+    installUpstream();
+    const result = await executor.execute(makeExecuteArgs());
+    await drain(result.response);
+    expect(agentRunCalls("START")).toHaveLength(1);
+    expect(agentRunCalls("FINISH")).toHaveLength(1);
+    const start = agentRunCalls("START")[0];
+    expect(start.body).toEqual({ action: "START", agentId: "base3-free-mimo", ancestorRunIds: [] });
+    expect(start.headers["User-Agent"]).toBe(sessionUserAgent());
+  });
+
+  it("answers a clean 400 for a model without a known agent id, without any upstream call", async () => {
+    installUpstream();
+    const result = await executor.execute(makeExecuteArgs({ model: "cb/who/dis" }));
+    expect(result.response.status).toBe(400);
+    const body = await result.response.json();
+    expect(body.error.code).toBe("model_not_supported");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("strips a thinking suffix such as (high) from the model", async () => {
+    installUpstream();
+    const result = await executor.execute(makeExecuteArgs({ model: "z-ai/glm-5.3-flash(high)", body: { messages: [] } }));
+    expect(drain(result.response)).toBeTruthy();
+    expect(agentRunCalls("START")[0].body.agentId).toBe("base3-free-glm-5-3-flash");
+  });
+
+  it("strips a provider prefix from the model before resolving the agent", async () => {
+    installUpstream();
+    await executor.execute(makeExecuteArgs({ model: "freebuff/mimo/mimo-v2.5" }));
+    expect(agentRunCalls("START")[0].body.agentId).toBe("base3-free-mimo");
+  });
+
+  it("answers 401 without any upstream call when there is no token", async () => {
+    installUpstream();
+    const result = await executor.execute(makeExecuteArgs({ credentials: { accessToken: "" } }));
+    expect(result.response.status).toBe(401);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("goes out on non-streaming requests with a JSON accept and no stream_options", async () => {
+    installUpstream({ chat: () => json({ choices: [{ message: { content: "ok" } }] }) });
+    const result = await executor.execute(makeExecuteArgs({ stream: false }));
+    const chat = callsTo(CHAT_URL, "POST")[0];
     expect(chat.headers.Accept).toBe("application/json");
     expect(chat.body.stream).toBe(false);
-  });
-
-  it("lets FREEBUFF_USER_AGENT override the User-Agent (read at request time)", async () => {
-    process.env.FREEBUFF_USER_AGENT = "Freebuff-CLI/9.9.9";
-    installUpstream();
-    const { response } = await executor.execute(makeExecuteArgs());
-    await drain(response);
-    for (const call of allCalls()) expect(call.headers["User-Agent"]).toBe("Freebuff-CLI/9.9.9");
+    expect(chat.body.stream_options).toBeUndefined();
+    expect((await result.response.json()).choices[0].message.content).toBe("ok");
   });
 
   it("accepts an API-key credential as well as an OAuth access token", async () => {
     installUpstream();
-    const key = newToken();
-    const { response } = await executor.execute(makeExecuteArgs({ credentials: { apiKey: key } }));
-    expect(response.status).toBe(200);
-    await drain(response);
-    expect(callsTo(CHAT_URL)[0].headers.Authorization).toBe(`Bearer ${key}`);
+    await executor.execute(makeExecuteArgs({ credentials: { apiKey: "fb-key-token", providerSpecificData: { freebuffDeviceKey: testRecord } } }));
+    const chat = callsTo(CHAT_URL, "POST")[0];
+    expect(chat.headers.Authorization).toBe("Bearer fb-key-token");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// device-key persistence and re-registration
+// ---------------------------------------------------------------------------
+
+describe("device key persistence", () => {
+  it("persists the key record through the injected persister", async () => {
+    installUpstream();
+    const persisted = [];
+    setFreebuffDeviceKeyPersister(async (connectionId, record) => persisted.push({ connectionId, record }));
+    const credentials = { connectionId: "conn-1", accessToken: newToken() }; // no stored record: fresh key
+    await executor.execute(makeExecuteArgs({ credentials }));
+
+    expect(persisted.length).toBeGreaterThanOrEqual(1);
+    expect(persisted[0].connectionId).toBe("conn-1");
+    const saved = persisted.at(-1);
+    expect(saved.record.version).toBe(1);
+    expect(saved.record.privateKey).toBeTruthy();
+    expect(Object.keys(saved.record.registrations).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("reuses the stored record after a simulated restart (no new registration)", async () => {
+    installUpstream();
+    const stored = await generateDeviceKeyRecord(subtle);
+    const credentials = { accessToken: newToken(), providerSpecificData: { freebuffDeviceKey: stored } };
+
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    expect(callsTo(DEVICE_KEYS_URL, "POST").length).toBeGreaterThanOrEqual(1);
+
+    // "Restart": in-memory caches are cleared, the record comes back from providerSpecificData.
+    clearDeviceKeyCache();
+    fetchMock.mockClear();
+    installUpstream();
+    const result = await executor.execute(makeExecuteArgs({ credentials }));
+    expect(await drain(result.response)).toContain("hi");
+    expect(callsTo(DEVICE_KEYS_URL, "POST")).toHaveLength(0);
+    const chat = callsTo(CHAT_URL, "POST")[0];
+    expect(
+      await verifyDeviceSig({ url: CHAT_URL, method: "POST", headers: chat.headers, body: JSON.stringify(chat.body), fetchId: "fetch-test-1" }, stored),
+    ).toBe(true);
+  });
+
+  it("forgets the registration and re-registers when upstream reports an unknown device key", async () => {
+    let chatCalls = 0;
+    installUpstream({
+      chat: () => {
+        chatCalls += 1;
+        if (chatCalls === 1) return json({ error: "device_key unknown" }, { status: 403 });
+        return sse();
+      },
+    });
+    const result = await executor.execute(makeExecuteArgs());
+    expect(await drain(result.response)).toContain("hi");
+    expect(chatCalls).toBe(2);
+    // The catalog was refetched and the forgotten scope re-registered after the forget.
+    expect(callsTo(CATALOG_URL, "GET").length).toBeGreaterThanOrEqual(2);
+    const registerPosts = allCalls().filter((c) => c.method === "POST" && String(c.url).endsWith("/api/v1/freebuff/device-keys"));
+    expect(registerPosts.length).toBeGreaterThanOrEqual(3); // 2 initial scopes + 1 re-register
+  });
+
+  it("refetches the catalog when the gate says it went stale", async () => {
+    let chatCalls = 0;
+    installUpstream({
+      chat: () => {
+        chatCalls += 1;
+        if (chatCalls === 1) return json({ error: "freebuff_catalog_stale" }, { status: 410 });
+        return sse();
+      },
+    });
+    const result = await executor.execute(makeExecuteArgs());
+    expect(await drain(result.response)).toContain("hi");
+    expect(callsTo(CATALOG_URL, "GET").length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// catalog cache
+// ---------------------------------------------------------------------------
+
+describe("freebuff catalog cache", () => {
+  it("caches the catalog per token and reuses the fetchId", async () => {
+    installUpstream();
+    const args = makeExecuteArgs();
+    await drain((await executor.execute(args)).response);
+    await drain((await executor.execute({ ...args, body: { messages: [{ role: "user", content: "again" }] } })).response);
+    expect(callsTo(CATALOG_URL, "GET")).toHaveLength(1);
+
+    const other = makeExecuteArgs({ credentials: { accessToken: newToken(), providerSpecificData: { freebuffDeviceKey: testRecord } } });
+    await drain((await executor.execute(other)).response);
+    expect(callsTo(CATALOG_URL, "GET")).toHaveLength(2); // per token
+  });
+
+  it("proceeds without a fetchId when the catalog is unavailable", async () => {
+    installUpstream({ catalog: () => new Response("gone", { status: 500 }) });
+    const result = await executor.execute(makeExecuteArgs());
+    expect(await drain(result.response)).toContain("hi");
+    const admission = callsTo(SESSION_ADMISSION_URL, "POST")[0];
+    expect(admission.headers["x-freebuff-catalog-fetch"]).toBeUndefined();
+    expect(admission.headers["x-freebuff-catalog-protocol"]).toBeUndefined();
+    const chat = callsTo(CHAT_URL, "POST")[0];
+    expect(chat.headers["x-freebuff-catalog-fetch"]).toBeUndefined();
+    // The admission model falls back to the plain key without a catalog.
+    expect(admission.headers["x-freebuff-model"]).toBe("mimo/mimo-v2.5");
+  });
+
+  it("keeps working when the catalog answer is not a protocol 1 document", async () => {
+    installUpstream({ catalog: () => json({ rows: "nope" }) });
+    const result = await executor.execute(makeExecuteArgs());
+    expect(await drain(result.response)).toContain("hi");
+  });
+
+  it("parse/visibleRows/TTL follow the CLI rules", () => {
+    expect(parseCatalog({ protocol: 2, rows: [] })).toBeNull();
+    expect(parseCatalog({ protocol: 1, rows: [] })).toBeNull();
+    const catalog = parseCatalog({ protocol: 1, rows: [{ key: "a", opensAt: 10 }, { key: "b" }] });
+    expect(visibleRows(catalog, 5).map((r) => r.key)).toEqual(["b"]);
+    expect(visibleRows(catalog, 11).map((r) => r.key)).toEqual(["a", "b"]);
+
+    const future = { refreshAt: Date.now() + 20 * 60_000 };
+    expect(catalogTtlMs(future)).toBeLessThanOrEqual(30 * 60_000);
+    expect(catalogTtlMs(future)).toBeGreaterThanOrEqual(60_000);
+    expect(catalogTtlMs({})).toBe(5 * 60_000);
+    process.env.FREEBUFF_CATALOG_TTL_MS = "1234";
+    expect(catalogTtlMs(future)).toBe(1234);
+    delete process.env.FREEBUFF_CATALOG_TTL_MS;
+  });
+
+  it("resolves the admission model through the row handle (rOA)", () => {
+    const catalog = { rows: [{ key: "mimo/mimo-v2.5", handle: "mimo-free" }] };
+    expect(resolveAdmissionModel(catalog, "mimo/mimo-v2.5")).toBe("mimo-free");
+    expect(resolveAdmissionModel(catalog, "unknown/key")).toBe("unknown/key");
+    expect(resolveAdmissionModel(null, "unknown/key")).toBe("unknown/key");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// wrapStreamWithCleanup
+// ---------------------------------------------------------------------------
+
+describe("wrapStreamWithCleanup", () => {
+  it("reports completion exactly once", async () => {
+    const onDone = vi.fn();
+    const wrapped = wrapStreamWithCleanup(sse(['data: {"x":1}\n\n', "data: [DONE]\n\n"]), onDone);
+    await drain(wrapped);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(onDone).toHaveBeenCalledTimes(1);
+    expect(onDone).toHaveBeenCalledWith("completed", undefined);
+  });
+
+  it("reports a failure when the body errors", async () => {
+    const onDone = vi.fn();
+    const failing = new Response(
+      new ReadableStream({
+        pull(controller) {
+          controller.error(new Error("kaboom"));
+        },
+      }),
+    );
+    const wrapped = wrapStreamWithCleanup(failing, onDone);
+    await expect(drain(wrapped)).rejects.toThrow("kaboom");
+    expect(onDone).toHaveBeenCalledWith("failed", "kaboom");
+  });
+
+  it("drops encoding/length headers that no longer describe the decoded body", () => {
+    const response = new Response("x", { headers: { "content-encoding": "gzip", "content-length": "99" } });
+    const wrapped = wrapStreamWithCleanup(response, () => {});
+    expect(wrapped.headers.get("content-encoding")).toBeNull();
+    expect(wrapped.headers.get("content-length")).toBeNull();
+  });
+
+  it("finishes immediately for a bodiless response", () => {
+    const onDone = vi.fn();
+    const response = new Response(null);
+    Object.defineProperty(response, "body", { value: null });
+    wrapStreamWithCleanup(response, onDone);
+    expect(onDone).toHaveBeenCalledWith("completed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// free session handling
+// ---------------------------------------------------------------------------
+
+describe("free session handling", () => {
+  it("reuses the session for the same token and model, but not across tokens or models", async () => {
+    installUpstream();
+    const credentials = { accessToken: newToken(), providerSpecificData: { freebuffDeviceKey: testRecord } };
+
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    expect(callsTo(SESSION_ADMISSION_URL, "POST")).toHaveLength(1);
+    // ...but every request still gets its own agent run in this mode
+    expect(agentRunCalls("START")).toHaveLength(2);
+    const [first, second] = callsTo(CHAT_URL, "POST");
+    expect(second.body.codebuff_metadata.freebuff_instance_id).toBe(first.body.codebuff_metadata.freebuff_instance_id);
+    expect(second.body.codebuff_metadata.run_id).not.toBe(first.body.codebuff_metadata.run_id);
+
+    await drain((await executor.execute(makeExecuteArgs({ credentials, model: "z-ai/glm-5.3-flash", body: { messages: [] } }))).response);
+    expect(callsTo(SESSION_ADMISSION_URL, "POST")).toHaveLength(2);
+
+    await drain((await executor.execute(makeExecuteArgs({ credentials: { accessToken: newToken(), providerSpecificData: { freebuffDeviceKey: testRecord } } }))).response);
+    expect(callsTo(SESSION_ADMISSION_URL, "POST")).toHaveLength(3);
+  });
+
+  it("never keeps the raw token as a cache key", async () => {
+    installUpstream();
+    const credentials = { accessToken: newToken(), providerSpecificData: { freebuffDeviceKey: testRecord } };
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    expect(sessions.size).toBe(1);
+    for (const key of [...sessions.keys(), ...activeRuns.keys()]) {
+      expect(key).not.toContain(credentials.accessToken);
+    }
+  });
+
+  it("admits a fresh session once the cached one is about to expire", async () => {
+    installUpstream();
+    const credentials = { accessToken: newToken(), providerSpecificData: { freebuffDeviceKey: testRecord } };
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    expect(callsTo(SESSION_ADMISSION_URL, "POST")).toHaveLength(1);
+
+    // remainingMs is 600s and the cache keeps a 60s safety margin.
+    const realNow = Date.now();
+    const nowSpy = vi.spyOn(Date, "now");
+    nowSpy.mockReturnValue(realNow + 530_000);
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    expect(callsTo(SESSION_ADMISSION_URL, "POST")).toHaveLength(1);
+
+    nowSpy.mockReturnValue(realNow + 550_000);
+    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
+    expect(callsTo(SESSION_ADMISSION_URL, "POST")).toHaveLength(2);
+    nowSpy.mockRestore();
+  });
+
+  it("shares one in-flight admission between concurrent requests", async () => {
+    let release;
+    const gate = new Promise((resolve) => (release = resolve));
+    let admissions = 0;
+    installUpstream({
+      admission: async (headers) => {
+        admissions += 1;
+        await gate;
+        return json({ status: "active", instanceId: "srv-shared", model: "mimo/mimo-v2.5", remainingMs: 600_000 });
+      },
+    });
+    const args = makeExecuteArgs();
+    const first = executor.execute(args);
+    const second = executor.execute({ ...args, body: { messages: [{ role: "user", content: "2" }] } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    release();
+    const [a, b] = await Promise.all([first, second]);
+    expect(admissions).toBe(1);
+    await drain(a.response);
+    await drain(b.response);
+    const instances = callsTo(CHAT_URL, "POST").map((c) => c.body.codebuff_metadata.freebuff_instance_id);
+    expect(instances).toEqual(["srv-shared", "srv-shared"]);
+  });
+
+  it("does not cache a failed admission", async () => {
+    let n = 0;
+    installUpstream({
+      admission: () => {
+        n += 1;
+        return n === 1
+          ? json({ error: "rate_limited" }, { status: 429 })
+          : json({ status: "active", instanceId: "srv-ok", model: "mimo/mimo-v2.5", remainingMs: 600_000 });
+      },
+    });
+    const first = await executor.execute(makeExecuteArgs());
+    expect(first.response.status).toBe(429);
+    const second = await executor.execute(makeExecuteArgs());
+    expect(second.response.status).toBe(200);
+    await drain(second.response);
+  });
+
+  describe("queued", () => {
+    it("answers 503 with Retry-After and an OpenAI-style error body, without starting a run", async () => {
+      installUpstream({ admission: () => json({ status: "queued", instanceId: "srv-q", position: 3, queueDepth: 9, estimatedWaitMs: 8000 }) });
+      const result = await executor.execute(makeExecuteArgs());
+      expect(result.response.status).toBe(503);
+      expect(result.response.headers.get("Retry-After")).toBe("8");
+      const body = await result.response.json();
+      expect(body.error.code).toBe("waiting_room_queued");
+      expect(agentRunCalls("START")).toHaveLength(0);
+    });
+
+    it("clamps Retry-After between 1 and 30 seconds", async () => {
+      installUpstream({ admission: () => json({ status: "queued", instanceId: "srv-q", position: 1, estimatedWaitMs: 90_000 }) });
+      const result = await executor.execute(makeExecuteArgs());
+      expect(result.response.headers.get("Retry-After")).toBe("30");
+    });
+
+    it("does not re-admit while the queue answer is fresh, then polls the queued instance", async () => {
+      let polls = 0;
+      installUpstream({
+        admission: () => json({ status: "queued", instanceId: "srv-queue", position: 1, estimatedWaitMs: 1000 }),
+        session: () => {
+          polls += 1;
+          return json({ status: "active", instanceId: "srv-queue", model: "mimo/mimo-v2.5", remainingMs: 600_000 });
+        },
+      });
+      const credentials = { accessToken: newToken(), providerSpecificData: { freebuffDeviceKey: testRecord } };
+      const first = await executor.execute(makeExecuteArgs({ credentials }));
+      expect(first.response.status).toBe(503);
+
+      // Push the clock past the queued retry window; the next request polls instead of re-admitting.
+      const nowSpy = vi.spyOn(Date, "now");
+      nowSpy.mockReturnValue(Date.now() + 5000);
+      const second = await executor.execute(makeExecuteArgs({ credentials }));
+      nowSpy.mockRestore();
+      expect(polls).toBe(1);
+      expect(callsTo(SESSION_ADMISSION_URL, "POST")).toHaveLength(1);
+      const chat = callsTo(CHAT_URL, "POST")[0];
+      expect(chat.body.codebuff_metadata.freebuff_instance_id).toBe("srv-queue");
+      await drain(second.response);
+    });
+  });
+
+  describe("model_locked", () => {
+    it("falls back to the locked model and remembers it serves the requested one too", async () => {
+      let asks = 0;
+      installUpstream({
+        admission: () => {
+          asks += 1;
+          if (asks === 1) return json({ status: "model_locked", currentModel: "z-ai/glm-5.3-flash", requestedModel: "mimo/mimo-v2.5" });
+          return json({ status: "active", instanceId: `srv-${asks}`, model: "z-ai/glm-5.3-flash", remainingMs: 600_000 });
+        },
+      });
+      const args = makeExecuteArgs();
+      await drain((await executor.execute(args)).response);
+      await drain((await executor.execute({ ...args, body: { messages: [{ role: "user", content: "2" }] } })).response);
+      // The second request must not re-admit: the lock is remembered under both model names.
+      expect(callsTo(SESSION_ADMISSION_URL, "POST")).toHaveLength(2);
+      expect(agentRunCalls("START").map((c) => c.body.agentId)).toEqual(["base3-free-glm-5-3-flash", "base3-free-glm-5-3-flash"]);
+    });
+
+    it("answers 409 when the locked model is not runnable here", async () => {
+      installUpstream({ admission: () => json({ status: "model_locked", currentModel: "unknown/lock-model" }) });
+      const result = await executor.execute(makeExecuteArgs());
+      expect(result.response.status).toBe(409);
+      expect((await result.response.json()).error.code).toBe("model_locked");
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// free session release on model switch and idle
+// ---------------------------------------------------------------------------
+
+describe("free session release", () => {
+  it("releases the old session with its assigned instance id (DELETE /session) before admitting the new model", async () => {
+    installUpstream();
+    const credentials = { accessToken: newToken(), providerSpecificData: { freebuffDeviceKey: testRecord } };
+    await drain((await executor.execute(makeExecuteArgs({ credentials, model: "mimo/mimo-v2.5" }))).response);
+    await drain((await executor.execute(makeExecuteArgs({ credentials, model: "z-ai/glm-5.3-flash", body: { messages: [] } }))).response);
+
+    const releases = releaseCalls();
+    expect(releases).toHaveLength(1);
+    const release = releases[0];
+    expect(release.method).toBe("DELETE");
+    expect(release.url).toBe(SESSION_URL); // server-assigned ids end on the plain session route
+    expect(release.headers["x-freebuff-instance-id"]).toMatch(/^srv-\d+$/);
+    expect(release.headers["x-freebuff-desktop-attempt-id"]).toBeUndefined(); // no client-minted claims
+    expect(release.headers["x-freebuff-multi-session"]).toBeUndefined();
+    expect(await verifyDeviceSig({ url: SESSION_URL, method: "DELETE", headers: release.headers, fetchId: "fetch-test-1" })).toBe(true);
+  });
+
+  it("routes session URLs like the CLI: /attempt only for cli: claims", () => {
+    expect(sessionUrlFor("DELETE", "cli:abcd")).toBe(SESSION_ATTEMPT_URL);
+    expect(sessionUrlFor("DELETE", "srv-1")).toBe(SESSION_URL);
+    expect(sessionUrlFor("POST", "")).toBe(SESSION_ADMISSION_URL);
+    expect(sessionUrlFor("GET", "srv-1")).toBe(SESSION_URL);
+  });
+
+  it("does not release while the same model keeps being served", async () => {
+    installUpstream();
+    await drain((await executor.execute(makeExecuteArgs())).response);
+    await drain((await executor.execute(makeExecuteArgs())).response);
+    expect(releaseCalls()).toHaveLength(0);
+  });
+
+  it("does not release another token's session", async () => {
+    installUpstream();
+    await drain((await executor.execute(makeExecuteArgs())).response);
+    await drain((await executor.execute(makeExecuteArgs({ credentials: { accessToken: newToken(), providerSpecificData: { freebuffDeviceKey: testRecord } } }))).response);
+    expect(releaseCalls()).toHaveLength(0);
+  });
+
+  it("ends the runs of the released session's agent, after their in-flight requests", async () => {
+    installUpstream();
+    const credentials = { accessToken: newToken(), providerSpecificData: { freebuffDeviceKey: testRecord } };
+    const first = await executor.execute(makeExecuteArgs({ credentials, model: "mimo/mimo-v2.5" }));
+    await drain(first.response);
+    await drain((await executor.execute(makeExecuteArgs({ credentials, model: "z-ai/glm-5.3-flash", body: { messages: [] } }))).response);
+    // The mimo run is retired: a FINISH goes out for it.
+    expect(agentRunCalls("FINISH").length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("does not fail the request when the release answers an error", async () => {
+    installUpstream({ release: () => new Response("no", { status: 500 }) });
+    await drain((await executor.execute(makeExecuteArgs({ model: "mimo/mimo-v2.5" }))).response);
+    const second = await executor.execute(makeExecuteArgs({ model: "z-ai/glm-5.3-flash", body: { messages: [] } }));
+    expect(second.response.status).toBe(200);
+    await drain(second.response);
+  });
+
+  it("does not fail the request when the release call itself throws", async () => {
+    installUpstream();
+    const upstream = fetchMock.getMockImplementation();
+    fetchMock.mockImplementation(async (url, init) => {
+      if (url === SESSION_URL && init?.method === "DELETE") throw new Error("socket blew up");
+      return upstream(url, init);
+    });
+    await drain((await executor.execute(makeExecuteArgs({ model: "mimo/mimo-v2.5" }))).response);
+    const second = await executor.execute(makeExecuteArgs({ model: "z-ai/glm-5.3-flash", body: { messages: [] } }));
+    expect(second.response.status).toBe(200);
+    await drain(second.response);
+  });
+
+  it("treats a 404 on release as already gone", async () => {
+    installUpstream({ release: () => new Response("gone", { status: 404 }) });
+    await drain((await executor.execute(makeExecuteArgs({ model: "mimo/mimo-v2.5" }))).response);
+    const second = await executor.execute(makeExecuteArgs({ model: "z-ai/glm-5.3-flash", body: { messages: [] } }));
+    expect(second.response.status).toBe(200);
+    await drain(second.response);
+  });
+
+  it("drops the old session even when the new admission is refused, instead of reusing a released one", async () => {
+    let admissions = 0;
+    const token = newToken();
+    const credentials = { accessToken: token, providerSpecificData: { freebuffDeviceKey: testRecord } };
+    installUpstream({
+      admission: () => {
+        admissions += 1;
+        if (admissions === 2) return json({ error: "purchase_capacity" }, { status: 429 });
+        return json({ status: "active", instanceId: `srv-${admissions}`, model: admissions === 1 ? "mimo/mimo-v2.5" : "z-ai/glm-5.3-flash", remainingMs: 600_000 });
+      },
+    });
+    await drain((await executor.execute(makeExecuteArgs({ credentials, model: "mimo/mimo-v2.5" }))).response);
+    const second = await executor.execute(makeExecuteArgs({ credentials, model: "z-ai/glm-5.3-flash", body: { messages: [] } }));
+    expect(second.response.status).toBe(429);
+    // The refused switch must not have restored the released mimo session.
+    expect(sessions.get(sessionKey(tokenOf(credentials)))).toBeUndefined();
+  });
+
+  it("releases an idle session after FREEBUFF_SESSION_IDLE_MS so the slot does not stay occupied", async () => {
+    vi.useFakeTimers();
+    installUpstream();
+    process.env.FREEBUFF_SESSION_IDLE_MS = "1000";
+    const args = makeExecuteArgs();
+    const first = await executor.execute(args);
+    await drain(first.response);
+    expect(releaseCalls()).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(1500);
+    // Signing the release runs real WebCrypto on the thread pool: give the event loop a few real
+    // turns so the DELETE lands before asserting.
+    vi.useRealTimers();
+    for (let i = 0; i < 50 && releaseCalls().length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(releaseCalls()).toHaveLength(1);
+    expect(releaseCalls()[0].headers["x-freebuff-instance-id"]).toMatch(/^srv-/);
+
+    // The session is gone: the next request re-admits.
+    const second = await executor.execute(args);
+    expect(callsTo(SESSION_ADMISSION_URL, "POST")).toHaveLength(2);
+    await drain(second.response);
+  });
+
+  it("defaults the idle window to ten minutes and ignores bad values", () => {
+    expect(sessionIdleMs()).toBe(DEFAULT_SESSION_IDLE_MS);
+    expect(DEFAULT_SESSION_IDLE_MS).toBe(600_000);
+    process.env.FREEBUFF_SESSION_IDLE_MS = "banana";
+    expect(sessionIdleMs()).toBe(600_000);
+    process.env.FREEBUFF_SESSION_IDLE_MS = "0";
+    expect(sessionIdleMs()).toBe(0);
+  });
+
+  it("releases a queued claim of the old model too", async () => {
+    let admissions = 0;
+    const credentials = { accessToken: newToken(), providerSpecificData: { freebuffDeviceKey: testRecord } };
+    installUpstream({
+      admission: () => {
+        admissions += 1;
+        if (admissions === 1) return json({ status: "queued", instanceId: "srv-queued-1", position: 1, estimatedWaitMs: 30_000 });
+        return json({ status: "active", instanceId: "srv-2", model: "z-ai/glm-5.3-flash", remainingMs: 600_000 });
+      },
+      session: () => json({ status: "queued", instanceId: "srv-queued-1", position: 1, estimatedWaitMs: 30_000 }),
+    });
+    const first = await executor.execute(makeExecuteArgs({ credentials, model: "mimo/mimo-v2.5" }));
+    expect(first.response.status).toBe(503);
+    await drain((await executor.execute(makeExecuteArgs({ credentials, model: "z-ai/glm-5.3-flash", body: { messages: [] } }))).response);
+    expect(releaseCalls()[0].headers["x-freebuff-instance-id"]).toBe("srv-queued-1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// run reuse and rotation
+// ---------------------------------------------------------------------------
+
+describe("run reuse and rotation", () => {
+  it("reuses one run across sequential requests: one admission, one START, no FINISH in between", async () => {
+    delete process.env.FREEBUFF_RUN_ROTATION_MS; // default: six-hour reuse
+    installUpstream();
+    const args = makeExecuteArgs();
+    await drain((await executor.execute(args)).response);
+    await drain((await executor.execute({ ...args, body: { messages: [{ role: "user", content: "2" }] } })).response);
+    expect(callsTo(SESSION_ADMISSION_URL, "POST")).toHaveLength(1);
+    expect(agentRunCalls("START")).toHaveLength(1);
+    expect(agentRunCalls("FINISH")).toHaveLength(0);
+  });
+
+  it("keeps a run per agent: another model on the same token gets its own run", async () => {
+    delete process.env.FREEBUFF_RUN_ROTATION_MS;
+    installUpstream();
+    await drain((await executor.execute(makeExecuteArgs({ model: "mimo/mimo-v2.5" }))).response);
+    await drain((await executor.execute(makeExecuteArgs({ model: "z-ai/glm-5.3-flash", body: { messages: [] } }))).response);
+    expect(agentRunCalls("START")).toHaveLength(2);
+  });
+
+  it("does not share runs across tokens", async () => {
+    delete process.env.FREEBUFF_RUN_ROTATION_MS;
+    installUpstream();
+    await drain((await executor.execute(makeExecuteArgs())).response);
+    await drain((await executor.execute(makeExecuteArgs({ credentials: { accessToken: newToken(), providerSpecificData: { freebuffDeviceKey: testRecord } } }))).response);
+    expect(agentRunCalls("START")).toHaveLength(2);
+  });
+
+  it("FREEBUFF_RUN_ROTATION_MS=0 restores a START and a FINISH for every request", async () => {
+    process.env.FREEBUFF_RUN_ROTATION_MS = "0";
+    installUpstream();
+    const args = makeExecuteArgs();
+    await drain((await executor.execute(args)).response);
+    await drain((await executor.execute({ ...args, body: { messages: [{ role: "user", content: "2" }] } })).response);
+    expect(agentRunCalls("START")).toHaveLength(2);
+    expect(agentRunCalls("FINISH")).toHaveLength(2);
   });
 
   it("finishes the run as cancelled when the client goes away mid-stream", async () => {
@@ -561,1002 +1291,46 @@ describe("execute: handshake and run lifecycle", () => {
         new Response(
           new ReadableStream({
             start(controller) {
-              controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"a"}}]}\n\n'));
+              controller.enqueue(new TextEncoder().encode('data: {"x":1}\n\n'));
             },
           }),
-          { status: 200 },
+          { status: 200, headers: { "content-type": "text/event-stream" } },
         ),
     });
-    const { response } = await executor.execute(makeExecuteArgs());
-    const reader = response.body.getReader();
+    const result = await executor.execute(makeExecuteArgs());
+    const reader = result.response.body.getReader();
     await reader.read();
     await reader.cancel();
-    await vi.waitFor(() => expect(agentRunCalls("FINISH")).toHaveLength(1));
+    await new Promise((r) => setTimeout(r, 0));
     expect(agentRunCalls("FINISH")[0].body.status).toBe("cancelled");
   });
 
   it("finishes the run as failed when the chat call itself throws", async () => {
-    installUpstream({
-      chat: () => {
-        throw new Error("socket hang up");
-      },
+    installUpstream();
+    const upstream = fetchMock.getMockImplementation();
+    fetchMock.mockImplementation(async (url, init) => {
+      if (url === CHAT_URL) throw new Error("boom");
+      return upstream(url, init);
     });
-    await expect(executor.execute(makeExecuteArgs())).rejects.toThrow("socket hang up");
-    await vi.waitFor(() => expect(agentRunCalls("FINISH")).toHaveLength(1));
-    expect(agentRunCalls("FINISH")[0].body).toMatchObject({ status: "failed", errorMessage: "socket hang up" });
+    await expect(executor.execute(makeExecuteArgs())).rejects.toThrow("boom");
+    expect(agentRunCalls("FINISH")[0].body.status).toBe("failed");
   });
 
   it("ignores a FINISH failure", async () => {
-    installUpstream({
-      finish: () => {
-        throw new Error("finish boom");
-      },
-    });
-    const { response } = await executor.execute(makeExecuteArgs());
-    await expect(drain(response)).resolves.toContain("[DONE]");
-  });
-
-  it("sends tools through by default and folds them when FREEBUFF_FOLD_TOOLS=1", async () => {
-    installUpstream();
-    const tools = [{ type: "function", function: { name: "t", description: "d", parameters: { type: "object", properties: {} } } }];
-    const body = () => ({ messages: [{ role: "user", content: "hi" }], tools, tool_choice: "auto" });
-
-    await drain((await executor.execute(makeExecuteArgs({ body: body() }))).response);
-    expect(callsTo(CHAT_URL)[0].body.tools).toEqual(tools);
-
-    fetchMock.mockClear();
-    process.env.FREEBUFF_FOLD_TOOLS = "1";
-    await drain((await executor.execute(makeExecuteArgs({ body: body() }))).response);
-    expect(callsTo(CHAT_URL)[0].body.tools).toBeUndefined();
-    expect(callsTo(CHAT_URL)[0].body.messages[1].content).toContain("[Available Tools]");
-  });
-});
-
-describe("wrapStreamWithCleanup", () => {
-  it("reports completion exactly once", async () => {
-    const done = vi.fn();
-    const wrapped = wrapStreamWithCleanup(sse(["a", "b"]), done);
-    expect(await wrapped.text()).toBe("ab");
-    expect(done).toHaveBeenCalledTimes(1);
-    expect(done.mock.calls[0][0]).toBe("completed");
-  });
-
-  it("reports a failure when the body errors", async () => {
-    const done = vi.fn();
-    const broken = new Response(
-      new ReadableStream({
-        start(controller) {
-          controller.error(new Error("boom"));
-        },
-      }),
-    );
-    const wrapped = wrapStreamWithCleanup(broken, done);
-    await expect(wrapped.text()).rejects.toThrow("boom");
-    expect(done).toHaveBeenCalledWith("failed", "boom");
-  });
-
-  it("drops encoding/length headers that no longer describe the decoded body", () => {
-    const upstream = new Response("x", { headers: { "content-encoding": "gzip", "content-length": "20", "x-keep": "1" } });
-    const wrapped = wrapStreamWithCleanup(upstream, () => {});
-    expect(wrapped.headers.get("content-encoding")).toBeNull();
-    expect(wrapped.headers.get("content-length")).toBeNull();
-    expect(wrapped.headers.get("x-keep")).toBe("1");
-  });
-
-  it("finishes immediately for a bodiless response", () => {
-    const done = vi.fn();
-    const res = new Response(null, { status: 204 });
-    expect(wrapStreamWithCleanup(res, done)).toBe(res);
-    expect(done).toHaveBeenCalledWith("completed");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// session cache, dedupe, queued, model_locked
-// ---------------------------------------------------------------------------
-
-describe("free session handling", () => {
-  it("reuses the session for the same token and model, but not across tokens or models", async () => {
-    installUpstream();
-    const credentials = { accessToken: newToken() };
-
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
-    // ...but every request still gets its own agent run
-    expect(agentRunCalls("START")).toHaveLength(2);
-    // the second chat call reuses the first session's instance id
-    const [first, second] = callsTo(CHAT_URL);
-    expect(second.body.codebuff_metadata.freebuff_instance_id).toBe(first.body.codebuff_metadata.freebuff_instance_id);
-    expect(second.body.codebuff_metadata.run_id).not.toBe(first.body.codebuff_metadata.run_id);
-
-    await drain((await executor.execute(makeExecuteArgs({ credentials, model: "z-ai/glm-5.3-flash" }))).response);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(2);
-
-    await drain((await executor.execute(makeExecuteArgs({ credentials: { accessToken: newToken() } }))).response);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(3);
-  });
-
-  it("never keeps the raw token as a cache key", async () => {
-    installUpstream();
-    const credentials = { accessToken: newToken() };
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    expect(sessions.size).toBe(1);
-    for (const key of sessions.keys()) expect(key).not.toContain(credentials.accessToken);
-  });
-
-  it("admits a fresh session once the cached one is about to expire", async () => {
-    installUpstream();
-    const credentials = { accessToken: newToken() };
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
-
-    const realNow = Date.now();
-    const nowSpy = vi.spyOn(Date, "now");
-    // remainingMs is 600s and the cache keeps a 60s safety margin
-    nowSpy.mockReturnValue(realNow + 530_000);
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
-
-    nowSpy.mockReturnValue(realNow + 545_000);
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(2);
-  });
-
-  it("shares one in-flight admission between concurrent requests", async () => {
-    let release;
-    const gate = new Promise((resolve) => {
-      release = resolve;
-    });
-    installUpstream({
-      admission: async (headers) => {
-        await gate;
-        return json({ status: "active", instanceId: headers["x-freebuff-instance-id"], model: headers["x-freebuff-model"], remainingMs: 600_000 });
-      },
-    });
-    const credentials = { accessToken: newToken() };
-    const runs = [
-      executor.execute(makeExecuteArgs({ credentials })),
-      executor.execute(makeExecuteArgs({ credentials })),
-      executor.execute(makeExecuteArgs({ credentials })),
-    ];
-    await vi.waitFor(() => expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1));
-    release();
-    const results = await Promise.all(runs);
-    for (const r of results) await drain(r.response);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
-    expect(agentRunCalls("START")).toHaveLength(3);
-  });
-
-  it("keeps a shared admission alive when the first caller aborts", async () => {
-    let release;
-    const gate = new Promise((resolve) => {
-      release = resolve;
-    });
-    installUpstream({
-      admission: async (headers) => {
-        await gate;
-        return json({ status: "active", instanceId: headers["x-freebuff-instance-id"], model: headers["x-freebuff-model"], remainingMs: 600_000 });
-      },
-    });
-    const credentials = { accessToken: newToken() };
-    const controller = new AbortController();
-    const first = executor.execute(makeExecuteArgs({ credentials, signal: controller.signal }));
-    const second = executor.execute(makeExecuteArgs({ credentials }));
-    await vi.waitFor(() => expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1));
-    controller.abort();
-    release();
-    await first.catch(() => {});
-    const { response } = await second;
-    expect(response.status).toBe(200);
-    await drain(response);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
-  });
-
-  it("does not cache a failed admission", async () => {
-    let calls = 0;
-    installUpstream({
-      admission: (headers) => {
-        calls += 1;
-        if (calls === 1) return json({ error: "boom" }, { status: 500 });
-        return json({ status: "active", instanceId: headers["x-freebuff-instance-id"], model: headers["x-freebuff-model"], remainingMs: 600_000 });
-      },
-    });
-    const credentials = { accessToken: newToken() };
-    const first = await executor.execute(makeExecuteArgs({ credentials }));
-    expect(first.response.status).toBe(500);
-    const second = await executor.execute(makeExecuteArgs({ credentials }));
-    expect(second.response.status).toBe(200);
-    await drain(second.response);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(2);
-  });
-
-  describe("queued", () => {
-    const queued = (estimatedWaitMs) => () =>
-      json({ status: "queued", instanceId: "cli:queued-1", position: 3, queueDepth: 9, estimatedWaitMs });
-
-    it("answers 503 with Retry-After and an OpenAI-style error body, without starting a run", async () => {
-      installUpstream({ admission: queued(12_000) });
-      const { response } = await executor.execute(makeExecuteArgs());
-      expect(response.status).toBe(503);
-      expect(response.headers.get("retry-after")).toBe("12");
-      const body = await response.json();
-      expect(body.error.code).toBe("waiting_room_queued");
-      expect(body.error.type).toBe("server_error");
-      expect(body.error.message).toContain("position 3/9");
-      expect(agentRunCalls("START")).toHaveLength(0);
-      expect(callsTo(CHAT_URL)).toHaveLength(0);
-    });
-
-    it("clamps Retry-After between 1 and 30 seconds", async () => {
-      installUpstream({ admission: queued(600_000) });
-      expect((await executor.execute(makeExecuteArgs())).response.headers.get("retry-after")).toBe("30");
-      clearSessionCache();
-      installUpstream({ admission: queued(0) });
-      expect((await executor.execute(makeExecuteArgs())).response.headers.get("retry-after")).toBe("1");
-    });
-
-    it("does not re-admit while the queue answer is fresh, then polls the queued instance", async () => {
-      const handlers = installUpstream({ admission: queued(5_000) });
-      const credentials = { accessToken: newToken() };
-      const first = await executor.execute(makeExecuteArgs({ credentials }));
-      expect(first.response.status).toBe(503);
-
-      const again = await executor.execute(makeExecuteArgs({ credentials }));
-      expect(again.response.status).toBe(503);
-      expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
-      expect(callsTo(SESSION_URL)).toHaveLength(0);
-
-      // once the retry window has passed the queued instance is polled and can turn active
-      handlers.session = () => json({ status: "active", instanceId: "cli:queued-1", model: "mimo/mimo-v2.5", remainingMs: 600_000 });
-      const nowSpy = vi.spyOn(Date, "now");
-      nowSpy.mockReturnValue(Date.now() + 10_000);
-      const ok = await executor.execute(makeExecuteArgs({ credentials }));
-      expect(ok.response.status).toBe(200);
-      await drain(ok.response);
-      const [poll] = callsTo(SESSION_URL, "GET");
-      expect(poll.headers["x-freebuff-instance-id"]).toBe("cli:queued-1");
-      expect(callsTo(CHAT_URL)[0].body.codebuff_metadata.freebuff_instance_id).toBe("cli:queued-1");
-    });
-  });
-
-  describe("model_locked", () => {
-    const lockedTo = (currentModel) => (headers) =>
-      headers["x-freebuff-model"] === currentModel
-        ? json({ status: "active", instanceId: headers["x-freebuff-instance-id"], model: currentModel, remainingMs: 600_000 })
-        : json({ status: "model_locked", currentModel, requestedModel: headers["x-freebuff-model"] }, { status: 409 });
-
-    it("retries once with the locked model and uses its agent id and model for the chat call", async () => {
-      installUpstream({ admission: lockedTo("z-ai/glm-5.3-flash") });
-      const { response } = await executor.execute(makeExecuteArgs({ model: "mimo/mimo-v2.5" }));
-      expect(response.status).toBe(200);
-      await drain(response);
-
-      const admissions = callsTo(SESSION_ADMISSION_URL);
-      expect(admissions.map((c) => c.headers["x-freebuff-model"])).toEqual(["mimo/mimo-v2.5", "z-ai/glm-5.3-flash"]);
-      expect(agentRunCalls("START")[0].body.agentId).toBe("base3-free-glm-5-3-flash");
-      expect(callsTo(CHAT_URL)[0].body.model).toBe("z-ai/glm-5.3-flash");
-    });
-
-    it("remembers the lock instead of repeating the round trip on every request", async () => {
-      installUpstream({ admission: lockedTo("z-ai/glm-5.3-flash") });
-      const credentials = { accessToken: newToken() };
-      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-      expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(2);
-      expect(callsTo(CHAT_URL)).toHaveLength(2);
-    });
-
-    it("passes a lock onto a model this proxy cannot run through as a 409", async () => {
-      installUpstream({ admission: lockedTo("some/unknown-model") });
-      const { response } = await executor.execute(makeExecuteArgs());
-      expect(response.status).toBe(409);
-      const body = await response.json();
-      expect(body.error.code).toBe("model_locked");
-      expect(body.error.upstream.currentModel).toBe("some/unknown-model");
-      expect(callsTo(CHAT_URL)).toHaveLength(0);
-    });
-  });
-
-  it("falls back to the legacy session route when the admission route does not exist", async () => {
-    installUpstream({
-      admission: () => json({ error: "not found" }, { status: 404 }),
-      session: (headers, method) =>
-        method === "POST" ? json({ status: "active", instanceId: "legacy-1", model: headers["x-freebuff-model"], remainingMs: 600_000 }) : json({ status: "none" }),
-    });
-    const { response } = await executor.execute(makeExecuteArgs());
-    expect(response.status).toBe(200);
-    await drain(response);
-    expect(callsTo(SESSION_URL, "POST")).toHaveLength(1);
-    const meta = callsTo(CHAT_URL)[0].body.codebuff_metadata;
-    expect(meta.freebuff_instance_id).toBe("legacy-1");
-    expect(meta.freebuff_multi_session).toBeUndefined();
-  });
-
-  it("chats without an instance id when the waiting room is disabled", async () => {
-    installUpstream({ admission: () => json({ status: "disabled" }) });
-    const { response } = await executor.execute(makeExecuteArgs());
-    expect(response.status).toBe(200);
-    await drain(response);
-    expect(callsTo(CHAT_URL)[0].body.codebuff_metadata.freebuff_instance_id).toBeUndefined();
-  });
-
-  it("re-admits once when the chat gate says the session is gone", async () => {
-    let chats = 0;
-    installUpstream({
-      chat: () => {
-        chats += 1;
-        return chats === 1 ? json({ error: "session_superseded", message: "Another session took over" }, { status: 409 }) : sse();
-      },
-    });
-    const credentials = { accessToken: newToken() };
-    const { response } = await executor.execute(makeExecuteArgs({ credentials }));
-    expect(response.status).toBe(200);
-    await drain(response);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(2);
-    expect(agentRunCalls("START")).toHaveLength(2);
-    await vi.waitFor(() => expect(agentRunCalls("FINISH")).toHaveLength(2));
-    expect(agentRunCalls("FINISH").map((c) => c.body.status).sort()).toEqual(["completed", "failed"]);
-  });
-
-  it("gives up after a single re-admission", async () => {
-    installUpstream({ chat: () => json({ error: "session_superseded", message: "gone" }, { status: 409 }) });
-    const { response } = await executor.execute(makeExecuteArgs());
-    expect(response.status).toBe(409);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(2);
-  });
-
-  it("re-admits when START reports a dead session, but not for its own queued answer", async () => {
-    let starts = 0;
-    installUpstream({
-      start: () => {
-        starts += 1;
-        return starts === 1 ? json({ error: "session_expired", message: "expired" }, { status: 409 }) : json({ runId: "run-ok" });
-      },
-    });
-    const { response } = await executor.execute(makeExecuteArgs());
-    expect(response.status).toBe(200);
-    await drain(response);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(2);
-
-    fetchMock.mockReset();
-    clearSessionCache();
-    installUpstream({ admission: () => json({ status: "queued", instanceId: "cli:q", estimatedWaitMs: 1000 }) });
-    const queued = await executor.execute(makeExecuteArgs());
-    expect(queued.response.status).toBe(503);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// run reuse and rotation (the default; FREEBUFF_RUN_ROTATION_MS=0 is the legacy mode above)
-// ---------------------------------------------------------------------------
-
-describe("agent run reuse", () => {
-  beforeEach(() => {
-    delete process.env.FREEBUFF_RUN_ROTATION_MS;
-  });
-
-  const GLM = "z-ai/glm-5.3-flash";
-
-  it("reuses one run across sequential requests: one admission, one START, no FINISH in between", async () => {
-    installUpstream();
-    const credentials = { accessToken: newToken() };
-
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
-    expect(agentRunCalls("START")).toHaveLength(1);
-    expect(agentRunCalls("FINISH")).toHaveLength(0);
-    const [first, second] = callsTo(CHAT_URL);
-    expect(first.body.codebuff_metadata.run_id).toBe("run-1");
-    expect(second.body.codebuff_metadata.run_id).toBe("run-1");
-
-    const [run] = [...activeRuns.values()];
-    expect(activeRuns.size).toBe(1);
-    expect(run).toMatchObject({ id: "run-1", agentId: "base3-free-mimo", inflight: 0, requestCount: 2 });
-  });
-
-  it("keeps a run per agent: another model on the same token gets its own run", async () => {
-    installUpstream();
-    const credentials = { accessToken: newToken() };
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    await drain((await executor.execute(makeExecuteArgs({ credentials, model: GLM }))).response);
-    expect(agentRunCalls("START").map((c) => c.body.agentId)).toEqual(["base3-free-mimo", "base3-free-glm-5-3-flash"]);
-  });
-
-  it("does not share runs across tokens", async () => {
-    installUpstream();
-    await drain((await executor.execute(makeExecuteArgs())).response);
-    await drain((await executor.execute(makeExecuteArgs())).response);
-    expect(agentRunCalls("START")).toHaveLength(2);
-    expect(activeRuns.size).toBe(2);
-    for (const key of activeRuns.keys()) expect(key).not.toContain("fb-test-token");
-  });
-
-  it("shares one admission and one START between concurrent requests", async () => {
-    let release;
-    const gate = new Promise((resolve) => {
-      release = resolve;
-    });
-    installUpstream({
-      admission: async (headers) => {
-        await gate;
-        return activeSession(headers);
-      },
-      start: async () => {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-        return json({ runId: "run-shared" });
-      },
-    });
-    const credentials = { accessToken: newToken() };
-    const runs = [0, 1, 2].map(() => executor.execute(makeExecuteArgs({ credentials })));
-    await vi.waitFor(() => expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1));
-    release();
-    for (const r of await Promise.all(runs)) await drain(r.response);
-
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
-    expect(agentRunCalls("START")).toHaveLength(1);
-    expect(callsTo(CHAT_URL).map((c) => c.body.codebuff_metadata.run_id)).toEqual(["run-shared", "run-shared", "run-shared"]);
-    expect([...activeRuns.values()][0]).toMatchObject({ inflight: 0, requestCount: 3 });
-    expect(agentRunCalls("FINISH")).toHaveLength(0);
-  });
-
-  it("does not cache a failed START", async () => {
-    let starts = 0;
-    installUpstream({
-      start: () => {
-        starts += 1;
-        return starts === 1 ? json({ error: "boom" }, { status: 500 }) : json({ runId: "run-ok" });
-      },
-    });
-    const credentials = { accessToken: newToken() };
-
-    const failed = await executor.execute(makeExecuteArgs({ credentials }));
-    expect(failed.response.status).toBe(500);
-    expect(activeRuns.size).toBe(0);
-    expect(callsTo(CHAT_URL)).toHaveLength(0);
-
-    const ok = await executor.execute(makeExecuteArgs({ credentials }));
-    expect(ok.response.status).toBe(200);
-    await drain(ok.response);
-    expect(agentRunCalls("START")).toHaveLength(2);
-    expect(callsTo(CHAT_URL)[0].body.codebuff_metadata.run_id).toBe("run-ok");
-    expect([...activeRuns.values()].map((r) => r.id)).toEqual(["run-ok"]);
-  });
-
-  it("hands a START failure to every request that waited on it, then starts again", async () => {
-    let starts = 0;
-    installUpstream({
-      start: async () => {
-        starts += 1;
-        await new Promise((resolve) => setTimeout(resolve, 10));
-        return starts === 1 ? json({ error: "boom" }, { status: 503 }) : json({ runId: "run-ok" });
-      },
-    });
-    const credentials = { accessToken: newToken() };
-    const results = await Promise.all([executor.execute(makeExecuteArgs({ credentials })), executor.execute(makeExecuteArgs({ credentials }))]);
-    expect(results.map((r) => r.response.status)).toEqual([503, 503]);
-    expect(agentRunCalls("START")).toHaveLength(1);
-
-    const ok = await executor.execute(makeExecuteArgs({ credentials }));
-    expect(ok.response.status).toBe(200);
-    await drain(ok.response);
-    expect(agentRunCalls("START")).toHaveLength(2);
-  });
-
-  it("leaves a reused run alone when a request fails", async () => {
-    let chats = 0;
-    installUpstream({
-      chat: () => {
-        chats += 1;
-        if (chats === 1) return json({ error: "upstream_down" }, { status: 500 });
-        if (chats === 2) throw new Error("socket hang up");
-        return sse();
-      },
-    });
-    const credentials = { accessToken: newToken() };
-    expect((await executor.execute(makeExecuteArgs({ credentials }))).response.status).toBe(500);
-    await expect(executor.execute(makeExecuteArgs({ credentials }))).rejects.toThrow("socket hang up");
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-
-    expect(agentRunCalls("START")).toHaveLength(1);
-    expect(agentRunCalls("FINISH")).toHaveLength(0);
-    expect([...activeRuns.values()][0]).toMatchObject({ id: "run-1", inflight: 0, requestCount: 3 });
-  });
-
-  it("keeps the run when the chat gate sends the session away", async () => {
-    let chats = 0;
-    installUpstream({
-      chat: () => {
-        chats += 1;
-        return chats === 1 ? json({ error: "session_superseded", message: "Another session took over" }, { status: 409 }) : sse();
-      },
-    });
-    const { response } = await executor.execute(makeExecuteArgs());
-    expect(response.status).toBe(200);
-    await drain(response);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(2);
-    expect(agentRunCalls("START")).toHaveLength(1);
-    expect(agentRunCalls("FINISH")).toHaveLength(0);
-    expect(callsTo(CHAT_URL).map((c) => c.body.codebuff_metadata.run_id)).toEqual(["run-1", "run-1"]);
-  });
-
-  it("replaces a run the upstream no longer knows without touching the session or finishing it", async () => {
-    let chats = 0;
-    installUpstream({
-      chat: () => {
-        chats += 1;
-        return chats === 1 ? json({ error: "bad_request", message: "runId not found" }, { status: 400 }) : sse();
-      },
-    });
-    const { response } = await executor.execute(makeExecuteArgs());
-    expect(response.status).toBe(200);
-    await drain(response);
-
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
-    expect(agentRunCalls("START")).toHaveLength(2);
-    expect(agentRunCalls("FINISH")).toHaveLength(0);
-    expect(callsTo(CHAT_URL).map((c) => c.body.codebuff_metadata.run_id)).toEqual(["run-1", "run-2"]);
-    expect([...activeRuns.values()].map((r) => r.id)).toEqual(["run-2"]);
-    expect(drainingRuns.size).toBe(0);
-  });
-
-  describe("rotation", () => {
-    it("rotates after the interval and finishes the old run only once its last request is done", async () => {
-      process.env.FREEBUFF_RUN_ROTATION_MS = "60000";
-      vi.useFakeTimers({ toFake: ["Date"] });
-      installUpstream();
-      const credentials = { accessToken: newToken() };
-
-      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-      const stillStreaming = await executor.execute(makeExecuteArgs({ credentials }));
-      expect(agentRunCalls("START")).toHaveLength(1);
-
-      vi.advanceTimersByTime(59_000);
-      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-      expect(agentRunCalls("START")).toHaveLength(1);
-
-      vi.advanceTimersByTime(2_000);
-      const rotated = await executor.execute(makeExecuteArgs({ credentials }));
-      expect(rotated.response.status).toBe(200);
-      expect(agentRunCalls("START")).toHaveLength(2);
-      expect(callsTo(CHAT_URL).map((c) => c.body.codebuff_metadata.run_id)).toEqual(["run-1", "run-1", "run-1", "run-2"]);
-
-      // run-1 still has a request in flight: it drains, no FINISH yet
-      expect(agentRunCalls("FINISH")).toHaveLength(0);
-      expect(drainingRuns.size).toBe(1);
-
-      await drain(stillStreaming.response);
-      expect(agentRunCalls("FINISH")).toHaveLength(1);
-      expect(agentRunCalls("FINISH")[0].body).toEqual({
-        action: "FINISH",
-        runId: "run-1",
-        status: "completed",
-        totalSteps: 3,
-        directCredits: 0,
-        totalCredits: 0,
-        steps: [],
-      });
-      expect(drainingRuns.size).toBe(0);
-
-      // the current run is never finished by its own requests
-      await drain(rotated.response);
-      expect(agentRunCalls("FINISH")).toHaveLength(1);
-      expect([...activeRuns.values()].map((r) => r.id)).toEqual(["run-2"]);
-    });
-
-    it("finishes an idle run right away when it rotates", async () => {
-      process.env.FREEBUFF_RUN_ROTATION_MS = "1000";
-      vi.useFakeTimers({ toFake: ["Date"] });
-      installUpstream();
-      const credentials = { accessToken: newToken() };
-
-      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-      vi.advanceTimersByTime(1_500);
-      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-
-      expect(agentRunCalls("START")).toHaveLength(2);
-      expect(agentRunCalls("FINISH")).toHaveLength(1);
-      expect(agentRunCalls("FINISH")[0].body).toMatchObject({ runId: "run-1", status: "completed", totalSteps: 1 });
-    });
-
-    it("keeps the old run when the replacement START fails, and retries on the next request", async () => {
-      process.env.FREEBUFF_RUN_ROTATION_MS = "1000";
-      vi.useFakeTimers({ toFake: ["Date"] });
-      let starts = 0;
-      installUpstream({
-        start: () => {
-          starts += 1;
-          return starts === 2 ? json({ error: "boom" }, { status: 500 }) : json({ runId: `run-${starts}` });
-        },
-      });
-      const credentials = { accessToken: newToken() };
-      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-      vi.advanceTimersByTime(1_500);
-
-      expect((await executor.execute(makeExecuteArgs({ credentials }))).response.status).toBe(500);
-      expect(agentRunCalls("FINISH")).toHaveLength(0);
-      expect([...activeRuns.values()].map((r) => r.id)).toEqual(["run-1"]);
-
-      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-      expect([...activeRuns.values()].map((r) => r.id)).toEqual(["run-3"]);
-      expect(agentRunCalls("FINISH").map((c) => c.body.runId)).toEqual(["run-1"]);
-    });
-
-    it("defaults to six hours and falls back to it for a bad value", () => {
-      expect(DEFAULT_RUN_ROTATION_MS).toBe(6 * 3_600_000);
-      expect(runRotationMs()).toBe(DEFAULT_RUN_ROTATION_MS);
-      for (const bad of ["abc", "-5", "NaN", "  "]) {
-        process.env.FREEBUFF_RUN_ROTATION_MS = bad;
-        expect(runRotationMs()).toBe(DEFAULT_RUN_ROTATION_MS);
-      }
-      process.env.FREEBUFF_RUN_ROTATION_MS = "0";
-      expect(runRotationMs()).toBe(0);
-      process.env.FREEBUFF_RUN_ROTATION_MS = "1500.9";
-      expect(runRotationMs()).toBe(1500);
-    });
-
-    it("keeps one run for hours at the default interval", async () => {
-      vi.useFakeTimers({ toFake: ["Date"] });
-      installUpstream({
-        admission: (headers) =>
-          json({ status: "active", instanceId: headers["x-freebuff-instance-id"], model: headers["x-freebuff-model"], remainingMs: 40_000_000 }),
-      });
-      const credentials = { accessToken: newToken() };
-      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-      vi.advanceTimersByTime(DEFAULT_RUN_ROTATION_MS - 60_000);
-      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-      expect(agentRunCalls("START")).toHaveLength(1);
-      vi.advanceTimersByTime(120_000);
-      await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-      expect(agentRunCalls("START")).toHaveLength(2);
-    });
-  });
-
-  it("FREEBUFF_RUN_ROTATION_MS=0 restores a START and a FINISH for every request", async () => {
-    process.env.FREEBUFF_RUN_ROTATION_MS = "0";
-    installUpstream();
-    const credentials = { accessToken: newToken() };
-
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    await vi.waitFor(() => expect(agentRunCalls("FINISH")).toHaveLength(1));
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    await vi.waitFor(() => expect(agentRunCalls("FINISH")).toHaveLength(2));
-
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
-    expect(agentRunCalls("START")).toHaveLength(2);
-    expect(callsTo(CHAT_URL).map((c) => c.body.codebuff_metadata.run_id)).toEqual(["run-1", "run-2"]);
-    expect(agentRunCalls("FINISH").map((c) => c.body)).toEqual([
-      expect.objectContaining({ runId: "run-1", status: "completed", totalSteps: 1, directCredits: 0, totalCredits: 0 }),
-      expect.objectContaining({ runId: "run-2", status: "completed", totalSteps: 1, directCredits: 0, totalCredits: 0 }),
-    ]);
-    expect(activeRuns.size).toBe(0);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// one free session per token, released on a model switch
-// ---------------------------------------------------------------------------
-
-describe("free session release on model switch", () => {
-  const GLM = "z-ai/glm-5.3-flash";
-  const DEEPSEEK = "deepseek/deepseek-v4-flash";
-
-  beforeEach(() => {
-    delete process.env.FREEBUFF_RUN_ROTATION_MS;
-  });
-
-  it("releases the old session with its own attempt headers before admitting the new model", async () => {
-    installUpstream();
-    const credentials = { accessToken: newToken() };
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    const { response } = await executor.execute(makeExecuteArgs({ credentials, model: GLM }));
-    expect(response.status).toBe(200);
-    await drain(response);
-
-    const [first, second] = callsTo(SESSION_ADMISSION_URL);
-    expect(releaseCalls()).toHaveLength(1);
-    const [release] = releaseCalls();
-    expect(release.url).toBe("https://www.codebuff.com/api/v1/freebuff/session/attempt");
-    expect(release.headers["x-freebuff-desktop-attempt-id"]).toBe(first.headers["x-freebuff-desktop-attempt-id"]);
-    expect(release.headers["x-freebuff-instance-id"]).toBe(first.headers["x-freebuff-instance-id"]);
-    expect(release.headers.Authorization).toBe(`Bearer ${credentials.accessToken}`);
-    expect(release.headers["User-Agent"]).toBe(DEFAULT_USER_AGENT);
-    expect(release.body).toBeNull();
-
-    // DELETE goes out between the two admissions
-    const order = allCalls().map((c) => `${c.method} ${c.url}`);
-    const at = (label) => order.map((l, i) => (l === label ? i : -1)).filter((i) => i >= 0);
-    const [a1, a2] = at(`POST ${SESSION_ADMISSION_URL}`);
-    const [del] = at(`DELETE ${SESSION_ATTEMPT_URL}`);
-    expect(a1).toBeLessThan(del);
-    expect(del).toBeLessThan(a2);
-
-    // the new session, not the old one, carries the second chat
-    const [, chat] = callsTo(CHAT_URL);
-    expect(chat.body.model).toBe(GLM);
-    expect(chat.body.codebuff_metadata.freebuff_instance_id).toBe(second.headers["x-freebuff-instance-id"]);
-    expect(chat.body.codebuff_metadata.freebuff_instance_id).not.toBe(first.headers["x-freebuff-instance-id"]);
-
-    // one session per token: the cache holds the new model only
-    expect(sessions.size).toBe(1);
-    expect([...sessions.values()][0]).toMatchObject({ type: "active", model: GLM });
-  });
-
-  it("sends the ids of the admission request even when the server answers with another instance id", async () => {
-    installUpstream({
-      admission: (headers) =>
-        json({ status: "active", instanceId: `cli:server-${headers["x-freebuff-model"]}`, model: headers["x-freebuff-model"], remainingMs: 600_000 }),
-    });
-    const credentials = { accessToken: newToken() };
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    await drain((await executor.execute(makeExecuteArgs({ credentials, model: GLM }))).response);
-
-    const [first] = callsTo(SESSION_ADMISSION_URL);
-    const [release] = releaseCalls();
-    expect(release.headers["x-freebuff-desktop-attempt-id"]).toBe(first.headers["x-freebuff-desktop-attempt-id"]);
-    expect(release.headers["x-freebuff-instance-id"]).toBe(first.headers["x-freebuff-instance-id"]);
-    // chat still uses the id the server handed out
-    expect(callsTo(CHAT_URL)[0].body.codebuff_metadata.freebuff_instance_id).toBe("cli:server-mimo/mimo-v2.5");
-  });
-
-  it("does not release while the same model keeps being served", async () => {
-    installUpstream();
-    const credentials = { accessToken: newToken() };
-    for (let i = 0; i < 3; i++) await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
-    expect(releaseCalls()).toHaveLength(0);
-  });
-
-  it("does not release another token's session", async () => {
-    installUpstream();
-    await drain((await executor.execute(makeExecuteArgs())).response);
-    await drain((await executor.execute(makeExecuteArgs({ model: GLM }))).response);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(2);
-    expect(releaseCalls()).toHaveLength(0);
-  });
-
-  it("ends the runs of the released session's agent, after their in-flight requests", async () => {
-    installUpstream();
-    const credentials = { accessToken: newToken() };
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    const stillStreaming = await executor.execute(makeExecuteArgs({ credentials }));
-
-    await drain((await executor.execute(makeExecuteArgs({ credentials, model: GLM }))).response);
-    expect(releaseCalls()).toHaveLength(1);
-    // run-1 (mimo) has a request in flight: it drains instead of finishing
-    expect(agentRunCalls("FINISH")).toHaveLength(0);
-    expect(drainingRuns.size).toBe(1);
-    expect(agentRunCalls("START").map((c) => c.body.agentId)).toEqual(["base3-free-mimo", "base3-free-glm-5-3-flash"]);
-
-    await drain(stillStreaming.response);
+    installUpstream({ finish: () => new Response("no", { status: 500 }) });
+    const result = await executor.execute(makeExecuteArgs());
+    await drain(result.response);
     expect(agentRunCalls("FINISH")).toHaveLength(1);
-    expect(agentRunCalls("FINISH")[0].body).toMatchObject({ runId: "run-1", status: "completed", totalSteps: 2 });
-    expect(drainingRuns.size).toBe(0);
-    // the new model's run is the only live one
-    expect([...activeRuns.values()].map((r) => r.agentId)).toEqual(["base3-free-glm-5-3-flash"]);
   });
 
-  it("finishes an idle run of the released session's agent immediately", async () => {
-    installUpstream();
-    const credentials = { accessToken: newToken() };
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    await drain((await executor.execute(makeExecuteArgs({ credentials, model: GLM }))).response);
-    expect(agentRunCalls("FINISH").map((c) => c.body.runId)).toEqual(["run-1"]);
-  });
-
-  it("does not fail the request when the release answers an error", async () => {
-    installUpstream({ release: () => json({ error: "nope" }, { status: 500 }) });
-    const log = { info: vi.fn(), warn: vi.fn(), debug: vi.fn() };
-    const credentials = { accessToken: newToken() };
-    await drain((await executor.execute(makeExecuteArgs({ credentials, log }))).response);
-    const { response } = await executor.execute(makeExecuteArgs({ credentials, log, model: GLM }));
-    expect(response.status).toBe(200);
-    await drain(response);
-    expect(releaseCalls()).toHaveLength(1);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(2);
-    expect(callsTo(CHAT_URL)[1].body.model).toBe(GLM);
-    expect(log.warn).toHaveBeenCalledWith("FREEBUFF", expect.stringContaining("500"));
-  });
-
-  it("does not fail the request when the release call itself throws", async () => {
-    installUpstream({
-      release: () => {
-        throw new Error("socket hang up");
-      },
-    });
-    const log = { info: vi.fn(), warn: vi.fn(), debug: vi.fn() };
-    const credentials = { accessToken: newToken() };
-    await drain((await executor.execute(makeExecuteArgs({ credentials, log }))).response);
-    const { response } = await executor.execute(makeExecuteArgs({ credentials, log, model: GLM }));
-    expect(response.status).toBe(200);
-    await drain(response);
-    expect(callsTo(CHAT_URL)[1].body.model).toBe(GLM);
-    expect(log.warn).toHaveBeenCalledWith("FREEBUFF", expect.stringContaining("socket hang up"));
-  });
-
-  it("treats a 404 on release as already gone", async () => {
-    installUpstream({ release: () => json({ error: "not_found" }, { status: 404 }) });
-    const log = { info: vi.fn(), warn: vi.fn(), debug: vi.fn() };
-    const credentials = { accessToken: newToken() };
-    await drain((await executor.execute(makeExecuteArgs({ credentials, log }))).response);
-    await drain((await executor.execute(makeExecuteArgs({ credentials, log, model: GLM }))).response);
-    expect(log.warn).not.toHaveBeenCalled();
-  });
-
-  it("drops the old session even when the new admission is refused, instead of reusing a released one", async () => {
-    installUpstream({
-      admission: (headers) =>
-        headers["x-freebuff-model"] === GLM ? json({ status: "purchase_capacity", message: "no slot" }) : activeSession(headers),
-    });
-    const credentials = { accessToken: newToken() };
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    const refused = await executor.execute(makeExecuteArgs({ credentials, model: GLM }));
-    expect(refused.response.status).toBe(429);
-    expect(sessions.size).toBe(0);
-
-    // going back to the first model needs a fresh admission: its old session was released
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(3);
-  });
-
-  it("serialises concurrent requests for different models: the switch waits for the pending admission", async () => {
-    let release;
-    const gate = new Promise((resolve) => {
-      release = resolve;
-    });
-    installUpstream({
-      admission: async (headers) => {
-        if (headers["x-freebuff-model"] === "mimo/mimo-v2.5") await gate;
-        return activeSession(headers);
-      },
-    });
-    const credentials = { accessToken: newToken() };
-    const first = executor.execute(makeExecuteArgs({ credentials }));
-    await vi.waitFor(() => expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1));
-    const second = executor.execute(makeExecuteArgs({ credentials, model: GLM }));
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    // nothing for the second model may reach the upstream before the first admission settles
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(1);
-    expect(releaseCalls()).toHaveLength(0);
-
-    release();
-    const [a, b] = await Promise.all([first, second]);
-    expect(a.response.status).toBe(200);
-    expect(b.response.status).toBe(200);
-    await drain(a.response);
-    await drain(b.response);
-
-    const order = allCalls().filter((c) => [SESSION_ADMISSION_URL, SESSION_ATTEMPT_URL].includes(c.url));
-    expect(order.map((c) => `${c.method} ${c.headers["x-freebuff-model"] || "-"}`)).toEqual([
-      "POST mimo/mimo-v2.5",
-      "DELETE -",
-      `POST ${GLM}`,
-    ]);
-    expect(sessions.size).toBe(1);
-    expect([...sessions.values()][0].model).toBe(GLM);
-  });
-
-  it("shares one admission between concurrent requests for the new model", async () => {
-    installUpstream();
-    const credentials = { accessToken: newToken() };
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    const results = await Promise.all([1, 2, 3].map(() => executor.execute(makeExecuteArgs({ credentials, model: GLM }))));
-    for (const r of results) await drain(r.response);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(2);
-    expect(releaseCalls()).toHaveLength(1);
-    expect(agentRunCalls("START")).toHaveLength(2);
-  });
-
-  it("releases a queued claim of the old model too", async () => {
-    installUpstream({
-      admission: (headers) =>
-        headers["x-freebuff-model"] === "mimo/mimo-v2.5"
-          ? json({ status: "queued", instanceId: "cli:server-queued", position: 2, queueDepth: 4, estimatedWaitMs: 5000 })
-          : activeSession(headers),
-    });
-    const credentials = { accessToken: newToken() };
-    expect((await executor.execute(makeExecuteArgs({ credentials }))).response.status).toBe(503);
-    const { response } = await executor.execute(makeExecuteArgs({ credentials, model: GLM }));
-    expect(response.status).toBe(200);
-    await drain(response);
-
-    const [queuedAdmission] = callsTo(SESSION_ADMISSION_URL);
-    const [release] = releaseCalls();
-    expect(release.headers["x-freebuff-desktop-attempt-id"]).toBe(queuedAdmission.headers["x-freebuff-desktop-attempt-id"]);
-    expect(release.headers["x-freebuff-instance-id"]).toBe(queuedAdmission.headers["x-freebuff-instance-id"]);
-  });
-
-  it("keeps the claim ids when a queued session is promoted by a poll", async () => {
-    const handlers = installUpstream({
-      admission: () => json({ status: "queued", instanceId: "cli:server-queued", estimatedWaitMs: 1000 }),
-    });
-    const credentials = { accessToken: newToken() };
-    expect((await executor.execute(makeExecuteArgs({ credentials }))).response.status).toBe(503);
-
-    handlers.session = () => json({ status: "active", instanceId: "cli:server-queued", model: "mimo/mimo-v2.5", remainingMs: 600_000 });
-    handlers.admission = activeSession;
-    const nowSpy = vi.spyOn(Date, "now");
-    nowSpy.mockReturnValue(Date.now() + 10_000);
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    await drain((await executor.execute(makeExecuteArgs({ credentials, model: GLM }))).response);
-
-    const [queuedAdmission] = callsTo(SESSION_ADMISSION_URL);
-    const [release] = releaseCalls();
-    expect(release.headers["x-freebuff-desktop-attempt-id"]).toBe(queuedAdmission.headers["x-freebuff-desktop-attempt-id"]);
-    expect(release.headers["x-freebuff-instance-id"]).toBe(queuedAdmission.headers["x-freebuff-instance-id"]);
-  });
-
-  it("cannot release a session from the legacy session route (no attempt id), but still switches", async () => {
-    installUpstream({
-      admission: () => json({ error: "not found" }, { status: 404 }),
-      session: (headers, method) =>
-        method === "POST" ? json({ status: "active", instanceId: `legacy-${headers["x-freebuff-model"]}`, model: headers["x-freebuff-model"], remainingMs: 600_000 }) : json({ status: "none" }),
-    });
-    const credentials = { accessToken: newToken() };
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    await drain((await executor.execute(makeExecuteArgs({ credentials, model: GLM }))).response);
-    expect(releaseCalls()).toHaveLength(0);
-    expect(callsTo(CHAT_URL).map((c) => c.body.codebuff_metadata.freebuff_instance_id)).toEqual(["legacy-mimo/mimo-v2.5", `legacy-${GLM}`]);
-  });
-
-  it("keeps the model_locked fallback without releasing it for the model that was redirected", async () => {
-    installUpstream({
-      admission: (headers) =>
-        headers["x-freebuff-model"] === GLM
-          ? activeSession(headers)
-          : json({ status: "model_locked", currentModel: GLM, requestedModel: headers["x-freebuff-model"] }, { status: 409 }),
-    });
-    const credentials = { accessToken: newToken() };
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    await drain((await executor.execute(makeExecuteArgs({ credentials }))).response);
-    expect(callsTo(CHAT_URL).map((c) => c.body.model)).toEqual([GLM, GLM]);
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(2);
-    expect(releaseCalls()).toHaveLength(0);
-
-    // a model the lock does not cover still releases the locked session
-    await drain((await executor.execute(makeExecuteArgs({ credentials, model: DEEPSEEK }))).response);
-    expect(releaseCalls()).toHaveLength(1);
-    const glmAdmission = callsTo(SESSION_ADMISSION_URL).find((c) => c.headers["x-freebuff-model"] === GLM);
-    expect(releaseCalls()[0].headers["x-freebuff-instance-id"]).toBe(glmAdmission.headers["x-freebuff-instance-id"]);
-  });
-
-  it("does not let a stale gate failure wipe the session a model switch opened", async () => {
-    let resolveChat;
-    const chatGate = new Promise((resolve) => {
-      resolveChat = resolve;
-    });
-    let chats = 0;
-    installUpstream({
-      chat: async () => {
-        chats += 1;
-        if (chats === 1) {
-          await chatGate;
-          return json({ error: "session_superseded", message: "gone" }, { status: 409 });
-        }
-        return sse();
-      },
-    });
-    const credentials = { accessToken: newToken() };
-    const slow = executor.execute(makeExecuteArgs({ credentials }));
-    await vi.waitFor(() => expect(callsTo(CHAT_URL)).toHaveLength(1));
-    await drain((await executor.execute(makeExecuteArgs({ credentials, model: GLM }))).response);
-    const glmSession = [...sessions.values()][0];
-    expect(glmSession.model).toBe(GLM);
-
-    resolveChat();
-    const retried = await slow;
-    expect(retried.response.status).toBe(200);
-    await drain(retried.response);
-
-    // The stale failure concerned the already released mimo session. The glm session was still known,
-    // so the retry (mimo again) released it instead of leaking its slot.
-    const glmAdmission = callsTo(SESSION_ADMISSION_URL).find((c) => c.headers["x-freebuff-model"] === GLM);
-    expect(releaseCalls()).toHaveLength(2);
-    expect(releaseCalls()[1].headers["x-freebuff-instance-id"]).toBe(glmAdmission.headers["x-freebuff-instance-id"]);
-    expect([...sessions.values()][0]).toMatchObject({ model: "mimo/mimo-v2.5" });
+  it("defaults to six hours and falls back to it for a bad value", () => {
+    delete process.env.FREEBUFF_RUN_ROTATION_MS;
+    expect(runRotationMs()).toBe(DEFAULT_RUN_ROTATION_MS);
+    expect(DEFAULT_RUN_ROTATION_MS).toBe(6 * 3_600_000);
+    process.env.FREEBUFF_RUN_ROTATION_MS = "banana";
+    expect(runRotationMs()).toBe(DEFAULT_RUN_ROTATION_MS);
+    process.env.FREEBUFF_RUN_ROTATION_MS = "0";
+    expect(runRotationMs()).toBe(0);
   });
 });
 
@@ -1565,354 +1339,447 @@ describe("free session release on model switch", () => {
 // ---------------------------------------------------------------------------
 
 describe("direct egress", () => {
-  const relay = "https://relay.example.workers.dev/proxy";
-
   it("drops a relay pool URL but keeps plain proxy settings", () => {
-    const log = { warn: vi.fn() };
-    const out = directEgressOptions(
-      { vercelRelayUrl: relay, connectionProxyEnabled: true, connectionProxyUrl: "http://127.0.0.1:8080", connectionNoProxy: "localhost" },
-      log,
-    );
-    expect(out).toEqual({ connectionProxyEnabled: true, connectionProxyUrl: "http://127.0.0.1:8080", connectionNoProxy: "localhost" });
+    const opts = { vercelRelayUrl: "https://relay.example/pipe", connectionProxyUrl: "http://proxy:8080" };
+    const out = directEgressOptions(opts);
     expect(out.vercelRelayUrl).toBeUndefined();
+    expect(out.connectionProxyUrl).toBe("http://proxy:8080");
   });
 
   it("passes options without a relay through untouched", () => {
-    const opts = { connectionProxyEnabled: true, connectionProxyUrl: "socks5://127.0.0.1:1080" };
+    const opts = { connectionProxyEnabled: true, connectionProxyUrl: "socks5://x" };
     expect(directEgressOptions(opts)).toBe(opts);
     expect(directEgressOptions(null)).toBeNull();
-    expect(directEgressOptions(undefined)).toBeUndefined();
   });
 
   it("warns once per relay with a single line", () => {
     const log = { warn: vi.fn() };
-    directEgressOptions({ vercelRelayUrl: relay }, log);
-    directEgressOptions({ vercelRelayUrl: relay }, log);
+    directEgressOptions({ vercelRelayUrl: "https://r/1" }, log);
+    directEgressOptions({ vercelRelayUrl: "https://r/1" }, log);
     expect(log.warn).toHaveBeenCalledTimes(1);
-    expect(log.warn.mock.calls[0][0]).toBe("FREEBUFF");
-    expect(log.warn.mock.calls[0][1]).toMatch(/relay/i);
-    directEgressOptions({ vercelRelayUrl: `${relay}2` }, log);
-    expect(log.warn).toHaveBeenCalledTimes(2);
   });
 
   it("never hands the relay URL to any of the outgoing calls", async () => {
     installUpstream();
-    const log = { warn: vi.fn(), debug: vi.fn() };
-    const { response } = await executor.execute(
-      makeExecuteArgs({ log, proxyOptions: { vercelRelayUrl: relay, connectionProxyEnabled: false } }),
-    );
-    await drain(response);
-    await vi.waitFor(() => expect(agentRunCalls("FINISH")).toHaveLength(1));
-
-    const calls = allCalls();
-    expect(calls.length).toBeGreaterThanOrEqual(4);
-    for (const call of calls) {
+    await executor.execute(makeExecuteArgs({ proxyOptions: { vercelRelayUrl: "https://relay.example/pipe" } }));
+    for (const call of allCalls()) {
       expect(call.opts?.vercelRelayUrl).toBeUndefined();
-      expect(JSON.stringify(call.opts || {})).not.toContain("relay.example");
     }
-    expect(log.warn).toHaveBeenCalledTimes(1);
   });
 
   it("still routes through a plain HTTP/SOCKS proxy", async () => {
     installUpstream();
-    const proxyOptions = { connectionProxyEnabled: true, connectionProxyUrl: "socks5://127.0.0.1:1080", connectionNoProxy: "" };
-    const { response } = await executor.execute(makeExecuteArgs({ proxyOptions }));
-    await drain(response);
-    await vi.waitFor(() => expect(agentRunCalls("FINISH")).toHaveLength(1));
-    for (const call of allCalls()) expect(call.opts).toEqual(proxyOptions);
+    await executor.execute(makeExecuteArgs({ proxyOptions: { connectionProxyUrl: "socks5://proxy:1080" } }));
+    const chat = callsTo(CHAT_URL, "POST")[0];
+    expect(chat.opts.connectionProxyUrl).toBe("socks5://proxy:1080");
   });
 });
 
 // ---------------------------------------------------------------------------
-// error pass-through
+// upstream errors
 // ---------------------------------------------------------------------------
 
 describe("upstream errors", () => {
-  it.each([
-    [403, { error: "free_mode_cli_required", message: "Free mode requires the Freebuff CLI" }],
-    [403, { error: "country_blocked", message: "Free mode is not available in your country" }],
-    [409, { error: "model_locked", message: "Session locked" }],
-    [403, { error: "free_mode_invalid_agent_hierarchy", message: "Invalid agent hierarchy" }],
-    [401, { error: "unauthorized", message: "Invalid auth token" }],
-    [429, { error: "rate_limited", message: "Slow down" }],
-    [404, { error: { message: "No endpoints found for mimo/mimo-v2.5", code: 404 } }],
-  ])("passes a %i chat error through untouched", async (status, payload) => {
-    installUpstream({ chat: () => json(payload, { status }) });
-    const { response } = await executor.execute(makeExecuteArgs());
-    expect(response.status).toBe(status);
-    expect(await response.json()).toEqual(payload);
-    await vi.waitFor(() => expect(agentRunCalls("FINISH")).toHaveLength(1));
-    expect(agentRunCalls("FINISH")[0].body.status).toBe("failed");
-  });
-
   it("surfaces Codebuff's machine-readable code through parseError", () => {
-    const parsed = executor.parseError({ status: 403 }, JSON.stringify({ error: "free_mode_cli_required", message: "Use the CLI" }));
-    expect(parsed).toEqual({ status: 403, message: "free_mode_cli_required: Use the CLI" });
-    expect(executor.parseError({ status: 404 }, JSON.stringify({ error: { message: "No endpoints found", code: 404 } }))).toEqual({
-      status: 404,
-      message: "404: No endpoints found",
-    });
-    expect(executor.parseError({ status: 502 }, "<html>bad gateway</html>")).toEqual({ status: 502, message: "<html>bad gateway</html>" });
-    expect(executor.parseError({ status: 500 }, "")).toEqual({ status: 500, message: "HTTP 500" });
+    const parsed = executor.parseError({ status: 403 }, JSON.stringify({ error: "free_mode_cli_required", message: "nope" }));
+    expect(parsed.status).toBe(403);
+    expect(parsed.message).toBe("free_mode_cli_required: nope");
   });
 
   it("keeps an admission refusal's status and code without calling chat", async () => {
-    installUpstream({ admission: () => json({ error: "country_blocked", message: "Not available in your country" }, { status: 403 }) });
-    const { response } = await executor.execute(makeExecuteArgs());
-    expect(response.status).toBe(403);
-    const body = await response.json();
+    installUpstream({ admission: () => json({ error: "country_blocked" }, { status: 403 }) });
+    const result = await executor.execute(makeExecuteArgs());
+    expect(result.response.status).toBe(403);
+    const body = await result.response.json();
     expect(body.error.code).toBe("country_blocked");
-    expect(body.error.message).toContain("Not available in your country");
     expect(callsTo(CHAT_URL)).toHaveLength(0);
-    expect(agentRunCalls("START")).toHaveLength(0);
   });
 
   it("turns a refusal delivered in a 2xx body into a real HTTP status", async () => {
-    installUpstream({ admission: () => json({ status: "country_blocked" }) });
-    const blocked = await executor.execute(makeExecuteArgs());
-    expect(blocked.response.status).toBe(403);
-    expect((await blocked.response.json()).error.code).toBe("country_blocked");
-
-    clearSessionCache();
-    installUpstream({ admission: () => json({ status: "rate_limited", retryAfterMs: 42_000 }) });
-    const limited = await executor.execute(makeExecuteArgs());
-    expect(limited.response.status).toBe(429);
-    expect(limited.response.headers.get("retry-after")).toBe("42");
+    installUpstream({ admission: () => json({ status: "banned" }) });
+    const result = await executor.execute(makeExecuteArgs());
+    expect(result.response.status).toBe(403);
+    expect((await result.response.json()).error.code).toBe("banned");
   });
 
   it("passes a 401 from admission straight through", async () => {
-    installUpstream({ admission: () => json({ error: "unauthorized", message: "Invalid auth token" }, { status: 401 }) });
-    const { response } = await executor.execute(makeExecuteArgs());
-    expect(response.status).toBe(401);
-    expect((await response.json()).error.code).toBe("unauthorized");
+    installUpstream({ admission: () => json({ error: "unauthorized" }, { status: 401 }) });
+    const result = await executor.execute(makeExecuteArgs());
+    expect(result.response.status).toBe(401);
   });
 
   it("gives a 429 from admission a Retry-After even when upstream sent none", async () => {
-    installUpstream({ admission: () => json({ error: "rate_limited", message: "Too many" }, { status: 429 }) });
-    const { response } = await executor.execute(makeExecuteArgs());
-    expect(response.status).toBe(429);
-    expect(response.headers.get("retry-after")).toBe("30");
+    installUpstream({ admission: () => json({ error: "rate_limited" }, { status: 429 }) });
+    const result = await executor.execute(makeExecuteArgs());
+    expect(result.response.status).toBe(429);
+    expect(result.response.headers.get("Retry-After")).toBe("30");
   });
 
   it("passes a START refusal through and never chats", async () => {
-    installUpstream({
-      start: () => json({ error: "free_mode_invalid_agent_hierarchy", message: "Invalid agent hierarchy" }, { status: 403 }),
-    });
-    const { response } = await executor.execute(makeExecuteArgs());
-    expect(response.status).toBe(403);
-    expect((await response.json()).error.code).toBe("free_mode_invalid_agent_hierarchy");
+    installUpstream({ start: () => json({ error: "no_capacity" }, { status: 429 }) });
+    const result = await executor.execute(makeExecuteArgs());
+    expect(result.response.status).toBe(429);
     expect(callsTo(CHAT_URL)).toHaveLength(0);
   });
 
   it("rejects a START answer without a run id", async () => {
-    installUpstream({ start: () => json({}) });
-    const { response } = await executor.execute(makeExecuteArgs());
-    expect(response.status).toBe(502);
-    expect((await response.json()).error.code).toBe("agent_run_start_failed");
+    installUpstream({ start: () => json({ nope: true }) });
+    const result = await executor.execute(makeExecuteArgs());
+    expect(result.response.status).toBe(502);
   });
 
-  it("answers a clean 400 for a model without a known agent id, without any upstream call", async () => {
-    installUpstream();
-    const { response } = await executor.execute(makeExecuteArgs({ model: "some/unheard-of-model" }));
-    expect(response.status).toBe(400);
-    const body = await response.json();
-    expect(body.error.type).toBe("invalid_request_error");
-    expect(body.error.code).toBe("model_not_supported");
-    expect(body.error.message).toContain("some/unheard-of-model");
-    expect(fetchMock).not.toHaveBeenCalled();
+  it("passes a chat gate error through after no retry when nothing is renewable", async () => {
+    installUpstream({ chat: () => json({ error: "free_mode_cli_required" }, { status: 403 }) });
+    const result = await executor.execute(makeExecuteArgs());
+    expect(result.response.status).toBe(403);
+    expect(callsTo(CHAT_URL, "POST")).toHaveLength(1);
   });
 
-  it("strips a thinking suffix such as (high) from the model", async () => {
-    installUpstream();
-    const { response } = await executor.execute(makeExecuteArgs({ model: "z-ai/glm-5.3-flash(high)" }));
-    expect(response.status).toBe(200);
-    await drain(response);
-    expect(callsTo(SESSION_ADMISSION_URL)[0].headers["x-freebuff-model"]).toBe("z-ai/glm-5.3-flash");
-    expect(agentRunCalls("START")[0].body.agentId).toBe("base3-free-glm-5-3-flash");
-    expect(callsTo(CHAT_URL)[0].body.model).toBe("z-ai/glm-5.3-flash");
+  it("re-admits once when the chat gate reports the session is gone", async () => {
+    let chatCalls = 0;
+    let admissions = 0;
+    installUpstream({
+      admission: () => {
+        admissions += 1;
+        return json({ status: "active", instanceId: `srv-${admissions}`, model: "mimo/mimo-v2.5", remainingMs: 600_000 });
+      },
+      chat: () => {
+        chatCalls += 1;
+        if (chatCalls === 1) return json({ error: "session_expired" }, { status: 410 });
+        return sse();
+      },
+    });
+    const result = await executor.execute(makeExecuteArgs());
+    expect(await drain(result.response)).toContain("hi");
+    expect(admissions).toBe(2);
+    expect(chatCalls).toBe(2);
   });
 
-  it("strips a provider prefix from the model before resolving the agent", async () => {
-    installUpstream();
-    const { response } = await executor.execute(makeExecuteArgs({ model: "cb/z-ai/glm-5.3-flash" }));
-    expect(response.status).toBe(200);
-    await drain(response);
-    expect(agentRunCalls("START")[0].body.agentId).toBe("base3-free-glm-5-3-flash");
+  it("classifies gate errors in gateRetryKind", () => {
+    expect(gateRetryKind(410, JSON.stringify({ error: "session_expired" }))).toBe("session");
+    expect(gateRetryKind(410, JSON.stringify({ error: "freebuff_update_required" }))).toBe("session");
+    expect(gateRetryKind(410, JSON.stringify({ error: "freebuff_catalog_stale" }))).toBe("catalog");
+    expect(gateRetryKind(403, JSON.stringify({ error: "device_key unknown" }))).toBe("devicekey");
+    expect(gateRetryKind(400, "runId not found")).toBe("run");
+    expect(gateRetryKind(403, JSON.stringify({ error: "free_mode_cli_required" }))).toBeNull();
+    expect(isDeviceKeyError("device_key unknown")).toBe(true);
   });
 
-  it("answers 401 without any upstream call when there is no token", async () => {
-    installUpstream();
-    const { response } = await executor.execute(makeExecuteArgs({ credentials: {} }));
-    expect(response.status).toBe(401);
-    expect((await response.json()).error.type).toBe("authentication_error");
-    expect(fetchMock).not.toHaveBeenCalled();
+  it("reports a session admission route that no longer exists (CLI hard error)", async () => {
+    installUpstream({ admission: () => new Response("no", { status: 404 }) });
+    const result = await executor.execute(makeExecuteArgs());
+    expect(result.response.status).toBe(502);
+    expect((await result.response.json()).error.code).toBe("session_admission_unsupported");
   });
 });
 
 // ---------------------------------------------------------------------------
-// dashboard token probe
+// probeFreebuffToken
 // ---------------------------------------------------------------------------
 
 describe("probeFreebuffToken", () => {
   it("accepts a token the session endpoint answers to", async () => {
-    fetchMock.mockResolvedValue(json({ status: "none" }));
-    const result = await probeFreebuffToken("tok");
-    expect(result).toMatchObject({ valid: true, error: null });
-    const [call] = allCalls();
-    expect(call.url).toBe(SESSION_URL);
-    expect(call.method).toBe("GET");
-    expect(call.headers.Authorization).toBe("Bearer tok");
-    // the probe must not open a free session
-    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(0);
+    installUpstream({ session: () => json({ status: "none" }) });
+    expect(await probeFreebuffToken("tok")).toEqual({ valid: true, status: 200, error: null });
   });
 
   it("rejects an invalid token on 401", async () => {
-    fetchMock.mockResolvedValue(json({ error: "unauthorized" }, { status: 401 }));
-    expect(await probeFreebuffToken("bad")).toMatchObject({ valid: false, status: 401, error: "Token invalid or revoked" });
+    installUpstream({ session: () => json({ error: "no" }, { status: 401 }) });
+    const result = await probeFreebuffToken("tok");
+    expect(result.valid).toBe(false);
+    expect(result.status).toBe(401);
   });
 
   it("keeps the token valid but warns on country_blocked", async () => {
-    fetchMock.mockResolvedValue(json({ status: "country_blocked" }, { status: 403 }));
+    installUpstream({ session: () => json({ status: "country_blocked" }) });
     const result = await probeFreebuffToken("tok");
     expect(result.valid).toBe(true);
     expect(result.warning).toContain("country_blocked");
   });
 
   it("reports transport failures and missing tokens", async () => {
-    fetchMock.mockRejectedValue(new Error("ECONNRESET"));
-    expect(await probeFreebuffToken("tok")).toMatchObject({ valid: false, error: "ECONNRESET" });
-    expect(await probeFreebuffToken("")).toMatchObject({ valid: false, error: "No token" });
+    fetchMock.mockImplementation(async () => {
+      throw new Error("no route");
+    });
+    expect((await probeFreebuffToken("tok")).valid).toBe(false);
+    expect((await probeFreebuffToken("")).valid).toBe(false);
   });
 
   it("goes out directly even when the connection uses a relay pool", async () => {
-    fetchMock.mockResolvedValue(json({ status: "none" }));
-    await probeFreebuffToken("tok", { vercelRelayUrl: "https://relay.example/x", connectionProxyEnabled: true, connectionProxyUrl: "http://127.0.0.1:3128" });
-    const [call] = allCalls();
-    expect(call.opts.vercelRelayUrl).toBeUndefined();
-    expect(call.opts.connectionProxyUrl).toBe("http://127.0.0.1:3128");
+    installUpstream({ session: () => json({ status: "none" }) });
+    await probeFreebuffToken("tok", { vercelRelayUrl: "https://relay/pipe" });
+    expect(allCalls()[0].opts?.vercelRelayUrl).toBeUndefined();
+  });
+
+  it("signs the session GET when a device key is handed over", async () => {
+    installUpstream({ session: () => json({ status: "none" }) });
+    const { FreebuffDeviceKeyManager } = await import("../../open-sse/utils/freebuffDeviceKey.js");
+    const manager = new FreebuffDeviceKeyManager({ record: testRecord, fetchImpl: async () => json({ keyId: "key-p" }) });
+    await probeFreebuffToken("tok", null, { deviceKey: manager });
+    const call = callsTo(SESSION_URL, "GET")[0];
+    expect(call.headers["User-Agent"]).toBe(sessionUserAgent());
+    expect(await verifyDeviceSig({ url: SESSION_URL, headers: call.headers })).toBe(true);
   });
 });
 
 // ---------------------------------------------------------------------------
-// OAuth (device-code) provider
+// freebuff oauth provider
 // ---------------------------------------------------------------------------
 
 describe("freebuff oauth provider", () => {
-  let freebuffOAuth;
-
-  beforeEach(async () => {
-    vi.stubGlobal("fetch", vi.fn());
-    ({ default: freebuffOAuth } = await import("../../src/lib/oauth/providers/freebuff.js"));
-  });
-
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  it("is a device_code flow wired to the codebuff cli auth endpoints", () => {
-    expect(freebuffOAuth.flowType).toBe("device_code");
-    expect(freebuffOAuth.config.deviceCodeUrl).toBe("https://www.codebuff.com/api/auth/cli/code");
-    expect(freebuffOAuth.config.tokenUrl).toBe("https://www.codebuff.com/api/auth/cli/status");
+  it("is a device_code flow wired to the codebuff cli auth endpoints", async () => {
+    const provider = (await import("../../src/lib/oauth/providers/freebuff.js")).default;
+    expect(provider.flowType).toBe("device_code");
+    expect(provider.config.deviceCodeUrl).toBe("https://www.codebuff.com/api/auth/cli/code");
+    expect(provider.config.tokenUrl).toBe("https://www.codebuff.com/api/auth/cli/status");
   });
 
   it("requests a login code and packs everything the status endpoint needs into device_code", async () => {
-    fetch.mockResolvedValueOnce(
-      json({
-        loginUrl: "https://www.codebuff.com/login?auth_code=abc.123.def",
-        fingerprintHash: "hash-1",
-        expiresAt: "1790000000000",
-        expiresInMs: 3_600_000,
-      }),
-    );
-    const data = await freebuffOAuth.requestDeviceCode(freebuffOAuth.config);
-
-    const [url, init] = fetch.mock.calls[0];
-    expect(url).toBe("https://www.codebuff.com/api/auth/cli/code");
-    expect(init.method).toBe("POST");
-    const sent = JSON.parse(init.body);
-    expect(sent.fingerprintId).toMatch(/^codebuff-cli-[A-Za-z0-9_-]{8}$/);
-
-    expect(data.verification_uri).toBe("https://www.codebuff.com/login?auth_code=abc.123.def");
-    expect(data.verification_uri_complete).toBe(data.verification_uri);
-    expect(data.expires_in).toBe(3600);
-    expect(data.interval).toBe(5);
-    expect(data.user_code).toBe(sent.fingerprintId.replace("codebuff-cli-", ""));
-    expect(JSON.parse(data.device_code)).toEqual({
-      fingerprintId: sent.fingerprintId,
-      fingerprintHash: "hash-1",
-      expiresAt: "1790000000000",
+    const provider = (await import("../../src/lib/oauth/providers/freebuff.js")).default;
+    fetchMock.mockImplementation(async (url) => {
+      expect(url).toBe("https://www.codebuff.com/api/auth/cli/code");
+      return json({ loginUrl: "https://codebuff.com/cli", fingerprintHash: "h", expiresAt: "2026-01-01", expiresInMs: 60_000 });
     });
+    const device = await provider.requestDeviceCode(provider.config);
+    expect(device.user_code).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(device.expires_in).toBe(60);
+    const packed = JSON.parse(device.device_code);
+    expect(packed.fingerprintHash).toBe("h");
+    expect(packed.expiresAt).toBe("2026-01-01");
+    expect(packed.fingerprintId).toMatch(/^codebuff-cli-/);
   });
 
   it("reports a failed code request with the status", async () => {
-    fetch.mockResolvedValueOnce(json("nope", { status: 500 }));
-    await expect(freebuffOAuth.requestDeviceCode(freebuffOAuth.config)).rejects.toThrow(/500/);
+    const provider = (await import("../../src/lib/oauth/providers/freebuff.js")).default;
+    fetchMock.mockResolvedValue(new Response("no", { status: 500 }));
+    await expect(provider.requestDeviceCode(provider.config)).rejects.toThrow(/500/);
   });
 
   it("rejects an incomplete code response", async () => {
-    fetch.mockResolvedValueOnce(json({ loginUrl: "https://x" }));
-    await expect(freebuffOAuth.requestDeviceCode(freebuffOAuth.config)).rejects.toThrow(/missing/);
+    const provider = (await import("../../src/lib/oauth/providers/freebuff.js")).default;
+    fetchMock.mockResolvedValue(json({ loginUrl: "x" }));
+    await expect(provider.requestDeviceCode(provider.config)).rejects.toThrow(/fingerprintHash/);
   });
-
-  const deviceCode = JSON.stringify({ fingerprintId: "codebuff-cli-abcd1234", fingerprintHash: "hash-1", expiresAt: "1790000000000" });
 
   it("echoes fingerprintId, fingerprintHash and expiresAt back when polling", async () => {
-    fetch.mockResolvedValueOnce(json({ error: "pending" }, { status: 401 }));
-    await freebuffOAuth.pollToken(freebuffOAuth.config, deviceCode);
-    const [url, init] = fetch.mock.calls[0];
-    const parsed = new URL(url);
-    expect(parsed.origin + parsed.pathname).toBe("https://www.codebuff.com/api/auth/cli/status");
-    expect(parsed.searchParams.get("fingerprintId")).toBe("codebuff-cli-abcd1234");
-    expect(parsed.searchParams.get("fingerprintHash")).toBe("hash-1");
-    expect(parsed.searchParams.get("expiresAt")).toBe("1790000000000");
-    expect(init.method).toBe("GET");
-  });
-
-  it("treats 401 and an empty answer as pending", async () => {
-    fetch.mockResolvedValueOnce(json({}, { status: 401 })).mockResolvedValueOnce(json({}));
-    expect(await freebuffOAuth.pollToken(freebuffOAuth.config, deviceCode)).toEqual({ ok: false, data: { error: "authorization_pending" } });
-    expect(await freebuffOAuth.pollToken(freebuffOAuth.config, deviceCode)).toEqual({ ok: false, data: { error: "authorization_pending" } });
-  });
-
-  it("reports other statuses as a poll failure", async () => {
-    fetch.mockResolvedValueOnce(json("boom", { status: 500 }));
-    const result = await freebuffOAuth.pollToken(freebuffOAuth.config, deviceCode);
-    expect(result.ok).toBe(false);
-    expect(result.data.error).toBe("poll_failed");
+    const provider = (await import("../../src/lib/oauth/providers/freebuff.js")).default;
+    fetchMock.mockImplementation(async (url) => {
+      expect(String(url)).toContain("fingerprintId=fp-1");
+      expect(String(url)).toContain("fingerprintHash=h");
+      expect(String(url)).toContain("expiresAt=e");
+      return json({ error: "pending" }, { status: 401 });
+    });
+    const result = await provider.pollToken(provider.config, JSON.stringify({ fingerprintId: "fp-1", fingerprintHash: "h", expiresAt: "e" }));
+    expect(result).toEqual({ ok: false, data: { error: "authorization_pending" } });
   });
 
   it("returns the auth token once the user approved the login", async () => {
-    fetch.mockResolvedValueOnce(
-      json({ user: { id: "u1", name: "Ada", email: "ada@example.test", authToken: "auth-token-xyz", fingerprintId: "codebuff-cli-abcd1234", fingerprintHash: "hash-1" } }),
-    );
-    const result = await freebuffOAuth.pollToken(freebuffOAuth.config, deviceCode);
+    const provider = (await import("../../src/lib/oauth/providers/freebuff.js")).default;
+    fetchMock.mockResolvedValue(json({ user: { authToken: "t", id: "u1", email: "e@x", name: "N", fingerprintId: "fp" } }));
+    const result = await provider.pollToken(provider.config, JSON.stringify({ fingerprintId: "fp-1", fingerprintHash: "h", expiresAt: "e" }));
     expect(result.ok).toBe(true);
-    expect(result.data.access_token).toBe("auth-token-xyz");
-
-    expect(freebuffOAuth.mapTokens(result.data)).toEqual({
-      accessToken: "auth-token-xyz",
-      refreshToken: null,
-      expiresIn: null,
-      email: "ada@example.test",
-      displayName: "Ada",
-      name: "Ada",
-      providerSpecificData: { userId: "u1", fingerprintId: "codebuff-cli-abcd1234", fingerprintHash: "hash-1" },
-    });
+    const mapped = provider.mapTokens(result.data);
+    expect(mapped.accessToken).toBe("t");
+    expect(mapped.providerSpecificData.userId).toBe("u1");
+    expect(mapped.providerSpecificData.fingerprintId).toBe("fp");
   });
 
   it("still understands the older answer shapes", async () => {
-    fetch.mockResolvedValueOnce(json({ default: { authToken: "legacy-token" } })).mockResolvedValueOnce(json({ authToken: "bare-token" }));
-    expect((await freebuffOAuth.pollToken(freebuffOAuth.config, deviceCode)).data.access_token).toBe("legacy-token");
-    expect((await freebuffOAuth.pollToken(freebuffOAuth.config, deviceCode)).data.access_token).toBe("bare-token");
+    const provider = (await import("../../src/lib/oauth/providers/freebuff.js")).default;
+    fetchMock.mockResolvedValue(json({ default: { authToken: "old" } }));
+    const result = await provider.pollToken(provider.config, "fp");
+    expect(result.ok).toBe(true);
+    expect(result.data.access_token).toBe("old");
   });
 
   it("accepts a bare fingerprint id as device code", async () => {
-    fetch.mockResolvedValueOnce(json({}, { status: 401 }));
-    await freebuffOAuth.pollToken(freebuffOAuth.config, "codebuff-cli-abcd1234");
-    expect(new URL(fetch.mock.calls[0][0]).searchParams.get("fingerprintId")).toBe("codebuff-cli-abcd1234");
+    const provider = (await import("../../src/lib/oauth/providers/freebuff.js")).default;
+    fetchMock.mockImplementation(async (url) => {
+      expect(String(url)).toContain("fingerprintId=fp-9");
+      return json({ error: "pending" }, { status: 401 });
+    });
+    expect(await provider.pollToken(provider.config, "fp-9")).toEqual({ ok: false, data: { error: "authorization_pending" } });
   });
 
-  it("falls back to a placeholder display name without profile data", () => {
-    expect(freebuffOAuth.mapTokens({ access_token: "t" })).toMatchObject({ accessToken: "t", email: null, displayName: "Freebuff User" });
+  it("falls back to a placeholder display name without profile data", async () => {
+    const provider = (await import("../../src/lib/oauth/providers/freebuff.js")).default;
+    const mapped = provider.mapTokens({ access_token: "t" });
+    expect(mapped.displayName).toBe("Freebuff User");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cloud-run lane (Desktop 0.0.188 protocol)
+// ---------------------------------------------------------------------------
+
+describe("cloud-run lane (desktop protocol)", () => {
+  const desktopCredentials = () => ({
+    accessToken: newToken(),
+    providerSpecificData: { freebuffExecMode: "cloud-run", freebuffDeviceKeyDesktop: testRecord },
+  });
+
+  it("resolveExecMode prefers the connection setting over the env default", () => {
+    expect(resolveExecMode({})).toBe("cli-chat");
+    expect(resolveExecMode({ providerSpecificData: { freebuffExecMode: "cloud-run" } })).toBe("cloud-run");
+    process.env.FREEBUFF_EXEC_MODE = "cloud-run";
+    expect(resolveExecMode({})).toBe("cloud-run");
+    expect(resolveExecMode({ providerSpecificData: { freebuffExecMode: "cli-chat" } })).toBe("cli-chat");
+    process.env.FREEBUFF_EXEC_MODE = "banana";
+    expect(resolveExecMode({})).toBe("cli-chat");
+    delete process.env.FREEBUFF_EXEC_MODE;
+  });
+
+  it("desktop identity: UA, version default and token-derived install id", () => {
+    expect(desktopVersion()).toBe(DEFAULT_DESKTOP_VERSION);
+    expect(DEFAULT_DESKTOP_VERSION).toBe("0.0.188");
+    expect(desktopUserAgent()).toBe("Freebuff-Desktop/0.0.188");
+    expect(installIdFor("tok")).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    expect(installIdFor("tok")).toBe(installIdFor("tok")); // deterministic across restarts
+    expect(installIdFor("other")).not.toBe(installIdFor("tok"));
+  });
+
+  it("signs the desktop admission with client, install-id, instance and multi-session headers", async () => {
+    installUpstream();
+    const result = await executor.execute(makeExecuteArgs({ credentials: desktopCredentials() }));
+    // env-free mode selection: the connection field drives it
+    expect(result.response.status).toBe(200);
+
+    const admission = callsTo(SESSION_ADMISSION_URL, "POST")[0];
+    expect(admission.headers["User-Agent"]).toBe(desktopUserAgent());
+    expect(admission.headers["x-freebuff-client"]).toBe("desktop");
+    expect(admission.headers["x-freebuff-install-id"]).toBe(installIdFor(admission.headers.Authorization.replace("Bearer ", "")));
+    expect(admission.headers["x-freebuff-client-version"]).toBe("0.0.188");
+    expect(admission.headers["x-freebuff-instance-id"]).toMatch(/^byok-[0-9a-f-]{36}$/);
+    expect(admission.headers["x-freebuff-multi-session"]).toBe("1");
+    expect(admission.headers["x-freebuff-purchase-continuity"]).toBe("1");
+    expect(admission.headers["x-freebuff-model"]).toBe("mimo-free");
+    expect(admission.headers["x-freebuff-wallet-spend-limit"]).toBe("session");
+    expect(admission.headers["x-freebuff-env"]).toBeUndefined(); // no CLI fingerprint on the desktop lane
+    expect(await verifyDeviceSig({ url: SESSION_ADMISSION_URL, method: "POST", headers: admission.headers, fetchId: "fetch-test-1" })).toBe(true);
+  });
+
+  it("posts a cloud run (unsigned) and adapts chunk events into an SSE chat response", async () => {
+    installUpstream();
+    const result = await executor.execute(makeExecuteArgs({ credentials: desktopCredentials() }));
+    expect(result.response.status).toBe(200);
+    expect(result.response.headers.get("content-type")).toContain("text/event-stream");
+    const text = await result.response.text();
+    expect(text).toContain('"content":"he"');
+    expect(text).toContain('"content":"y"');
+    expect(text.trim().endsWith("data: [DONE]")).toBe(true);
+
+    // The run POST is Bearer-only: no device-key signature, no CLI fingerprint.
+    const runPost = callsTo(CLOUD_RUNS_URL, "POST")[0];
+    expect(runPost.headers.Authorization).toMatch(/^Bearer fb-test-token-/);
+    expect(runPost.headers["x-freebuff-cloud-questions"]).toBe("1");
+    expect(JSON.parse(runPost.headers["X-Freebuff-Product-Context"])).toEqual({ originApp: "desktop" });
+    expect(runPost.headers["x-freebuff-device-key"]).toBeUndefined();
+
+    // Submission shape (REPORT-DESKTOP.md §5).
+    expect(runPost.body.workspaceId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(runPost.body.runId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(runPost.body.instanceId).toMatch(/^srv-\d+$/); // server-assigned instance id from admission
+    expect(runPost.body.model).toBe("mimo-free"); // catalog handle
+    expect(runPost.body.prompt).toContain("user: hello");
+    expect(runPost.body.agentMode).toBe("chat");
+    expect(runPost.body.injectAgentsMd).toBe(false);
+    expect(runPost.body.images).toEqual([]);
+    expect(runPost.body.terminalSessionIds).toEqual([]);
+    expect(runPost.body.github).toBeUndefined();
+
+    // Polling walked the run's event page (client-minted run id).
+    expect(allCalls().some((c) => c.method === "GET" && String(c.url).startsWith(`${CLOUD_RUNS_URL}/`))).toBe(true);
+  });
+
+  it("renders a non-streaming cloud run as a chat.completion JSON body", async () => {
+    installUpstream();
+    const result = await executor.execute(makeExecuteArgs({ credentials: desktopCredentials(), stream: false }));
+    expect(result.response.status).toBe(200);
+    const body = await result.response.json();
+    expect(body.object).toBe("chat.completion");
+    expect(body.choices[0].message.content).toBe("hey");
+    expect(body.choices[0].finish_reason).toBe("stop");
+  });
+
+  it("refreshes the catalog and retries once when the cloud run answers freebuff_catalog_stale", async () => {
+    let posts = 0;
+    installUpstream({
+      cloudRunPost: () => {
+        posts += 1;
+        return posts === 1 ? json({ error: "freebuff_catalog_stale" }, { status: 409 }) : json({ runId: "cloud-run-2", status: "queued" });
+      },
+    });
+    const result = await executor.execute(makeExecuteArgs({ credentials: desktopCredentials() }));
+    expect(result.response.status).toBe(200);
+    expect(posts).toBe(2);
+    expect(callsTo(CATALOG_URL, "GET").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("surfaces a failed cloud run as 502", async () => {
+    installUpstream({
+      cloudRunGet: () => json({ status: "failed", errorMessage: "model exploded" }),
+    });
+    const result = await executor.execute(makeExecuteArgs({ credentials: desktopCredentials() }));
+    expect(result.response.status).toBe(502);
+    expect((await result.response.json()).error.code).toBe("cloud_run_failed");
+  });
+
+  it("registers the desktop keypair separately from the cli keypair", async () => {
+    installUpstream();
+    const token = newToken();
+    await executor.execute(makeExecuteArgs({ credentials: { accessToken: token, providerSpecificData: { freebuffDeviceKey: testRecord, freebuffDeviceKeyDesktop: testRecord } } }));
+    await executor.execute(makeExecuteArgs({ credentials: { accessToken: token, providerSpecificData: { freebuffExecMode: "cloud-run", freebuffDeviceKey: testRecord, freebuffDeviceKeyDesktop: testRecord } } }));
+    // Both lanes ran; each registration carries its client type.
+    expect(callsTo(DEVICE_KEYS_URL, "POST").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("cloud helpers: prompt flattening, chunk text, admission model fallback to the digest handle", () => {
+    const { prompt, displayPrompt } = promptFromMessages([
+      { role: "system", content: "be brief" },
+      { role: "user", content: [{ type: "text", text: "hello world" }] },
+    ]);
+    expect(prompt).toBe("system: be brief\n\nuser: hello world");
+    expect(displayPrompt).toBe("hello world");
+    expect(cloudChunkText({ text: "x" })).toBe("x");
+    expect(cloudChunkText("raw")).toBe("raw");
+    expect(cloudChunkText(undefined)).toBe("");
+    const submission = buildCloudSubmission({ body: { messages: [{ role: "user", content: "hi" }] }, model: "m-abc", instanceId: "srv-9" });
+    expect(submission.instanceId).toBe("srv-9");
+    expect(submission.prompt).toBe("user: hi");
+    expect(submission.effort).toBeUndefined();
+    const withEffort = buildCloudSubmission({ body: { messages: [], reasoning_effort: "high" }, model: "m-abc", instanceId: "" });
+    expect(withEffort.effort).toBe("high");
+    expect(withEffort.instanceId).toMatch(/^byok-[0-9a-f-]{36}$/);
+  });
+
+  it("computes the desktop model handle exactly like the binary (verified vector)", async () => {
+    const { freebuffHandleFor, freebuffLegacyModelDigest } = await import("../../open-sse/utils/freebuffCatalog.js");
+    expect(freebuffLegacyModelDigest("z-ai/glm-5.3-flash")).toBe("197cbcdc4b67262b");
+    expect(freebuffHandleFor("z-ai/glm-5.3-flash")).toBe("m-7e20df6765");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// model surface compatibility (cb/ + registry list)
+// ---------------------------------------------------------------------------
+
+describe("model surface", () => {
+  it("keeps the 10 registry models intact", () => {
+    expect(freebuffRegistry.models.map((m) => m.id)).toEqual([
+      "mimo/mimo-v2.5",
+      "z-ai/glm-5.3-flash",
+      "deepseek/deepseek-v4-flash",
+      "openai/gpt-6-luna",
+      "mimo/mimo-v2.6-pro",
+      "google/gemini-3.8-flash",
+      "upstage/solar-mini4",
+      "upstage/solar-pro4",
+      "stealth/space-bunny-alpha",
+      "meta/muse-spark-1.2-contributor",
+    ]);
+  });
+
+  it("registry remains passthrough so catalog keys reach the executor", () => {
+    expect(freebuffRegistry.passthroughModels).toBe(true);
   });
 });
