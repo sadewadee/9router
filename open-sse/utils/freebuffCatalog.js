@@ -113,15 +113,16 @@ export function invalidateFreebuffCatalog(tokenHash = null) {
   }
 }
 
-// The admission (x-freebuff-model) and cloud-run model fields must be a key straight from the
-// live catalog (rows are keyed "m-<10hex>"; handles are "fbm1..." opaque tokens). Live probe:
-// anything else — including the legacy fnv-derived handle — is rejected with 409
-// freebuff_catalog_stale. No row for the model -> null; the caller answers 502 invalid_model
-// instead of guessing. Callers should prefer row.key; row.handle is passed through only when a
-// row carries one the server currently accepts.
+// The admission (x-freebuff-model) field must carry the catalog row's opaque handle ("fbm1...",
+// ~116 chars), NOT the row key (rows are keyed "m-<10hex>"). Live bisect 2026-10-27: handle -> 200,
+// key -> 409 freebuff_catalog_stale, stale handles from a previous catalog generation are still
+// accepted (the server does not compare them against fetchId). The chat body and /v1/models keep
+// using the row KEY — the admission answer normalises its `model` back to the key. The legacy fnv
+// digest is diagnostic only and never goes out. No row for the model -> null; the caller answers
+// 502 invalid_model instead of guessing. A row without a handle falls back to its key.
 export function resolveAdmissionModel(catalog, modelKey) {
   const row = visibleRows(catalog).find((candidate) => candidate.key === modelKey);
-  return row ? row.key || row.handle || null : null;
+  return row ? row.handle || row.key || null : null;
 }
 
 async function fetchOnce({ token, deviceKey, accountId, client, proxyFetch, proxyOptions, signal, log }) {
