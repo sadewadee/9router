@@ -163,13 +163,17 @@ function installUpstream(overrides = {}) {
   const handlers = {
     deviceKeys: () => json({ keyId: "key-test-1" }),
     catalog: () => json(catalogBody),
-    admission: (headers) =>
-      json({
+    admission: (headers) => {
+      const sent = headers["x-freebuff-model"];
+      // The live server normalises the admitted opaque handle back to the catalog row key.
+      const row = catalogBody.rows.find((candidate) => candidate.handle === sent);
+      return json({
         status: "active",
         instanceId: `srv-${++instanceSeq}`,
-        model: headers["x-freebuff-model"], // the server echoes the admitted key
+        model: row ? row.key : sent,
         remainingMs: 600_000,
-      }),
+      });
+    },
     session: () => json({ status: "none" }),
     start: () => json({ runId: `run-${++runSeq}` }),
     finish: () => json({}),
@@ -656,7 +660,7 @@ describe("execute: signed handshake", () => {
     expect(admission.headers["x-freebuff-client-version"]).toBe(cliVersion());
     expect(admission.headers["x-fb-timezone"]).toBeTruthy();
     expect(admission.headers["x-freebuff-env"]).toBe(clientEnv());
-    expect(admission.headers["x-freebuff-model"]).toBe("mimo/mimo-v2.5"); // live catalog row key
+    expect(admission.headers["x-freebuff-model"]).toBe("fbm1.AAEmimoAlias"); // live catalog row handle (bisect 2026-10-27: handle 200, key 409)
     expect(admission.headers["x-freebuff-wallet-spend-limit"]).toBe("session");
     expect(admission.headers["x-freebuff-catalog-fetch"]).toBe("fetch-test-1");
     expect(admission.headers["x-freebuff-catalog-protocol"]).toBe("1");
@@ -694,6 +698,19 @@ describe("execute: signed handshake", () => {
     expect(chat.body.codebuff_metadata.run_id).toMatch(/^run-\d+$/);
     expect(chat.body.codebuff_metadata.freebuff_instance_id).toMatch(/^srv-\d+$/);
     expect(chat.body.codebuff_metadata.surface).toBeUndefined(); // server-assigned id, no cli: claim
+  });
+
+  it("admits with the catalog row handle while the chat body keeps the row key", async () => {
+    installUpstream();
+    const result = await executor.execute(makeExecuteArgs());
+    await drain(result.response);
+    const admission = callsTo(SESSION_ADMISSION_URL, "POST")[0];
+    const chat = callsTo(CHAT_URL, "POST")[0];
+    // Live bisect 2026-10-27: the admission header must be the opaque "fbm1..." handle or the
+    // server answers 409 freebuff_catalog_stale; the chat body model stays the row key.
+    expect(admission.headers["x-freebuff-model"]).toBe("fbm1.AAEmimoAlias");
+    expect(admission.headers["x-freebuff-model"]).not.toBe("mimo/mimo-v2.5");
+    expect(chat.body.model).toBe("mimo/mimo-v2.5");
   });
 
   it("starts and finishes an agent run around the chat (rotation disabled)", async () => {
@@ -927,11 +944,16 @@ describe("freebuff catalog cache", () => {
     delete process.env.FREEBUFF_CATALOG_TTL_MS;
   });
 
-  it("resolves the admission model through the live catalog row key (never a fabricated handle)", () => {
+  it("resolves the admission model to the live catalog row handle (bisect 2026-10-27: handle 200, key 409)", () => {
     const catalog = { rows: [{ key: "m-00032eaeec", handle: "fbm1.AAE..." }] };
-    expect(resolveAdmissionModel(catalog, "m-00032eaeec")).toBe("m-00032eaeec");
+    expect(resolveAdmissionModel(catalog, "m-00032eaeec")).toBe("fbm1.AAE...");
     expect(resolveAdmissionModel(catalog, "unknown/key")).toBeNull();
     expect(resolveAdmissionModel(null, "m-00032eaeec")).toBeNull(); // passthrough is the caller's job
+  });
+
+  it("falls back to the row key only when the row carries no handle", () => {
+    const catalog = { rows: [{ key: "m-00032eaeec" }] };
+    expect(resolveAdmissionModel(catalog, "m-00032eaeec")).toBe("m-00032eaeec");
   });
 });
 
@@ -1705,7 +1727,7 @@ describe("cloud-run lane (desktop protocol)", () => {
     expect(admission.headers["x-freebuff-instance-id"]).toMatch(/^byok-[0-9a-f-]{36}$/);
     expect(admission.headers["x-freebuff-multi-session"]).toBe("1");
     expect(admission.headers["x-freebuff-purchase-continuity"]).toBe("1");
-    expect(admission.headers["x-freebuff-model"]).toBe("mimo/mimo-v2.5");
+    expect(admission.headers["x-freebuff-model"]).toBe("fbm1.AAEmimoAlias"); // catalog row handle
     expect(admission.headers["x-freebuff-wallet-spend-limit"]).toBe("session");
     expect(admission.headers["x-freebuff-env"]).toBeUndefined(); // no CLI fingerprint on the desktop lane
     expect(await verifyDeviceSig({ url: SESSION_ADMISSION_URL, method: "POST", headers: admission.headers, fetchId: "fetch-test-1" })).toBe(true);
