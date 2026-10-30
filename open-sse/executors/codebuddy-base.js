@@ -38,9 +38,17 @@ export function isLegacyRequest(body, env = process.env) {
 //    message": {"error":{"message":"内容违规","type":"content_policy_violation"}}).
 //  - model return error: the generic message CodeBuddy answered when its content
 //    filter tripped (#2071, see executors/codebuddy-cn.js history).
+//  - code 11128 + msg "Illegal API invocation from an unapproved channel": the
+//    fingerprint WAF of the CodeBuddy/WorkBuddy intl gateway (workbuddy2api-hub
+//    wb_proxy.py, SANITIZE_*; production HTTP 400 on wb/deepseek-v4.1-flash,
+//    2026-10-30). Matched on `code` + `msg` only, never on `displayTips`: the other
+//    11128 variants ("conversation id missing", "first message is not system
+//    prompt") are request-shape errors the legacy transform cannot fix.
 // Credit/auth errors (HTTP 401/402/429, code 14018 "Credits exhausted") are
 // never content-filter rejections — see isContentFilterRejection.
 const CONTENT_FILTER_SIGNATURES = [/content_policy_violation/i, /内容违规/, /model return error/i];
+const CHANNEL_REJECTION_CODE = 11128;
+const CHANNEL_REJECTION_MSG = /unapproved channel|illegal api invocation/i;
 const NEVER_CONTENT_FILTER_STATUS = new Set([401, 402, 429]);
 const NEVER_CONTENT_FILTER_CODES = new Set([14018]);
 const ERROR_BODY_SAMPLE = 4096;
@@ -50,8 +58,10 @@ export function matchesContentFilterBody(text) {
   if (typeof text !== "string" || !text) return false;
   const sample = text.slice(0, ERROR_BODY_SAMPLE);
   try {
-    const code = Number(JSON.parse(sample)?.code);
+    const parsed = JSON.parse(sample);
+    const code = Number(parsed?.code);
     if (NEVER_CONTENT_FILTER_CODES.has(code)) return false;
+    if (code === CHANNEL_REJECTION_CODE && typeof parsed?.msg === "string" && CHANNEL_REJECTION_MSG.test(parsed.msg)) return true;
   } catch { /* not JSON: fall through to the signature match */ }
   return CONTENT_FILTER_SIGNATURES.some((re) => re.test(sample));
 }

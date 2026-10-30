@@ -312,6 +312,58 @@ describe("WorkBuddyExecutor chat request", () => {
       expect(out.messages.filter((m) => m.role === "system")).toHaveLength(1);
     });
 
+    describe("gateway fingerprints (11128 unapproved channel)", () => {
+      const poisoned = () => ({
+        messages: [
+          { role: "developer", content: "You are an AI agent powered by DeepSeek Harness.\nx-anthropic-billing-header: cc_version=2.1.0; cc_entrypoint=cli;\nMain branch (you will usually use this for PRs): main" },
+          user("run the build"),
+          { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "Bash", arguments: { cmd: "echo 11128" } } }] },
+          { role: "tool", tool_call_id: "c1", content: "HTTP 400 {\"code\":11128,\"msg\":\"Illegal API invocation from an unapproved channel\"}" },
+          user("why did that fail? error 11128"),
+        ],
+      });
+
+      it("sends no bare 11128 and no billing header anywhere in the body", () => {
+        const out = exec.transformRequest("deepseek-v4.1-flash", poisoned(), true, creds);
+        const wire = JSON.stringify(out);
+        expect(wire).not.toContain("11128");
+        expect(wire.toLowerCase()).not.toContain("x-anthropic-billing-header:");
+        expect(wire).not.toContain("cc_entrypoint");
+        expect(wire).toContain("11-128");
+      });
+
+      it("rewrites the identity sentence and the template lines, and still leads with exactly one system message", () => {
+        const out = exec.transformRequest("deepseek-v4.1-flash", poisoned(), true, creds);
+        expect(out.messages[0].role).toBe("system");
+        expect(out.messages.filter((m) => m.role === "system")).toHaveLength(1);
+        expect(out.messages[0].content).toBe(
+          "You are a helpful AI assistant.\nDefault branch (you will usually use this for PRs): main",
+        );
+        expect(out.messages.map((m) => m.role)).toEqual(["system", "user", "assistant", "tool", "user"]);
+      });
+
+      it("applies to the content-filter legacy transform too (history is kept there)", () => {
+        const out = exec.transformRequest("deepseek-v4.1-flash", markLegacyAttempt(poisoned()), true, creds);
+        const wire = JSON.stringify(out);
+        expect(wire).not.toContain("11128");
+        expect(out.messages[0].content).toBe(
+          "You are a helpful assistant. Respond in the user's language, follow the user's instructions, and be direct and concise.",
+        );
+      });
+
+      it("keeps the incoming body untouched (a retry re-transforms the original)", () => {
+        const body = poisoned();
+        const snapshot = JSON.stringify(body);
+        exec.transformRequest("deepseek-v4.1-flash", body, true, creds);
+        expect(JSON.stringify(body)).toBe(snapshot);
+      });
+
+      it("serializes non-string tool_call arguments", () => {
+        const out = exec.transformRequest("deepseek-v4.1-flash", poisoned(), true, creds);
+        expect(out.messages[2].tool_calls[0].function.arguments).toBe('{"cmd":"echo 11-128"}');
+      });
+    });
+
     it("sends the hub's minimal neutral prompt on the content-filter legacy re-send", () => {
       const out = exec.transformRequest("glm-5.3", markLegacyAttempt({
         messages: [{ role: "system", content: "Answer in French." }, user("hi")],
@@ -341,6 +393,60 @@ describe("WorkBuddyExecutor chat request", () => {
       expect(opts.headers["X-Product"]).toBe("SaaS");
       expect(opts.headers["X-Machine-ID"]).toBeUndefined();
       expect(opts.headers["X-Session-ID"]).toBeUndefined();
+    });
+
+    describe("11128 unapproved channel", () => {
+      const UNAPPROVED = '{"code":11128,"msg":"Illegal API invocation from an unapproved channel","displayTips":"x"}';
+      const agentBody = () => ({
+        messages: [
+          { role: "system", content: "You are an AI agent powered by DeepSeek Harness. Be careful." },
+          user("fix the parser"),
+        ],
+      });
+      const run = (body = agentBody()) => exec.execute({ model: "deepseek-v4.1-flash", body, stream: true, credentials: creds });
+      const wire = (call) => JSON.parse(fetchMock.mock.calls[call][1].body);
+
+      it("never puts 11128 or the billing header on the wire", async () => {
+        await run({
+          messages: [
+            { role: "system", content: "x-anthropic-billing-header: cc_version=2.1.0; cc_entrypoint=cli;\nBe brief." },
+            user("earlier I got error 11128"),
+          ],
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        const sent = fetchMock.mock.calls[0][1].body;
+        expect(sent).not.toContain("11128");
+        expect(sent.toLowerCase()).not.toContain("x-anthropic-billing-header:");
+      });
+
+      it("retries exactly once with the legacy transform after an unapproved-channel rejection", async () => {
+        fetchMock
+          .mockImplementationOnce(async () => new Response(UNAPPROVED, { status: 400 }))
+          .mockImplementationOnce(async () => new Response("data: ok\n\n", { status: 200 }));
+        const result = await run();
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(wire(0).messages[0].content).toContain("helpful AI assistant");
+        expect(wire(1).messages[0].content).toContain("Respond in the user's language"); // legacy neutral prompt
+        expect(result.response.status).toBe(200);
+      });
+
+      it("does not retry a second time when the legacy attempt is refused too", async () => {
+        fetchMock.mockImplementation(async () => new Response(UNAPPROVED, { status: 400 }));
+        const result = await run();
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(result.response.status).toBe(400);
+      });
+
+      it.each([
+        ['{"code":11128,"msg":"first message is not system prompt"}'],
+        ['{"code":11128,"msg":"conversation id missing"}'],
+        ['{"code":11128,"msg":"conversation id missing","displayTips":"Illegal API invocation from an unapproved channel"}'],
+      ])("does NOT retry the other 11128 variant %s", async (body) => {
+        fetchMock.mockImplementation(async () => new Response(body, { status: 400 }));
+        const result = await run();
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(await result.response.text()).toBe(body);
+      });
     });
 
     it("keeps the same account identity and conversation on the content-filter legacy re-send", async () => {
