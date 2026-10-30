@@ -16,6 +16,7 @@ import {
   invalidateFreebuffCatalog,
   resolveAdmissionModel,
   resolveCatalogKey,
+  freebuffHandleFor,
   tokenHashOf,
   CATALOG_URL,
   DEVICE_KEYS_URL,
@@ -1636,7 +1637,7 @@ export class FreebuffExecutor extends BaseExecutor {
         // Live rows are keyed "m-<10hex>": the model field must come from the catalog. No row ->
         // 502 invalid_model (the legacy fnv handle is rejected server-side).
         // A human model id maps to its catalog key; per attempt, the catalog can be refetched.
-        const modelKey = catalog ? (resolveCatalogKey(catalog, targetModel) ?? targetModel) : targetModel;
+        const modelKey = catalog ? (resolveCatalogKey(catalog, targetModel) ?? freebuffHandleFor(targetModel)) : freebuffHandleFor(targetModel);
         ctx.admissionModel = resolveModelForAdmission(catalog, modelKey);
 
         session = await getFreebuffSession(token, modelKey, ctx);
@@ -1736,7 +1737,7 @@ export class FreebuffExecutor extends BaseExecutor {
         ctx.fetchId = fetchId;
         ctx.catalog = catalog;
         // A human model id maps to its catalog key; per attempt, the catalog can be refetched.
-        const modelKey = catalog ? (resolveCatalogKey(catalog, targetModel) ?? targetModel) : targetModel;
+        const modelKey = catalog ? (resolveCatalogKey(catalog, targetModel) ?? freebuffHandleFor(targetModel)) : freebuffHandleFor(targetModel);
         ctx.admissionModel = resolveModelForAdmission(catalog, modelKey);
 
         session = await getFreebuffSession(token, modelKey, ctx);
