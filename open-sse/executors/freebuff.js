@@ -15,6 +15,7 @@ import {
   cachedFetchId,
   invalidateFreebuffCatalog,
   resolveAdmissionModel,
+  resolveCatalogKey,
   tokenHashOf,
   CATALOG_URL,
   DEVICE_KEYS_URL,
@@ -717,7 +718,7 @@ function resolveModelForAdmission(catalog, model) {
     throw new FreebuffHttpError(
       502,
       "invalid_model",
-      `Freebuff: model "${model}" is not in the current catalog. Fetch /v1/models for the routable keys.`,
+      `Freebuff: model "${model}" is not in the current catalog (a catalog key or its model id are both accepted). Fetch /v1/models for the routable keys.`,
       { type: "invalid_request_error" },
     );
   }
@@ -1589,9 +1590,11 @@ export class FreebuffExecutor extends BaseExecutor {
         ctx.catalog = catalog;
         // Live rows are keyed "m-<10hex>": the model field must come from the catalog. No row ->
         // 502 invalid_model (the legacy fnv handle is rejected server-side).
-        ctx.admissionModel = resolveModelForAdmission(catalog, targetModel);
+        // A human model id maps to its catalog key; per attempt, the catalog can be refetched.
+        const modelKey = catalog ? (resolveCatalogKey(catalog, targetModel) ?? targetModel) : targetModel;
+        ctx.admissionModel = resolveModelForAdmission(catalog, modelKey);
 
-        session = await getFreebuffSession(token, targetModel, ctx);
+        session = await getFreebuffSession(token, modelKey, ctx);
         submission = buildCloudSubmission({ body, model: session.resolvedModel || ctx.admissionModel, instanceId: session.instanceId, stream });
         runId = submission.runId;
         submissionStr = JSON.stringify(submission);
@@ -1686,9 +1689,11 @@ export class FreebuffExecutor extends BaseExecutor {
         ctx.hasCatalog = Boolean(catalog);
         ctx.fetchId = fetchId;
         ctx.catalog = catalog;
-        ctx.admissionModel = resolveModelForAdmission(catalog, targetModel);
+        // A human model id maps to its catalog key; per attempt, the catalog can be refetched.
+        const modelKey = catalog ? (resolveCatalogKey(catalog, targetModel) ?? targetModel) : targetModel;
+        ctx.admissionModel = resolveModelForAdmission(catalog, modelKey);
 
-        session = await getFreebuffSession(token, targetModel, ctx);
+        session = await getFreebuffSession(token, modelKey, ctx);
         // The static map still covers the legacy ids; every other (live catalog) key rides the
         // generic "codebuff" root agent (live-verified START + chat accept it).
         const agentId = FREEBUFF_AGENT_ID_BY_MODEL[session.resolvedModel] || "codebuff";
