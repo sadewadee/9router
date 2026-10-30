@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { FREEBUFF_CONFIG } from "../constants/oauth.js";
 
-// Device-code sign-in of the official Freebuff Desktop (0.0.188), NOT the Codebuff CLI flow.
+// Device-code sign-in of the official Freebuff Desktop (0.0.200), NOT the Codebuff CLI flow.
 // Mirrors the Desktop orchestrator's Login.issue() / Login.poll(), auth host https://freebuff.com:
 //   POST /api/auth/cli/code   { fingerprintId: <uuid> }                  -> { loginUrl, fingerprintHash, expiresAt, expiresInMs }
 //   GET  /api/auth/cli/status ?fingerprintId&fingerprintHash&expiresAt   -> 401 while pending, { user: { authToken, id, email, name } } once approved
-// The login page is opened with ?desktop_flow=<attemptId> appended to loginUrl. The status endpoint
+// The login page is opened with ?cli_flow=<cliFlowId> appended to loginUrl. The status endpoint
 // verifies an HMAC over (fingerprintId, expiresAt), so all three values must be echoed back unchanged.
 // They travel through the generic device flow packed in the opaque `device_code` string.
 const DEFAULT_AUTH_HOST = "https://freebuff.com";
@@ -16,9 +16,10 @@ const POLL_INTERVAL_SEC = 5;
 const ISSUE_TIMEOUT_MS = 15000;
 const POLL_TIMEOUT_MS = 10000;
 
-// The Desktop orchestrator runs on its bundled Bun (resources/bun/bun.exe = v1.4.2) and sets no
-// User-Agent of its own, so Bun's fetch default goes out. Node's fetch would say "node" instead.
-const DESKTOP_RUNTIME_UA = "Bun/1.4.2";
+// The Desktop identifies as Freebuff-CLI/<version> (CODEBUFF_CLI_VERSION in the binary); Node's fetch
+// would otherwise say "node", so the User-Agent is set explicitly.
+const FREEBUFF_CLI_VERSION = process.env.FREEBUFF_CLI_VERSION || "0.0.200";
+const FREEBUFF_UA = `Freebuff-CLI/${FREEBUFF_CLI_VERSION}`;
 
 function canonicalizeHost(raw) {
   try {
@@ -75,11 +76,11 @@ const freebuff = {
   requestDeviceCode: async (config) => {
     const codeUrl = endpoint(config, "deviceCodeUrl", "/api/auth/cli/code");
     const fingerprintId = randomUUID();
-    const attemptId = randomUUID();
+    const cliFlowId = randomUUID();
 
     const response = await fetch(codeUrl, {
       method: "POST",
-      headers: { "content-type": "application/json", "User-Agent": DESKTOP_RUNTIME_UA },
+      headers: { "content-type": "application/json", "User-Agent": FREEBUFF_UA },
       body: JSON.stringify({ fingerprintId }),
       signal: AbortSignal.timeout(ISSUE_TIMEOUT_MS),
     });
@@ -93,8 +94,7 @@ const freebuff = {
     if (!data || typeof data !== "object") throw new Error("Freebuff device code response is invalid");
 
     const loginUrl = validateLoginUrl(data.loginUrl, new URL(codeUrl).origin);
-    loginUrl.searchParams.set("desktop_flow", attemptId);
-    loginUrl.searchParams.delete("desktop_acquisition"); // no acquisition id outside the Desktop installer
+    loginUrl.searchParams.set("cli_flow", cliFlowId);
 
     const fingerprintHash = typeof data.fingerprintHash === "string" ? data.fingerprintHash.trim() : "";
     if (!fingerprintHash) throw new Error("Freebuff device code response is missing fingerprintHash");
@@ -105,7 +105,7 @@ const freebuff = {
     }
 
     return {
-      device_code: JSON.stringify({ fingerprintId, fingerprintHash, expiresAt, desktopAttemptId: attemptId }),
+      device_code: JSON.stringify({ fingerprintId, fingerprintHash, expiresAt, cliFlowId }),
       // Short form of the fingerprint for the modal; the Desktop login page itself needs no code.
       user_code: fingerprintId.slice(0, 8),
       verification_uri: loginUrl.toString(),
@@ -116,7 +116,7 @@ const freebuff = {
   },
 
   pollToken: async (config, deviceCode) => {
-    const { fingerprintId, fingerprintHash, expiresAt, desktopAttemptId } = parseDeviceCode(deviceCode);
+    const { fingerprintId, fingerprintHash, expiresAt, cliFlowId } = parseDeviceCode(deviceCode);
 
     const url = new URL(endpoint(config, "tokenUrl", "/api/auth/cli/status"));
     if (fingerprintId) url.searchParams.set("fingerprintId", fingerprintId);
@@ -126,7 +126,7 @@ const freebuff = {
     // No custom headers beyond the runtime's own User-Agent, like the Desktop's poll.
     const response = await fetch(url.toString(), {
       method: "GET",
-      headers: { "User-Agent": DESKTOP_RUNTIME_UA },
+      headers: { "User-Agent": FREEBUFF_UA },
       signal: AbortSignal.timeout(POLL_TIMEOUT_MS),
     });
 
@@ -155,7 +155,7 @@ const freebuff = {
           _name: user.name,
           _fingerprintId: user.fingerprintId || fingerprintId,
           _fingerprintHash: user.fingerprintHash || fingerprintHash,
-          _desktopAttemptId: desktopAttemptId,
+          _cliFlowId: cliFlowId,
         },
       };
     }
@@ -175,7 +175,7 @@ const freebuff = {
       fingerprintHash: tokens._fingerprintHash,
       // Tells Desktop-flow connections apart from older ones minted through the Codebuff CLI flow.
       freebuffAuthOrigin: "desktop",
-      desktopAttemptId: tokens._desktopAttemptId,
+      cliFlowId: tokens._cliFlowId,
     },
   }),
 };

@@ -1632,8 +1632,8 @@ describe("freebuff oauth provider (Freebuff Desktop login)", () => {
     const call = allCalls()[0];
     expect(call.url).toBe(CODE_URL);
     expect(call.method).toBe("POST");
-    // Desktop: content-type only; the User-Agent is the bundled Bun's fetch default (Bun 1.4.2).
-    expect(lowerKeys(call.headers)).toEqual({ "content-type": "application/json", "user-agent": "Bun/1.4.2" });
+    // Desktop: content-type plus the Freebuff-CLI/<version> User-Agent (0.0.200).
+    expect(lowerKeys(call.headers)).toEqual({ "content-type": "application/json", "user-agent": "Freebuff-CLI/0.0.200" });
     expect(Object.keys(call.body)).toEqual(["fingerprintId"]);
     expect(call.body.fingerprintId).toMatch(UUID_RE);
   });
@@ -1647,14 +1647,14 @@ describe("freebuff oauth provider (Freebuff Desktop login)", () => {
 
     for (const call of allCalls()) {
       const headers = lowerKeys(call.headers);
-      expect(headers["user-agent"]).toMatch(/^Bun\/\d+\.\d+\.\d+$/);
+      expect(headers["user-agent"]).toMatch(/^Freebuff-CLI\/\d+/);
       expect(headers["user-agent"]).not.toMatch(/Mozilla|Chrome|Safari/);
       expect(headers.accept).toBeUndefined();
       expect(String(call.url)).not.toMatch(/codebuff/i);
     }
   });
 
-  it("packs fingerprint, hash, expiry and attempt id into device_code and opens the desktop_flow login url", async () => {
+  it("packs fingerprint, hash, expiry and cli flow id into device_code and opens the cli_flow login url", async () => {
     const provider = await loadProvider();
     mockCode();
     const device = await provider.requestDeviceCode(provider.config);
@@ -1663,14 +1663,13 @@ describe("freebuff oauth provider (Freebuff Desktop login)", () => {
     expect(packed.fingerprintId).toMatch(UUID_RE);
     expect(packed.fingerprintHash).toBe("h");
     expect(packed.expiresAt).toBe(1790000000000);
-    expect(packed.desktopAttemptId).toMatch(UUID_RE);
-    expect(packed.desktopAttemptId).not.toBe(packed.fingerprintId);
+    expect(packed.cliFlowId).toMatch(UUID_RE);
+    expect(packed.cliFlowId).not.toBe(packed.fingerprintId);
 
     const login = new URL(device.verification_uri);
     expect(login.origin).toBe("https://freebuff.com");
-    expect(login.searchParams.get("desktop_flow")).toBe(packed.desktopAttemptId);
+    expect(login.searchParams.get("cli_flow")).toBe(packed.cliFlowId);
     expect(login.searchParams.get("auth_code")).toBe("abc.def"); // server-issued params survive
-    expect(login.searchParams.has("desktop_acquisition")).toBe(false);
     expect(device.verification_uri_complete).toBe(device.verification_uri);
 
     // The modal code is the first 8 chars of the uuid fingerprint, with no codebuff prefix.
@@ -1680,20 +1679,13 @@ describe("freebuff oauth provider (Freebuff Desktop login)", () => {
     expect(device.interval).toBe(5);
   });
 
-  it("drops a desktop_acquisition param from the login url like the Desktop does without an acquisition id", async () => {
-    const provider = await loadProvider();
-    mockCode({ loginUrl: `${LOGIN_URL}&desktop_acquisition=11111111-1111-4111-8111-111111111111` });
-    const device = await provider.requestDeviceCode(provider.config);
-    expect(new URL(device.verification_uri).searchParams.has("desktop_acquisition")).toBe(false);
-  });
-
-  it("uses a fresh fingerprint and attempt id for every sign-in", async () => {
+  it("uses a fresh fingerprint and cli flow id for every sign-in", async () => {
     const provider = await loadProvider();
     mockCode();
     const a = JSON.parse((await provider.requestDeviceCode(provider.config)).device_code);
     const b = JSON.parse((await provider.requestDeviceCode(provider.config)).device_code);
     expect(a.fingerprintId).not.toBe(b.fingerprintId);
-    expect(a.desktopAttemptId).not.toBe(b.desktopAttemptId);
+    expect(a.cliFlowId).not.toBe(b.cliFlowId);
   });
 
   it("falls back to a one hour lifetime and caps an oversized one at two hours", async () => {
@@ -1751,7 +1743,7 @@ describe("freebuff oauth provider (Freebuff Desktop login)", () => {
     fetchMock.mockImplementation(async () => json({ error: "pending" }, { status: 401 }));
     const result = await provider.pollToken(
       provider.config,
-      JSON.stringify({ fingerprintId: "fp-1", fingerprintHash: "h", expiresAt: 1790000000000, desktopAttemptId: "att" }),
+      JSON.stringify({ fingerprintId: "fp-1", fingerprintHash: "h", expiresAt: 1790000000000, cliFlowId: "att" }),
     );
     expect(result).toEqual({ ok: false, data: { error: "authorization_pending" } });
 
@@ -1760,7 +1752,7 @@ describe("freebuff oauth provider (Freebuff Desktop login)", () => {
     expect(`${url.origin}${url.pathname}`).toBe(STATUS_URL);
     expect(call.method).toBe("GET");
     expect(Object.fromEntries(url.searchParams)).toEqual({ fingerprintId: "fp-1", fingerprintHash: "h", expiresAt: "1790000000000" });
-    expect(lowerKeys(call.headers)).toEqual({ "user-agent": "Bun/1.4.2" });
+    expect(lowerKeys(call.headers)).toEqual({ "user-agent": "Freebuff-CLI/0.0.200" });
     expect(call.body).toBeNull();
   });
 
@@ -1785,7 +1777,7 @@ describe("freebuff oauth provider (Freebuff Desktop login)", () => {
     fetchMock.mockImplementation(async () => json({ user: { authToken: "t", id: "u1", email: "e@x", name: "N" } }));
     const result = await provider.pollToken(
       provider.config,
-      JSON.stringify({ fingerprintId: "fp-1", fingerprintHash: "h", expiresAt: 1, desktopAttemptId: "att-1" }),
+      JSON.stringify({ fingerprintId: "fp-1", fingerprintHash: "h", expiresAt: 1, cliFlowId: "att-1" }),
     );
     expect(result.ok).toBe(true);
     expect(result.data.access_token).toBe("t");
@@ -1800,11 +1792,11 @@ describe("freebuff oauth provider (Freebuff Desktop login)", () => {
       fingerprintId: "fp-1",
       fingerprintHash: "h",
       freebuffAuthOrigin: "desktop",
-      desktopAttemptId: "att-1",
+      cliFlowId: "att-1",
     });
   });
 
-  it("round-trips one sign-in: the polled fingerprint and the stored attempt id match the minted ones", async () => {
+  it("round-trips one sign-in: the polled fingerprint and the stored cli flow id match the minted ones", async () => {
     const provider = await loadProvider();
     fetchMock.mockImplementation(async (url) => {
       if (String(url).startsWith(CODE_URL)) return json(codeBody());
@@ -1818,7 +1810,7 @@ describe("freebuff oauth provider (Freebuff Desktop login)", () => {
     expect(new URL(allCalls()[1].url).searchParams.get("fingerprintId")).toBe(mintedFingerprint);
     expect(stored.fingerprintId).toBe(mintedFingerprint);
     expect(stored.fingerprintId).toMatch(UUID_RE);
-    expect(stored.desktopAttemptId).toBe(new URL(device.verification_uri).searchParams.get("desktop_flow"));
+    expect(stored.cliFlowId).toBe(new URL(device.verification_uri).searchParams.get("cli_flow"));
     expect(stored.freebuffAuthOrigin).toBe("desktop");
   });
 
