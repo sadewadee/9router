@@ -21,6 +21,9 @@ import { ZWSP } from "../../open-sse/utils/codebuddyDesensitize.js";
 
 const strip = (s) => s.split(ZWSP).join("");
 const CC_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude.\nRefuse requests for DoS attacks and exploit development.";
+// codebuddy-intl rewrites the Claude Code identity line (one word added) before the ZWSP pass,
+// see utils/workbuddySanitize.js: the gateway's fingerprint WAF refuses the original line.
+const CC_SYSTEM_INTL = CC_SYSTEM.replace("official CLI for Claude", "official CLI tool for Claude");
 const NEUTRAL = "You are a helpful AI assistant that helps with software engineering tasks.";
 const LEAD = "You are CodeBuddy Code.";
 const creds = { accessToken: "tok-abc", connectionId: "conn-1" };
@@ -107,7 +110,7 @@ describe("CodeBuddyIntlExecutor transformRequest / buildIntlMessages", () => {
     expect(typeof out.messages[0].content).toBe("string");
     expect(out.messages[0].content.startsWith(`${LEAD}\n\n`)).toBe(true);
     expect(out.messages[0].content).toContain(ZWSP);
-    expect(strip(out.messages[0].content)).toBe(`${LEAD}\n\n${CC_SYSTEM}`);
+    expect(strip(out.messages[0].content)).toBe(`${LEAD}\n\n${CC_SYSTEM_INTL}`);
     // exactly one system message: the gateway is only known to accept a single leading one
     expect(out.messages.filter((m) => m.role === "system")).toHaveLength(1);
   });
@@ -186,6 +189,13 @@ describe("resolveSystemPromptMode / matchesContentFilterBody", () => {
     expect(matchesContentFilterBody('{"code":14018,"msg":"model return error"}')).toBe(false);
     expect(matchesContentFilterBody('{"code":11101,"msg":"Non-stream chat request is currently not supported"}')).toBe(false);
     expect(matchesContentFilterBody('{"code":11128,"msg":"request illegal"}')).toBe(false);
+    // 11128 is the gateway's fingerprint WAF only with its "unapproved channel" message
+    expect(matchesContentFilterBody('{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}')).toBe(true);
+    expect(matchesContentFilterBody('{"code":"11128","msg":"illegal api invocation"}')).toBe(true);
+    expect(matchesContentFilterBody('{"code":11128,"msg":"conversation id missing"}')).toBe(false);
+    expect(matchesContentFilterBody('{"code":11128,"msg":"first message is not system prompt"}')).toBe(false);
+    expect(matchesContentFilterBody('{"code":11128,"msg":"conversation id missing","displayTips":"unapproved channel"}')).toBe(false);
+    expect(matchesContentFilterBody('{"code":11101,"msg":"Illegal API invocation from an unapproved channel"}')).toBe(false);
     expect(matchesContentFilterBody("")).toBe(false);
     expect(matchesContentFilterBody(undefined)).toBe(false);
   });

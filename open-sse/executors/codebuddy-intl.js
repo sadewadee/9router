@@ -1,10 +1,15 @@
 import { createHash, randomUUID } from "crypto";
 import { CodeBuddyBaseExecutor, isLegacyRequest } from "./codebuddy-base.js";
 import { contentToText, desensitizeText, desensitizeTools } from "../utils/codebuddyDesensitize.js";
+import { sanitizeFingerprintMessages } from "../utils/workbuddySanitize.js";
 import { extractClientSessionId } from "../utils/sessionManager.js";
 
 // The gateway wants a leading system prompt; this exact line is the verified-good one.
 const LEAD_PROMPT = "You are CodeBuddy Code.";
+
+// Providers on the www.<codebuddy|workbuddy>.ai gateway, whose fingerprint WAF
+// answers 400 code 11128 "unapproved channel" (see utils/workbuddySanitize.js).
+const FINGERPRINT_PROVIDERS = new Set(["codebuddy-intl", "workbuddy"]);
 
 /**
  * Build the INTL message list.
@@ -118,7 +123,14 @@ export class CodeBuddyIntlExecutor extends CodeBuddyBaseExecutor {
       transformed.reasoning_summary = "auto";
     }
 
-    transformed.messages = buildIntlMessages(transformed.messages, this.messageOptions(legacy));
+    // Fingerprint rewrite first, on the full history and in the legacy transform
+    // too: the "11128" / billing-header lines that trip the WAF sit in user and
+    // tool messages, which the legacy fallback keeps. The ZWSP desensitize inside
+    // buildIntlMessages then runs on the rewritten system text.
+    const messages = FINGERPRINT_PROVIDERS.has(this.provider)
+      ? sanitizeFingerprintMessages(transformed.messages)
+      : transformed.messages;
+    transformed.messages = buildIntlMessages(messages, this.messageOptions(legacy));
     if (!legacy) {
       if (Array.isArray(transformed.tools)) transformed.tools = desensitizeTools(transformed.tools);
       if (Array.isArray(transformed.functions)) transformed.functions = desensitizeTools(transformed.functions);
