@@ -1601,85 +1601,247 @@ describe("probeFreebuffToken", () => {
 // freebuff oauth provider
 // ---------------------------------------------------------------------------
 
-describe("freebuff oauth provider", () => {
-  it("is a device_code flow wired to the codebuff cli auth endpoints", async () => {
-    const provider = (await import("../../src/lib/oauth/providers/freebuff.js")).default;
-    expect(provider.flowType).toBe("device_code");
-    expect(provider.config.deviceCodeUrl).toBe("https://www.codebuff.com/api/auth/cli/code");
-    expect(provider.config.tokenUrl).toBe("https://www.codebuff.com/api/auth/cli/status");
+describe("freebuff oauth provider (Freebuff Desktop login)", () => {
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  const CODE_URL = "https://freebuff.com/api/auth/cli/code";
+  const STATUS_URL = "https://freebuff.com/api/auth/cli/status";
+  const LOGIN_URL = "https://freebuff.com/login?auth_code=abc.def";
+
+  const loadProvider = async () => (await import("../../src/lib/oauth/providers/freebuff.js")).default;
+  const lowerKeys = (headers) => Object.fromEntries(Object.entries(headers || {}).map(([k, v]) => [k.toLowerCase(), v]));
+  const codeBody = (extra = {}) => ({ loginUrl: LOGIN_URL, fingerprintHash: "h", expiresAt: 1790000000000, expiresInMs: 60_000, ...extra });
+  const mockCode = (extra) => fetchMock.mockImplementation(async () => json(codeBody(extra)));
+
+  afterEach(() => {
+    delete process.env.FREEBUFF_AUTH_HOST;
   });
 
-  it("requests a login code and packs everything the status endpoint needs into device_code", async () => {
-    const provider = (await import("../../src/lib/oauth/providers/freebuff.js")).default;
+  it("is a device_code flow wired to the freebuff.com auth endpoints, not codebuff.com", async () => {
+    const provider = await loadProvider();
+    expect(provider.flowType).toBe("device_code");
+    expect(provider.config.deviceCodeUrl).toBe(CODE_URL);
+    expect(provider.config.tokenUrl).toBe(STATUS_URL);
+  });
+
+  it("mints the login code on freebuff.com with a uuid fingerprint and only the Desktop request headers", async () => {
+    const provider = await loadProvider();
+    mockCode();
+    await provider.requestDeviceCode(provider.config);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const call = allCalls()[0];
+    expect(call.url).toBe(CODE_URL);
+    expect(call.method).toBe("POST");
+    // Desktop: content-type only; the User-Agent is the bundled Bun's fetch default (Bun 1.4.2).
+    expect(lowerKeys(call.headers)).toEqual({ "content-type": "application/json", "user-agent": "Bun/1.4.2" });
+    expect(Object.keys(call.body)).toEqual(["fingerprintId"]);
+    expect(call.body.fingerprintId).toMatch(UUID_RE);
+  });
+
+  it("does not present itself as a browser or as the codebuff cli", async () => {
+    const provider = await loadProvider();
+    mockCode();
+    await provider.requestDeviceCode(provider.config);
+    fetchMock.mockImplementation(async () => json({ error: "pending" }, { status: 401 }));
+    await provider.pollToken(provider.config, JSON.stringify({ fingerprintId: "fp", fingerprintHash: "h", expiresAt: 1 }));
+
+    for (const call of allCalls()) {
+      const headers = lowerKeys(call.headers);
+      expect(headers["user-agent"]).toMatch(/^Bun\/\d+\.\d+\.\d+$/);
+      expect(headers["user-agent"]).not.toMatch(/Mozilla|Chrome|Safari/);
+      expect(headers.accept).toBeUndefined();
+      expect(String(call.url)).not.toMatch(/codebuff/i);
+    }
+  });
+
+  it("packs fingerprint, hash, expiry and attempt id into device_code and opens the desktop_flow login url", async () => {
+    const provider = await loadProvider();
+    mockCode();
+    const device = await provider.requestDeviceCode(provider.config);
+
+    const packed = JSON.parse(device.device_code);
+    expect(packed.fingerprintId).toMatch(UUID_RE);
+    expect(packed.fingerprintHash).toBe("h");
+    expect(packed.expiresAt).toBe(1790000000000);
+    expect(packed.desktopAttemptId).toMatch(UUID_RE);
+    expect(packed.desktopAttemptId).not.toBe(packed.fingerprintId);
+
+    const login = new URL(device.verification_uri);
+    expect(login.origin).toBe("https://freebuff.com");
+    expect(login.searchParams.get("desktop_flow")).toBe(packed.desktopAttemptId);
+    expect(login.searchParams.get("auth_code")).toBe("abc.def"); // server-issued params survive
+    expect(login.searchParams.has("desktop_acquisition")).toBe(false);
+    expect(device.verification_uri_complete).toBe(device.verification_uri);
+
+    // The modal code is the first 8 chars of the uuid fingerprint, with no codebuff prefix.
+    expect(device.user_code).toBe(packed.fingerprintId.slice(0, 8));
+    expect(JSON.stringify(device)).not.toMatch(/codebuff/i);
+    expect(device.expires_in).toBe(60);
+    expect(device.interval).toBe(5);
+  });
+
+  it("drops a desktop_acquisition param from the login url like the Desktop does without an acquisition id", async () => {
+    const provider = await loadProvider();
+    mockCode({ loginUrl: `${LOGIN_URL}&desktop_acquisition=11111111-1111-4111-8111-111111111111` });
+    const device = await provider.requestDeviceCode(provider.config);
+    expect(new URL(device.verification_uri).searchParams.has("desktop_acquisition")).toBe(false);
+  });
+
+  it("uses a fresh fingerprint and attempt id for every sign-in", async () => {
+    const provider = await loadProvider();
+    mockCode();
+    const a = JSON.parse((await provider.requestDeviceCode(provider.config)).device_code);
+    const b = JSON.parse((await provider.requestDeviceCode(provider.config)).device_code);
+    expect(a.fingerprintId).not.toBe(b.fingerprintId);
+    expect(a.desktopAttemptId).not.toBe(b.desktopAttemptId);
+  });
+
+  it("falls back to a one hour lifetime and caps an oversized one at two hours", async () => {
+    const provider = await loadProvider();
+    mockCode({ expiresInMs: undefined });
+    expect((await provider.requestDeviceCode(provider.config)).expires_in).toBe(3600);
+    mockCode({ expiresInMs: 99 * 60 * 60 * 1000 });
+    expect((await provider.requestDeviceCode(provider.config)).expires_in).toBe(7200);
+  });
+
+  it("honours FREEBUFF_AUTH_HOST for both endpoints and the login url origin check", async () => {
+    const provider = await loadProvider();
+    process.env.FREEBUFF_AUTH_HOST = "http://localhost:4010/";
     fetchMock.mockImplementation(async (url) => {
-      expect(url).toBe("https://www.codebuff.com/api/auth/cli/code");
-      return json({ loginUrl: "https://codebuff.com/cli", fingerprintHash: "h", expiresAt: "2026-01-01", expiresInMs: 60_000 });
+      if (String(url).includes("/code")) return json(codeBody({ loginUrl: "http://localhost:4010/login?auth_code=x" }));
+      return json({ error: "pending" }, { status: 401 });
     });
     const device = await provider.requestDeviceCode(provider.config);
-    expect(device.user_code).toMatch(/^[A-Za-z0-9_-]+$/);
-    expect(device.expires_in).toBe(60);
-    const packed = JSON.parse(device.device_code);
-    expect(packed.fingerprintHash).toBe("h");
-    expect(packed.expiresAt).toBe("2026-01-01");
-    expect(packed.fingerprintId).toMatch(/^codebuff-cli-/);
+    await provider.pollToken(provider.config, device.device_code);
+    expect(allCalls().map((c) => String(c.url).split("?")[0])).toEqual([
+      "http://localhost:4010/api/auth/cli/code",
+      "http://localhost:4010/api/auth/cli/status",
+    ]);
   });
 
   it("reports a failed code request with the status", async () => {
-    const provider = (await import("../../src/lib/oauth/providers/freebuff.js")).default;
+    const provider = await loadProvider();
     fetchMock.mockResolvedValue(new Response("no", { status: 500 }));
     await expect(provider.requestDeviceCode(provider.config)).rejects.toThrow(/500/);
   });
 
-  it("rejects an incomplete code response", async () => {
-    const provider = (await import("../../src/lib/oauth/providers/freebuff.js")).default;
-    fetchMock.mockResolvedValue(json({ loginUrl: "x" }));
-    await expect(provider.requestDeviceCode(provider.config)).rejects.toThrow(/fingerprintHash/);
+  describe("code response validation", () => {
+    const rejects = async (extra, pattern, raw) => {
+      const provider = await loadProvider();
+      fetchMock.mockImplementation(async () => (raw !== undefined ? new Response(raw, { status: 200 }) : json(codeBody(extra))));
+      await expect(provider.requestDeviceCode(provider.config)).rejects.toThrow(pattern);
+    };
+
+    it("rejects a body that is not a json object", () => rejects({}, /invalid/, "<html>nope</html>"));
+    it("rejects a missing loginUrl", () => rejects({ loginUrl: undefined }, /loginUrl/));
+    it("rejects an unparseable loginUrl", () => rejects({ loginUrl: "not a url" }, /invalid loginUrl/));
+    it("rejects a loginUrl outside the auth host", () => rejects({ loginUrl: "https://www.codebuff.com/login?auth_code=x" }, /origin/));
+    it("rejects a loginUrl with embedded credentials", () => rejects({ loginUrl: "https://user:pw@freebuff.com/login" }, /credentials/));
+    it("rejects a missing fingerprintHash", () => rejects({ fingerprintHash: undefined }, /fingerprintHash/));
+    it("rejects a blank fingerprintHash", () => rejects({ fingerprintHash: "   " }, /fingerprintHash/));
+    it("rejects a non-string fingerprintHash", () => rejects({ fingerprintHash: 42 }, /fingerprintHash/));
+    it("rejects a missing expiresAt", () => rejects({ expiresAt: undefined }, /expiresAt/));
+    it("rejects a non-numeric expiresAt", () => rejects({ expiresAt: "2026-01-01" }, /expiresAt/));
+    it("rejects a non-positive expiresAt", () => rejects({ expiresAt: 0 }, /expiresAt/));
+    it("rejects a fractional expiresAt", () => rejects({ expiresAt: 1.5 }, /expiresAt/));
   });
 
-  it("echoes fingerprintId, fingerprintHash and expiresAt back when polling", async () => {
-    const provider = (await import("../../src/lib/oauth/providers/freebuff.js")).default;
-    fetchMock.mockImplementation(async (url) => {
-      expect(String(url)).toContain("fingerprintId=fp-1");
-      expect(String(url)).toContain("fingerprintHash=h");
-      expect(String(url)).toContain("expiresAt=e");
-      return json({ error: "pending" }, { status: 401 });
-    });
-    const result = await provider.pollToken(provider.config, JSON.stringify({ fingerprintId: "fp-1", fingerprintHash: "h", expiresAt: "e" }));
+  it("echoes fingerprintId, fingerprintHash and expiresAt back on a bare GET and reports 401 as pending", async () => {
+    const provider = await loadProvider();
+    fetchMock.mockImplementation(async () => json({ error: "pending" }, { status: 401 }));
+    const result = await provider.pollToken(
+      provider.config,
+      JSON.stringify({ fingerprintId: "fp-1", fingerprintHash: "h", expiresAt: 1790000000000, desktopAttemptId: "att" }),
+    );
+    expect(result).toEqual({ ok: false, data: { error: "authorization_pending" } });
+
+    const call = allCalls()[0];
+    const url = new URL(call.url);
+    expect(`${url.origin}${url.pathname}`).toBe(STATUS_URL);
+    expect(call.method).toBe("GET");
+    expect(Object.fromEntries(url.searchParams)).toEqual({ fingerprintId: "fp-1", fingerprintHash: "h", expiresAt: "1790000000000" });
+    expect(lowerKeys(call.headers)).toEqual({ "user-agent": "Bun/1.4.2" });
+    expect(call.body).toBeNull();
+  });
+
+  it("surfaces other poll failures instead of treating them as pending", async () => {
+    const provider = await loadProvider();
+    fetchMock.mockImplementation(async () => new Response("boom", { status: 503 }));
+    const result = await provider.pollToken(provider.config, JSON.stringify({ fingerprintId: "fp-1", fingerprintHash: "h", expiresAt: 1 }));
+    expect(result.ok).toBe(false);
+    expect(result.data.error).toBe("poll_failed");
+    expect(result.data.error_description).toContain("503");
+  });
+
+  it("keeps polling when an ok answer carries no auth token yet", async () => {
+    const provider = await loadProvider();
+    fetchMock.mockImplementation(async () => json({ user: { id: "u1" } }));
+    const result = await provider.pollToken(provider.config, JSON.stringify({ fingerprintId: "fp-1", fingerprintHash: "h", expiresAt: 1 }));
     expect(result).toEqual({ ok: false, data: { error: "authorization_pending" } });
   });
 
-  it("returns the auth token once the user approved the login", async () => {
-    const provider = (await import("../../src/lib/oauth/providers/freebuff.js")).default;
-    fetchMock.mockResolvedValue(json({ user: { authToken: "t", id: "u1", email: "e@x", name: "N", fingerprintId: "fp" } }));
-    const result = await provider.pollToken(provider.config, JSON.stringify({ fingerprintId: "fp-1", fingerprintHash: "h", expiresAt: "e" }));
+  it("returns the auth token once approved and records the desktop origin on the connection", async () => {
+    const provider = await loadProvider();
+    fetchMock.mockImplementation(async () => json({ user: { authToken: "t", id: "u1", email: "e@x", name: "N" } }));
+    const result = await provider.pollToken(
+      provider.config,
+      JSON.stringify({ fingerprintId: "fp-1", fingerprintHash: "h", expiresAt: 1, desktopAttemptId: "att-1" }),
+    );
     expect(result.ok).toBe(true);
+    expect(result.data.access_token).toBe("t");
+
     const mapped = provider.mapTokens(result.data);
     expect(mapped.accessToken).toBe("t");
-    expect(mapped.providerSpecificData.userId).toBe("u1");
-    expect(mapped.providerSpecificData.fingerprintId).toBe("fp");
+    expect(mapped.refreshToken).toBeNull();
+    expect(mapped.email).toBe("e@x");
+    expect(mapped.displayName).toBe("N");
+    expect(mapped.providerSpecificData).toEqual({
+      userId: "u1",
+      fingerprintId: "fp-1",
+      fingerprintHash: "h",
+      freebuffAuthOrigin: "desktop",
+      desktopAttemptId: "att-1",
+    });
+  });
+
+  it("round-trips one sign-in: the polled fingerprint and the stored attempt id match the minted ones", async () => {
+    const provider = await loadProvider();
+    fetchMock.mockImplementation(async (url) => {
+      if (String(url).startsWith(CODE_URL)) return json(codeBody());
+      return json({ user: { authToken: "tok", id: "u9", email: "a@b.c", name: "Nine" } });
+    });
+    const device = await provider.requestDeviceCode(provider.config);
+    const polled = await provider.pollToken(provider.config, device.device_code);
+    const stored = provider.mapTokens(polled.data).providerSpecificData;
+
+    const mintedFingerprint = allCalls()[0].body.fingerprintId;
+    expect(new URL(allCalls()[1].url).searchParams.get("fingerprintId")).toBe(mintedFingerprint);
+    expect(stored.fingerprintId).toBe(mintedFingerprint);
+    expect(stored.fingerprintId).toMatch(UUID_RE);
+    expect(stored.desktopAttemptId).toBe(new URL(device.verification_uri).searchParams.get("desktop_flow"));
+    expect(stored.freebuffAuthOrigin).toBe("desktop");
   });
 
   it("still understands the older answer shapes", async () => {
-    const provider = (await import("../../src/lib/oauth/providers/freebuff.js")).default;
-    fetchMock.mockResolvedValue(json({ default: { authToken: "old" } }));
+    const provider = await loadProvider();
+    fetchMock.mockImplementation(async () => json({ default: { authToken: "old" } }));
     const result = await provider.pollToken(provider.config, "fp");
     expect(result.ok).toBe(true);
     expect(result.data.access_token).toBe("old");
   });
 
   it("accepts a bare fingerprint id as device code", async () => {
-    const provider = (await import("../../src/lib/oauth/providers/freebuff.js")).default;
-    fetchMock.mockImplementation(async (url) => {
-      expect(String(url)).toContain("fingerprintId=fp-9");
-      return json({ error: "pending" }, { status: 401 });
-    });
+    const provider = await loadProvider();
+    fetchMock.mockImplementation(async () => json({ error: "pending" }, { status: 401 }));
     expect(await provider.pollToken(provider.config, "fp-9")).toEqual({ ok: false, data: { error: "authorization_pending" } });
+    expect(String(allCalls()[0].url)).toContain("fingerprintId=fp-9");
   });
 
   it("falls back to a placeholder display name without profile data", async () => {
-    const provider = (await import("../../src/lib/oauth/providers/freebuff.js")).default;
+    const provider = await loadProvider();
     const mapped = provider.mapTokens({ access_token: "t" });
     expect(mapped.displayName).toBe("Freebuff User");
+    expect(mapped.providerSpecificData.freebuffAuthOrigin).toBe("desktop");
   });
 });
 

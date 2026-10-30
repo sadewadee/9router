@@ -1,26 +1,40 @@
-import { randomBytes } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { FREEBUFF_CONFIG } from "../constants/oauth.js";
 
-// Device-code sign-in of the Freebuff / Codebuff CLI:
-//   POST /api/auth/cli/code   { fingerprintId }                          -> { loginUrl, fingerprintHash, expiresAt, expiresInMs }
-//   GET  /api/auth/cli/status ?fingerprintId&fingerprintHash&expiresAt   -> 401 while pending, { user: { authToken, ... } } once approved
-// The status endpoint verifies an HMAC over (fingerprintId, expiresAt), so all three values must be echoed
-// back unchanged. They travel through the generic device flow packed in the opaque `device_code` string.
-const FREEBUFF_API = "https://www.codebuff.com";
+// Device-code sign-in of the official Freebuff Desktop (0.0.188), NOT the Codebuff CLI flow.
+// Mirrors the Desktop orchestrator's Login.issue() / Login.poll(), auth host https://freebuff.com:
+//   POST /api/auth/cli/code   { fingerprintId: <uuid> }                  -> { loginUrl, fingerprintHash, expiresAt, expiresInMs }
+//   GET  /api/auth/cli/status ?fingerprintId&fingerprintHash&expiresAt   -> 401 while pending, { user: { authToken, id, email, name } } once approved
+// The login page is opened with ?desktop_flow=<attemptId> appended to loginUrl. The status endpoint
+// verifies an HMAC over (fingerprintId, expiresAt), so all three values must be echoed back unchanged.
+// They travel through the generic device flow packed in the opaque `device_code` string.
+const DEFAULT_AUTH_HOST = "https://freebuff.com";
 const DEFAULT_CODE_LIFETIME_MS = 60 * 60 * 1000;
+const MAX_CODE_LIFETIME_MS = 2 * 60 * 60 * 1000;
 const POLL_INTERVAL_SEC = 5;
-const REQUEST_TIMEOUT_MS = 20000;
+// Same request timeouts the Desktop uses (ISSUE_REQUEST_TIMEOUT_MS / POLL_REQUEST_TIMEOUT_MS).
+const ISSUE_TIMEOUT_MS = 15000;
+const POLL_TIMEOUT_MS = 10000;
 
-const BROWSER_UA =
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+// The Desktop orchestrator runs on its bundled Bun (resources/bun/bun.exe = v1.4.2) and sets no
+// User-Agent of its own, so Bun's fetch default goes out. Node's fetch would say "node" instead.
+const DESKTOP_RUNTIME_UA = "Bun/1.4.2";
 
-// Same shape the CLI itself falls back to ("codebuff-cli-" + 8 base64url chars).
-function newFingerprintId() {
-  return `codebuff-cli-${randomBytes(6).toString("base64url").slice(0, 8)}`;
+function canonicalizeHost(raw) {
+  try {
+    const url = new URL(raw);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return String(raw).replace(/\/+$/, "");
+  }
 }
 
+// FREEBUFF_AUTH_HOST repoints the whole login (the Desktop honours the same variable); otherwise the
+// registry URLs apply, with the Desktop host as the last resort.
 function endpoint(config, key, fallbackPath) {
-  return (config && config[key]) || `${FREEBUFF_API}${fallbackPath}`;
+  const override = (process.env.FREEBUFF_AUTH_HOST || "").trim();
+  if (override) return `${canonicalizeHost(override)}${fallbackPath}`;
+  return (config && config[key]) || `${DEFAULT_AUTH_HOST}${fallbackPath}`;
 }
 
 function parseDeviceCode(deviceCode) {
@@ -34,21 +48,40 @@ function parseDeviceCode(deviceCode) {
   return { fingerprintId: deviceCode };
 }
 
+// Desktop validateHostedLoginUrl(): the login page must live on the auth host and carry no credentials.
+function validateLoginUrl(value, authOrigin) {
+  if (typeof value !== "string") throw new Error("Freebuff device code response is missing loginUrl");
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("Freebuff device code response has an invalid loginUrl");
+  }
+  if (url.origin !== authOrigin) throw new Error("Freebuff device code response has an unexpected loginUrl origin");
+  if (url.username || url.password) throw new Error("Freebuff device code response has unexpected loginUrl credentials");
+  return url;
+}
+
+function codeLifetimeMs(value) {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms <= 0) return DEFAULT_CODE_LIFETIME_MS;
+  return Math.min(ms, MAX_CODE_LIFETIME_MS);
+}
+
 const freebuff = {
   config: FREEBUFF_CONFIG,
   flowType: "device_code",
 
   requestDeviceCode: async (config) => {
-    const fingerprintId = newFingerprintId();
-    const response = await fetch(endpoint(config, "deviceCodeUrl", "/api/auth/cli/code"), {
+    const codeUrl = endpoint(config, "deviceCodeUrl", "/api/auth/cli/code");
+    const fingerprintId = randomUUID();
+    const attemptId = randomUUID();
+
+    const response = await fetch(codeUrl, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "User-Agent": BROWSER_UA,
-      },
+      headers: { "content-type": "application/json", "User-Agent": DESKTOP_RUNTIME_UA },
       body: JSON.stringify({ fingerprintId }),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(ISSUE_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -56,40 +89,45 @@ const freebuff = {
       throw new Error(`Freebuff device code request failed (${response.status}): ${error.slice(0, 300)}`);
     }
 
-    const data = await response.json();
-    if (!data.loginUrl || !data.fingerprintHash || !data.expiresAt) {
-      throw new Error("Freebuff device code response is missing loginUrl/fingerprintHash/expiresAt");
+    const data = await response.json().catch(() => null);
+    if (!data || typeof data !== "object") throw new Error("Freebuff device code response is invalid");
+
+    const loginUrl = validateLoginUrl(data.loginUrl, new URL(codeUrl).origin);
+    loginUrl.searchParams.set("desktop_flow", attemptId);
+    loginUrl.searchParams.delete("desktop_acquisition"); // no acquisition id outside the Desktop installer
+
+    const fingerprintHash = typeof data.fingerprintHash === "string" ? data.fingerprintHash.trim() : "";
+    if (!fingerprintHash) throw new Error("Freebuff device code response is missing fingerprintHash");
+
+    const expiresAt = Number(data.expiresAt);
+    if (!Number.isInteger(expiresAt) || expiresAt <= 0) {
+      throw new Error("Freebuff device code response has an invalid expiresAt");
     }
 
-    const expiresInMs = Number(data.expiresInMs) > 0 ? Number(data.expiresInMs) : DEFAULT_CODE_LIFETIME_MS;
-
     return {
-      device_code: JSON.stringify({
-        fingerprintId,
-        fingerprintHash: data.fingerprintHash,
-        expiresAt: data.expiresAt,
-      }),
-      // The web page asks the user to confirm this fingerprint; show its short form.
-      user_code: fingerprintId.replace(/^codebuff-cli-/, ""),
-      verification_uri: data.loginUrl,
-      verification_uri_complete: data.loginUrl,
-      expires_in: Math.floor(expiresInMs / 1000),
+      device_code: JSON.stringify({ fingerprintId, fingerprintHash, expiresAt, desktopAttemptId: attemptId }),
+      // Short form of the fingerprint for the modal; the Desktop login page itself needs no code.
+      user_code: fingerprintId.slice(0, 8),
+      verification_uri: loginUrl.toString(),
+      verification_uri_complete: loginUrl.toString(),
+      expires_in: Math.floor(codeLifetimeMs(data.expiresInMs) / 1000),
       interval: POLL_INTERVAL_SEC,
     };
   },
 
   pollToken: async (config, deviceCode) => {
-    const { fingerprintId, fingerprintHash, expiresAt } = parseDeviceCode(deviceCode);
+    const { fingerprintId, fingerprintHash, expiresAt, desktopAttemptId } = parseDeviceCode(deviceCode);
 
     const url = new URL(endpoint(config, "tokenUrl", "/api/auth/cli/status"));
     if (fingerprintId) url.searchParams.set("fingerprintId", fingerprintId);
     if (fingerprintHash) url.searchParams.set("fingerprintHash", fingerprintHash);
-    if (expiresAt) url.searchParams.set("expiresAt", expiresAt);
+    if (expiresAt) url.searchParams.set("expiresAt", String(expiresAt));
 
+    // No custom headers beyond the runtime's own User-Agent, like the Desktop's poll.
     const response = await fetch(url.toString(), {
       method: "GET",
-      headers: { Accept: "application/json", "User-Agent": BROWSER_UA },
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      headers: { "User-Agent": DESKTOP_RUNTIME_UA },
+      signal: AbortSignal.timeout(POLL_TIMEOUT_MS),
     });
 
     // 401 = the user has not approved the login yet.
@@ -117,6 +155,7 @@ const freebuff = {
           _name: user.name,
           _fingerprintId: user.fingerprintId || fingerprintId,
           _fingerprintHash: user.fingerprintHash || fingerprintHash,
+          _desktopAttemptId: desktopAttemptId,
         },
       };
     }
@@ -134,6 +173,9 @@ const freebuff = {
       userId: tokens._userId,
       fingerprintId: tokens._fingerprintId,
       fingerprintHash: tokens._fingerprintHash,
+      // Tells Desktop-flow connections apart from older ones minted through the Codebuff CLI flow.
+      freebuffAuthOrigin: "desktop",
+      desktopAttemptId: tokens._desktopAttemptId,
     },
   }),
 };
