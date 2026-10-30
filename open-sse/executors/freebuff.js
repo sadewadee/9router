@@ -1752,7 +1752,7 @@ export class FreebuffExecutor extends BaseExecutor {
         ctx.admissionModel = resolveModelForAdmission(catalog, modelKey);
 
         session = await getFreebuffSession(token, modelKey, ctx);
-        const agentId = resolveFreebuffAgent(session.resolvedModel);
+        const agentId = resolveFreebuffAgent(targetModel, session.resolvedModel);
         startFailed = true;
         lease = await acquireAgentRun(token, agentId, ctx);
         startFailed = false;

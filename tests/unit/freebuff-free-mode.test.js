@@ -60,6 +60,15 @@ describe("resolveFreebuffAgent", () => {
   it("falls back to codebuff for unknown models", () => {
     expect(resolveFreebuffAgent("some-unknown-model")).toBe("codebuff");
   });
+
+  it("prefers model-specific agent over catalog key fallback", () => {
+    expect(resolveFreebuffAgent("upstage/solar-mini4", "m-69307952f8")).toBe("base3-free-solar-mini4");
+    expect(resolveFreebuffAgent("deepseek/deepseek-v4-flash", "m-096e75164d")).toBe("base3-free-deepseek-flash");
+  });
+
+  it("falls back to base3-free-catalog when model not in table but resolvedModel is catalog key", () => {
+    expect(resolveFreebuffAgent("unknown/model", "m-69307952f8")).toBe("base3-free-catalog");
+  });
 });
 
 describe("neutralizeSystemPromptMarkers", () => {

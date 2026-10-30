@@ -66,10 +66,18 @@ export const SIGNATURE_TOOL_DEFINITIONS = [
   },
 ];
 
-export function resolveFreebuffAgent(model) {
-  if (typeof model === "string") {
-    if (CATALOG_KEY_PATTERN.test(model) || model.startsWith("fbm1.")) return "base3-free-catalog";
-    if (FREEBUFF_AGENT_ID_BY_MODEL[model]) return FREEBUFF_AGENT_ID_BY_MODEL[model];
+export function resolveFreebuffAgent(model, resolvedModel = null) {
+  if (typeof model === "string" && FREEBUFF_AGENT_ID_BY_MODEL[model]) {
+    return FREEBUFF_AGENT_ID_BY_MODEL[model];
+  }
+  if (typeof resolvedModel === "string" && FREEBUFF_AGENT_ID_BY_MODEL[resolvedModel]) {
+    return FREEBUFF_AGENT_ID_BY_MODEL[resolvedModel];
+  }
+  if (typeof model === "string" && (CATALOG_KEY_PATTERN.test(model) || model.startsWith("fbm1."))) {
+    return "base3-free-catalog";
+  }
+  if (typeof resolvedModel === "string" && (CATALOG_KEY_PATTERN.test(resolvedModel) || resolvedModel.startsWith("fbm1."))) {
+    return "base3-free-catalog";
   }
   return "codebuff";
 }
