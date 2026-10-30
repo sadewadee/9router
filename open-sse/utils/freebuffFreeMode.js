@@ -79,7 +79,7 @@ export function resolveFreebuffAgent(model, resolvedModel = null) {
   if (typeof resolvedModel === "string" && (CATALOG_KEY_PATTERN.test(resolvedModel) || resolvedModel.startsWith("fbm1."))) {
     return "base3-free-catalog";
   }
-  return "codebuff";
+  return "base2-free";
 }
 
 function neutralizeText(text) {

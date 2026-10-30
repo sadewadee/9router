@@ -208,13 +208,13 @@ export const FREEBUFF_ROOT_OPENING = "You are the AI agent behind Freebuff, a to
 const ROOT_SYSTEM_PROMPT =
   `${FREEBUFF_ROOT_OPENING} See freebuff.com for more information about the product.`;
 
-// Model -> free-mode agent id, from the CLI 0.2.34 binary (base3 generation).
-// The server pins each agent to exactly one model; catalog-resolved keys use "base3-free-catalog".
+// Model -> free-mode agent id, from the CLI 0.2.34 binary. Base3 agents for deepseek/mimo/minimax/luna/muse;
+// base2 agents for solar/gemini/space-bunny/ox/glm/kimi. The server pins each agent to one model.
 export const FREEBUFF_AGENT_ID_BY_MODEL = {
   "mimo/mimo-v2.5": "base3-free-mimo",
   "mimo/mimo-v2.6-pro": "base3-free-mimo-2-6-pro",
-  "z-ai/glm-5.3-flash": "base3-free-glm-5-3-flash",
-  "z-ai/glm-5.2": "base3-free-glm",
+  "z-ai/glm-5.3-flash": "base2-free-glm-5-3-flash",
+  "z-ai/glm-5.2": "base2-free-glm",
   "deepseek/deepseek-v4-flash": "base3-free-deepseek-flash",
   "deepseek/deepseek-v4-flash-fast": "base3-fast-free-deepseek-flash",
   "deepseek/deepseek-v4-pro": "base3-free-deepseek",
@@ -222,14 +222,14 @@ export const FREEBUFF_AGENT_ID_BY_MODEL = {
   "openai/gpt-5.6-luna": "base3-free-luna",
   "openai/gpt-6.1-sol": "base3-free-gpt-6-1-sol",
   "openai/gpt-5.6-luna-es": "base3-free-luna-es",
-  "google/gemini-3.8-flash": "base3-free-gemini-3-8-flash",
-  "google/gemini-4-argon": "base3-free-gemini-4-argon",
-  "upstage/solar-mini4": "base3-free-solar-mini4",
-  "upstage/solar-pro4": "base3-free-solar-pro4",
-  "stealth/space-bunny-alpha": "base3-free-space-bunny-alpha",
-  "stealth/ox-alpha": "base3-free-ox-alpha",
+  "google/gemini-3.8-flash": "base2-free-gemini-3-8-flash",
+  "google/gemini-4-argon": "base2-free-gemini-4-argon",
+  "upstage/solar-mini4": "base2-free-solar-mini4",
+  "upstage/solar-pro4": "base2-free-solar-pro4",
+  "stealth/space-bunny-alpha": "base2-free-space-bunny-alpha",
+  "stealth/ox-alpha": "base2-free-ox-alpha",
   "minimax/minimax-m3": "base3-free-minimax-m3",
-  "crof/kimi-k3-eco": "base3-free-kimi-k3-eco",
+  "crof/kimi-k3-eco": "base2-free-kimi-k3-eco",
   "meta/muse-spark-1.2-contributor": "base3-free-muse-spark",
   "meta/muse-spark-1.3-contributor": "base3-free-muse-spark-1-3",
   "deepseek/deepseek-v4.1-flash": "base3-free-deepseek-flash",
