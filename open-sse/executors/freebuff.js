@@ -1215,7 +1215,6 @@ function buildChatBody(
   const out = { ...(body || {}) };
   delete out.codebuff_metadata;
   delete out.provider;
-  delete out.codebuff;
 
   let messages = ensureRootOpening(out.messages);
   if (Array.isArray(out.tools) && out.tools.length > 0) {
@@ -1266,10 +1265,8 @@ function buildChatBody(
   out.messages = messages;
   out.stream = stream !== false;
   if (out.stream && out.stream_options == null) out.stream_options = { include_usage: true };
-  out.codebuff = {
-    codebuff_metadata: metadata,
-    provider: { order: null, allow_fallbacks: true },
-  };
+  out.codebuff_metadata = metadata;
+  out.provider = { order: null, allow_fallbacks: true };
   return out;
 }
 
@@ -1757,8 +1754,9 @@ export class FreebuffExecutor extends BaseExecutor {
         lease = await acquireAgentRun(token, agentId, ctx);
         startFailed = false;
 
+        const chatModel = ctx.admissionModel || session.resolvedModel;
         const transformedBody = buildChatBody(body, {
-          model: session.resolvedModel,
+          model: chatModel,
           runId: lease.runId,
           instanceId: session.instanceId,
           reasoningEffort: body?.reasoning_effort ?? null,
