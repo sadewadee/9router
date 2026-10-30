@@ -160,8 +160,7 @@ function aiSdkVersion() {
   return process.env.FREEBUFF_AISDK_VERSION || DEFAULT_AISDK_VERSION;
 }
 
-function chatUserAgent(isFreeMode = false) {
-  if (isFreeMode) return `ai-sdk/openai-compatible/${aiSdkVersion()}/freebuff-chatgpt`;
+function chatUserAgent() {
   return process.env.FREEBUFF_USER_AGENT || `ai-sdk/openai-compatible/${aiSdkVersion()}/codebuff`;
 }
 
@@ -1216,6 +1215,7 @@ function buildChatBody(
   const out = { ...(body || {}) };
   delete out.codebuff_metadata;
   delete out.provider;
+  delete out.codebuff;
 
   let messages = ensureRootOpening(out.messages);
   if (Array.isArray(out.tools) && out.tools.length > 0) {
@@ -1266,18 +1266,20 @@ function buildChatBody(
   out.messages = messages;
   out.stream = stream !== false;
   if (out.stream && out.stream_options == null) out.stream_options = { include_usage: true };
-  out.codebuff_metadata = metadata;
-  out.provider = { order: null, allow_fallbacks: true };
+  out.codebuff = {
+    codebuff_metadata: metadata,
+    provider: { order: null, allow_fallbacks: true },
+  };
   return out;
 }
 
 // Chat headers, mirroring the CLI provider factory + YWA: ai-sdk user agent, gzip recovery,
 // acting user, catalog fetch binding, and the device-key signature over this exact body.
-async function buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, deviceKey, isFreeMode = false }) {
+async function buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, deviceKey }) {
   const headers = {
     "Content-Type": "application/json",
     Authorization: `Bearer ${token}`,
-    "User-Agent": chatUserAgent(isFreeMode),
+    "User-Agent": chatUserAgent(),
     Accept: stream ? "text/event-stream" : "application/json",
     [HEADER_GZIP_RECOVERY]: "1",
   };
@@ -1765,7 +1767,7 @@ export class FreebuffExecutor extends BaseExecutor {
         });
         carrierPlan = transformedBody[CARRIER_PLAN_SYMBOL] || null;
         bodyStr = JSON.stringify(transformedBody);
-        chatHeaders = await buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, deviceKey, isFreeMode: true });
+        chatHeaders = await buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, deviceKey });
       } catch (err) {
         if (err instanceof FreebuffHttpError) {
           // A START that reports a dead session (not our own queued answer) gets one fresh admission.

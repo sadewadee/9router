@@ -418,11 +418,6 @@ describe("user agents and versions", () => {
     expect(DEFAULT_CLI_VERSION).toBe("0.2.34");
   });
 
-  it("free-mode chat UA carries the freebuff-chatgpt suffix", () => {
-    expect(chatUserAgent(true)).toBe(`ai-sdk/openai-compatible/${DEFAULT_AISDK_VERSION}/freebuff-chatgpt`);
-    expect(chatUserAgent(false)).toBe(`ai-sdk/openai-compatible/${DEFAULT_AISDK_VERSION}/codebuff`);
-  });
-
   it("env overrides both versions (read at request time)", () => {
     process.env.FREEBUFF_AISDK_VERSION = "9.9.9";
     process.env.FREEBUFF_CLI_VERSION = "1.2.3";
@@ -502,7 +497,7 @@ describe("root system prompt opening", () => {
 describe("buildChatBody", () => {
   it("adds codebuff_metadata with run id, 13-char client id, client env, and no cost_mode by default", () => {
     const body = buildChatBody({ messages: [] }, { model: "mimo/mimo-v2.5", runId: "run-1", instanceId: "srv-1" });
-    const meta = body.codebuff_metadata;
+    const meta = body.codebuff.codebuff_metadata;
     expect(meta.run_id).toBe("run-1");
     expect(meta.client_id).toMatch(/^[a-z0-9]{13}$/);
     expect(meta.freebuff_instance_id).toBe("srv-1");
@@ -513,36 +508,36 @@ describe("buildChatBody", () => {
 
   it("marks multi-session only for client-minted cli: claims (RZA)", () => {
     const claim = buildChatBody({ messages: [] }, { model: "m", runId: "r", instanceId: "cli:abcd-1" });
-    expect(claim.codebuff_metadata.freebuff_multi_session).toBe("1");
-    expect(claim.codebuff_metadata.surface).toBe("cli");
+    expect(claim.codebuff.codebuff_metadata.freebuff_multi_session).toBe("1");
+    expect(claim.codebuff.codebuff_metadata.surface).toBe("cli");
 
     const assigned = buildChatBody({ messages: [] }, { model: "m", runId: "r", instanceId: "srv-77" });
-    expect(assigned.codebuff_metadata.freebuff_multi_session).toBeUndefined();
-    expect(assigned.codebuff_metadata.surface).toBeUndefined();
+    expect(assigned.codebuff.codebuff_metadata.freebuff_multi_session).toBeUndefined();
+    expect(assigned.codebuff.codebuff_metadata.surface).toBeUndefined();
   });
 
   it("omits the instance id fields when the waiting room is off", () => {
     const body = buildChatBody({ messages: [] }, { model: "m", runId: "r", instanceId: "" });
-    expect(body.codebuff_metadata.freebuff_instance_id).toBeUndefined();
+    expect(body.codebuff.codebuff_metadata.freebuff_instance_id).toBeUndefined();
   });
 
   it("copies a reasoning effort into freebuff_reasoning_effort", () => {
     const body = buildChatBody({ messages: [], reasoning_effort: "high" }, { model: "m", runId: "r", reasoningEffort: "high" });
-    expect(body.codebuff_metadata.freebuff_reasoning_effort).toBe("high");
+    expect(body.codebuff.codebuff_metadata.freebuff_reasoning_effort).toBe("high");
     const plain = buildChatBody({ messages: [], reasoning_effort: "high" }, { model: "m", runId: "r" });
-    expect(plain.codebuff_metadata.freebuff_reasoning_effort).toBeUndefined();
+    expect(plain.codebuff.codebuff_metadata.freebuff_reasoning_effort).toBeUndefined();
   });
 
   it("sends cost_mode only when asked, never hardcoded", () => {
-    expect(buildChatBody({ messages: [] }, { model: "m", runId: "r" }).codebuff_metadata.cost_mode).toBeUndefined();
+    expect(buildChatBody({ messages: [] }, { model: "m", runId: "r" }).codebuff.codebuff_metadata.cost_mode).toBeUndefined();
     const body = buildChatBody({ messages: [] }, { model: "m", runId: "r", costMode: "normal" });
-    expect(body.codebuff_metadata.cost_mode).toBe("normal");
+    expect(body.codebuff.codebuff_metadata.cost_mode).toBe("normal");
     process.env.FREEBUFF_COST_MODE = "free";
-    expect(buildChatBody({ messages: [] }, { model: "m", runId: "r" }).codebuff_metadata.cost_mode).toBe("free");
+    expect(buildChatBody({ messages: [] }, { model: "m", runId: "r" }).codebuff.codebuff_metadata.cost_mode).toBe("free");
   });
 
   it("spreads provider routing as {order:null, allow_fallbacks:true}", () => {
-    expect(buildChatBody({ messages: [] }, { model: "m", runId: "r" }).provider).toEqual({ order: null, allow_fallbacks: true });
+    expect(buildChatBody({ messages: [] }, { model: "m", runId: "r" }).codebuff.provider).toEqual({ order: null, allow_fallbacks: true });
   });
 
   it("sets stream_options include_usage when streaming and plain stream:false otherwise", () => {
@@ -565,9 +560,9 @@ describe("buildChatBody", () => {
       { model: "mimo/mimo-v2.5", runId: "r1" },
     );
     expect(body.model).toBe("mimo/mimo-v2.5");
-    expect(body.codebuff_metadata.run_id).toBe("r1");
-    expect(body.codebuff_metadata.client_id).not.toBe("hacked");
-    expect(body.provider).toEqual({ order: null, allow_fallbacks: true });
+    expect(body.codebuff.codebuff_metadata.run_id).toBe("r1");
+    expect(body.codebuff.codebuff_metadata.client_id).not.toBe("hacked");
+    expect(body.codebuff.provider).toEqual({ order: null, allow_fallbacks: true });
   });
 
   it("honours a caller-provided stream_options", () => {
@@ -709,7 +704,7 @@ describe("execute: signed handshake", () => {
     expect(await drain(result.response)).toContain("hi");
 
     const chat = callsTo(CHAT_URL, "POST")[0];
-    expect(chat.headers["User-Agent"]).toBe(chatUserAgent(true));
+    expect(chat.headers["User-Agent"]).toBe(chatUserAgent());
     expect(chat.headers[HEADER_GZIP_RECOVERY]).toBe("1");
     expect(chat.headers["x-freebuff-acting-user-id"]).toBe("user-42");
     expect(chat.headers["x-freebuff-catalog-fetch"]).toBe("fetch-test-1");
@@ -720,11 +715,11 @@ describe("execute: signed handshake", () => {
     expect(chat.body.model).toBe("mimo/mimo-v2.5");
     expect(chat.body.stream).toBe(true);
     expect(chat.body.stream_options).toEqual({ include_usage: true });
-    expect(chat.body.provider).toEqual({ order: null, allow_fallbacks: true });
+    expect(chat.body.codebuff.provider).toEqual({ order: null, allow_fallbacks: true });
     expect(chat.body.messages[0].content.startsWith(FREEBUFF_ROOT_OPENING)).toBe(true);
-    expect(chat.body.codebuff_metadata.run_id).toMatch(/^run-\d+$/);
-    expect(chat.body.codebuff_metadata.freebuff_instance_id).toMatch(/^srv-\d+$/);
-    expect(chat.body.codebuff_metadata.surface).toBeUndefined(); // server-assigned id, no cli: claim
+    expect(chat.body.codebuff.codebuff_metadata.run_id).toMatch(/^run-\d+$/);
+    expect(chat.body.codebuff.codebuff_metadata.freebuff_instance_id).toMatch(/^srv-\d+$/);
+    expect(chat.body.codebuff.codebuff_metadata.surface).toBeUndefined(); // server-assigned id, no cli: claim
   });
 
   it("admits with the catalog row handle while the chat body keeps the row key", async () => {
@@ -771,7 +766,7 @@ describe("execute: signed handshake", () => {
     expect(start.body.agentId).toBe("base2-free-mimo");
     const chat = callsTo(CHAT_URL, "POST")[0];
     expect(chat.body.model).toBe("m-00032eaeec");
-    expect(chat.body.codebuff_metadata.freebuff_instance_id).toMatch(/^srv-\d+$/);
+    expect(chat.body.codebuff.codebuff_metadata.freebuff_instance_id).toMatch(/^srv-\d+$/);
   });
 
   it("translates a human model id to its catalog key before admission and chat", async () => {
@@ -1114,8 +1109,8 @@ describe("free session handling", () => {
     // ...but every request still gets its own agent run in this mode
     expect(agentRunCalls("START")).toHaveLength(2);
     const [first, second] = callsTo(CHAT_URL, "POST");
-    expect(second.body.codebuff_metadata.freebuff_instance_id).toBe(first.body.codebuff_metadata.freebuff_instance_id);
-    expect(second.body.codebuff_metadata.run_id).not.toBe(first.body.codebuff_metadata.run_id);
+    expect(second.body.codebuff.codebuff_metadata.freebuff_instance_id).toBe(first.body.codebuff.codebuff_metadata.freebuff_instance_id);
+    expect(second.body.codebuff.codebuff_metadata.run_id).not.toBe(first.body.codebuff.codebuff_metadata.run_id);
 
     await drain((await executor.execute(makeExecuteArgs({ credentials, model: "z-ai/glm-5.3-flash", body: { messages: [] } }))).response);
     expect(callsTo(SESSION_ADMISSION_URL, "POST")).toHaveLength(2);
@@ -1173,7 +1168,7 @@ describe("free session handling", () => {
     expect(admissions).toBe(1);
     await drain(a.response);
     await drain(b.response);
-    const instances = callsTo(CHAT_URL, "POST").map((c) => c.body.codebuff_metadata.freebuff_instance_id);
+    const instances = callsTo(CHAT_URL, "POST").map((c) => c.body.codebuff.codebuff_metadata.freebuff_instance_id);
     expect(instances).toEqual(["srv-shared", "srv-shared"]);
   });
 
@@ -1232,7 +1227,7 @@ describe("free session handling", () => {
       expect(polls).toBe(1);
       expect(callsTo(SESSION_ADMISSION_URL, "POST")).toHaveLength(1);
       const chat = callsTo(CHAT_URL, "POST")[0];
-      expect(chat.body.codebuff_metadata.freebuff_instance_id).toBe("srv-queue");
+      expect(chat.body.codebuff.codebuff_metadata.freebuff_instance_id).toBe("srv-queue");
       await drain(second.response);
     });
   });
