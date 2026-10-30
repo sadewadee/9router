@@ -41,20 +41,20 @@ afterEach(() => {
 });
 
 describe("resolveFreebuffAgent", () => {
-  it("returns root base2-free for all catalog keys and opaque handles", () => {
-    expect(resolveFreebuffAgent("m-69307952f8")).toBe("base2-free");
-    expect(resolveFreebuffAgent("m-9a7e098cc1")).toBe("base2-free");
-    expect(resolveFreebuffAgent("m-096e75164d")).toBe("base2-free");
-    expect(resolveFreebuffAgent("m-7e20df6765")).toBe("base2-free");
-    expect(resolveFreebuffAgent("m-0000000000")).toBe("base2-free");
-    expect(resolveFreebuffAgent("fbm1.abc123")).toBe("base2-free");
+  it("returns base3-free-catalog for all catalog keys and opaque handles", () => {
+    expect(resolveFreebuffAgent("m-69307952f8")).toBe("base3-free-catalog");
+    expect(resolveFreebuffAgent("m-9a7e098cc1")).toBe("base3-free-catalog");
+    expect(resolveFreebuffAgent("m-096e75164d")).toBe("base3-free-catalog");
+    expect(resolveFreebuffAgent("m-7e20df6765")).toBe("base3-free-catalog");
+    expect(resolveFreebuffAgent("m-0000000000")).toBe("base3-free-catalog");
+    expect(resolveFreebuffAgent("fbm1.abc123")).toBe("base3-free-catalog");
   });
 
-  it("routes known free models to their specific agent", () => {
-    expect(resolveFreebuffAgent("deepseek/deepseek-v4-flash")).toBe("base2-free-deepseek-flash");
-    expect(resolveFreebuffAgent("mimo/mimo-v2.5")).toBe("base2-free-mimo");
-    expect(resolveFreebuffAgent("upstage/solar-mini4")).toBe("base2-free-solar-mini4");
-    expect(resolveFreebuffAgent("upstage/solar-pro4")).toBe("base2-free-solar-pro4");
+  it("routes known free models to their specific base3 agent", () => {
+    expect(resolveFreebuffAgent("deepseek/deepseek-v4-flash")).toBe("base3-free-deepseek-flash");
+    expect(resolveFreebuffAgent("mimo/mimo-v2.5")).toBe("base3-free-mimo");
+    expect(resolveFreebuffAgent("upstage/solar-mini4")).toBe("base3-free-solar-mini4");
+    expect(resolveFreebuffAgent("upstage/solar-pro4")).toBe("base3-free-solar-pro4");
   });
 
   it("falls back to codebuff for unknown models", () => {

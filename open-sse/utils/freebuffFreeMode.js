@@ -68,7 +68,7 @@ export const SIGNATURE_TOOL_DEFINITIONS = [
 
 export function resolveFreebuffAgent(model) {
   if (typeof model === "string") {
-    if (CATALOG_KEY_PATTERN.test(model) || model.startsWith("fbm1.")) return "base2-free";
+    if (CATALOG_KEY_PATTERN.test(model) || model.startsWith("fbm1.")) return "base3-free-catalog";
     if (FREEBUFF_AGENT_ID_BY_MODEL[model]) return FREEBUFF_AGENT_ID_BY_MODEL[model];
   }
   return "codebuff";
