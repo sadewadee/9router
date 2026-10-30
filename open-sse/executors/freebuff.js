@@ -24,6 +24,16 @@ import {
   CLIENT_CLI,
   CLIENT_DESKTOP,
 } from "../utils/freebuffCatalog.js";
+import {
+  resolveFreebuffAgent,
+  neutralizeSystemPromptMarkers,
+  packToolsForFreebuff,
+  alignHistoryToolNames,
+  createCarrierSseTransform,
+  unpackCarrierToolCalls,
+  resolveCostMode,
+  CARRIER_PLAN_SYMBOL,
+} from "../utils/freebuffFreeMode.js";
 
 /**
  * Freebuff (codebuff.com) free-mode executor.
@@ -1190,12 +1200,15 @@ function normalizeToolSchemas(tools) {
 // through, but model, messages, stream, codebuff_metadata and provider belong to the handshake.
 // codebuff_metadata order follows the CLI spread: extra (instance/env) first, then run_id,
 // client_id, and the conditional n / cost_mode / cache_debug_correlation.
-function buildChatBody(body, { model, runId, instanceId = "", reasoningEffort = null, stream = true, costMode = null } = {}) {
+function buildChatBody(
+  body,
+  { model, runId, instanceId = "", reasoningEffort = null, stream = true, costMode = null, freeModeTransforms = null } = {},
+) {
   const out = { ...(body || {}) };
   delete out.codebuff_metadata;
   delete out.provider;
 
-  const messages = ensureRootOpening(out.messages);
+  let messages = ensureRootOpening(out.messages);
   if (Array.isArray(out.tools) && out.tools.length > 0) {
     if (shouldFoldTools()) {
       const notice = buildToolNotice(out.tools);
@@ -1206,6 +1219,18 @@ function buildChatBody(body, { model, runId, instanceId = "", reasoningEffort = 
     } else {
       out.tools = normalizeToolSchemas(out.tools);
     }
+  }
+
+  let carrierPlan = null;
+  if (freeModeTransforms) {
+    messages = neutralizeSystemPromptMarkers(messages);
+    if (Array.isArray(out.tools) && out.tools.length > 0) {
+      const packed = packToolsForFreebuff(out.tools);
+      out.tools = packed.tools;
+      carrierPlan = packed.carrierPlan;
+      out[CARRIER_PLAN_SYMBOL] = carrierPlan;
+    }
+    messages = alignHistoryToolNames(messages, carrierPlan);
   }
 
   if (out.max_tokens == null && out.max_completion_tokens != null) out.max_tokens = out.max_completion_tokens;
@@ -1225,7 +1250,7 @@ function buildChatBody(body, { model, runId, instanceId = "", reasoningEffort = 
   metadata.freebuff_client_env = clientEnv();
   metadata.run_id = runId;
   metadata.client_id = generateClientId();
-  const mode = costMode ?? costModeOverride();
+  const mode = freeModeTransforms ? resolveCostMode(costMode, costModeOverride()) : (costMode ?? costModeOverride());
   if (mode) metadata.cost_mode = mode;
 
   out.model = model;
@@ -1284,6 +1309,27 @@ function gateRetryKind(status, errText) {
   // The run vanished server side (a long-lived run can expire); a fresh START fixes it.
   if (status === 400 && /runid not (found|running)/i.test(errText)) return "run";
   return null;
+}
+
+function carrierSseResponse(response, carrierPlan) {
+  return new Response(response.body.pipeThrough(createCarrierSseTransform(carrierPlan)), {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
+async function carrierJsonResponse(response, carrierPlan) {
+  const text = await response.text();
+  let out = text;
+  try {
+    out = JSON.stringify(unpackCarrierToolCalls(JSON.parse(text), carrierPlan));
+  } catch {
+    out = text;
+  }
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  return new Response(out, { status: response.status, statusText: response.statusText, headers });
 }
 
 // Finish the agent run when the response body ends, errors or is cancelled.
@@ -1685,6 +1731,7 @@ export class FreebuffExecutor extends BaseExecutor {
       let startFailed = false;
       let bodyStr = "";
       let chatHeaders;
+      let carrierPlan = null;
       try {
         ctx.hasCatalog = Boolean(catalog);
         ctx.fetchId = fetchId;
@@ -1694,9 +1741,8 @@ export class FreebuffExecutor extends BaseExecutor {
         ctx.admissionModel = resolveModelForAdmission(catalog, modelKey);
 
         session = await getFreebuffSession(token, modelKey, ctx);
-        // The static map still covers the legacy ids; every other (live catalog) key rides the
-        // generic "codebuff" root agent (live-verified START + chat accept it).
-        const agentId = FREEBUFF_AGENT_ID_BY_MODEL[session.resolvedModel] || "codebuff";
+        // Catalog keys ride the base3-free-catalog root agent; legacy ids keep their pinned map entry.
+        const agentId = resolveFreebuffAgent(session.resolvedModel);
         startFailed = true;
         lease = await acquireAgentRun(token, agentId, ctx);
         startFailed = false;
@@ -1707,7 +1753,9 @@ export class FreebuffExecutor extends BaseExecutor {
           instanceId: session.instanceId,
           reasoningEffort: body?.reasoning_effort ?? null,
           stream,
+          freeModeTransforms: {},
         });
+        carrierPlan = transformedBody[CARRIER_PLAN_SYMBOL] || null;
         bodyStr = JSON.stringify(transformedBody);
         chatHeaders = await buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, deviceKey });
       } catch (err) {
@@ -1775,7 +1823,12 @@ export class FreebuffExecutor extends BaseExecutor {
       }
 
       const wrapped = wrapStreamWithCleanup(response, (status, message) => lease.release(status, message));
-      return { response: wrapped, url, headers: chatHeaders, transformedBody: JSON.parse(bodyStr) };
+      const finalResponse = carrierPlan?.active
+        ? stream
+          ? carrierSseResponse(wrapped, carrierPlan)
+          : await carrierJsonResponse(wrapped, carrierPlan)
+        : wrapped;
+      return { response: finalResponse, url, headers: chatHeaders, transformedBody: JSON.parse(bodyStr) };
     }
 
     throw new Error("Freebuff execution failed");

@@ -757,13 +757,13 @@ describe("execute: signed handshake", () => {
     expect(callsTo(CATALOG_URL, "GET")).toHaveLength(1);
   });
 
-  it("routes a live catalog key with the generic codebuff root agent (passthrough)", async () => {
+  it("routes a live catalog key with the base3-free-catalog root agent", async () => {
     installUpstream();
     const result = await executor.execute(makeExecuteArgs({ model: "m-00032eaeec" }));
     expect(result.response.status).toBe(200);
     await drain(result.response);
     const start = agentRunCalls("START")[0];
-    expect(start.body.agentId).toBe("codebuff"); // live-verified default root agent
+    expect(start.body.agentId).toBe("base3-free-catalog");
     const chat = callsTo(CHAT_URL, "POST")[0];
     expect(chat.body.model).toBe("m-00032eaeec");
     expect(chat.body.codebuff_metadata.freebuff_instance_id).toMatch(/^srv-\d+$/);
