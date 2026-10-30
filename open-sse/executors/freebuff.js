@@ -202,36 +202,35 @@ function clientEnv() {
 const DEFAULT_MODEL = "mimo/mimo-v2.5";
 
 // The server does a byte-exact prefix check on the FIRST system message of a free-mode request
-// (FREEBUFF_ROOT_SYSTEM_PROMPT_OPENINGS). base3 is the current CLI harness, so the base3-free-*
-// agent ids below pair with the base3 opening (base2 agents pair with a different opening).
-export const FREEBUFF_ROOT_OPENING = "You are Buffy, the coding agent behind Codebuff.";
+// (FREEBUFF_ROOT_SYSTEM_PROMPT_OPENINGS). base2 agents pair with the base2/Freebuff opening.
+export const FREEBUFF_ROOT_OPENING = "You are the AI agent behind Freebuff, a tool where users can chat with you to code with AI for free.";
 const ROOT_SYSTEM_PROMPT =
-  `${FREEBUFF_ROOT_OPENING} You help users with software engineering tasks: fixing bugs, adding functionality, refactoring, and explaining code.`;
+  `${FREEBUFF_ROOT_OPENING} See freebuff.com for more information about the product.`;
 
-// Model -> free-mode root agent id, from the CLI 0.2.34 binary (FREEBUFF_CLI_BASE3_AGENT_ID_BY_MODEL
-// upstream; union of both build variants). The server pins each root agent to exactly one model.
+// Model -> free-mode root agent id, from the CLI 0.2.34 binary (base2 generation).
+// The server pins each root agent to exactly one model.
 export const FREEBUFF_AGENT_ID_BY_MODEL = {
-  "mimo/mimo-v2.5": "base3-free-mimo",
-  "mimo/mimo-v2.6-pro": "base3-free-mimo-2-6-pro",
-  "z-ai/glm-5.3-flash": "base3-free-glm-5-3-flash",
-  "z-ai/glm-5.2": "base3-free-glm",
-  "deepseek/deepseek-v4-flash": "base3-free-deepseek-flash",
-  "deepseek/deepseek-v4-flash-fast": "base3-fast-free-deepseek-flash",
-  "deepseek/deepseek-v4-pro": "base3-free-deepseek",
-  "openai/gpt-6-luna": "base3-free-luna-6",
-  "openai/gpt-5.6-luna": "base3-free-luna",
-  "openai/gpt-6.1-sol": "base3-free-gpt-6-1-sol",
-  "openai/gpt-5.6-luna-es": "base3-free-luna-es",
-  "google/gemini-3.8-flash": "base3-free-gemini-3-8-flash",
-  "google/gemini-4-argon": "base3-free-gemini-4-argon",
-  "upstage/solar-mini4": "base3-free-solar-mini4",
-  "upstage/solar-pro4": "base3-free-solar-pro4",
-  "stealth/space-bunny-alpha": "base3-free-space-bunny-alpha",
-  "stealth/ox-alpha": "base3-free-ox-alpha",
-  "minimax/minimax-m3": "base3-free-minimax-m3",
-  "crof/kimi-k3-eco": "base3-free-kimi-k3-eco",
-  "meta/muse-spark-1.2-contributor": "base3-free-muse-spark",
-  "meta/muse-spark-1.3-contributor": "base3-free-muse-spark-1-3",
+  "mimo/mimo-v2.5": "base2-free-mimo",
+  "mimo/mimo-v2.6-pro": "base2-free-mimo-2-6-pro",
+  "z-ai/glm-5.3-flash": "base2-free-glm-5-3-flash",
+  "z-ai/glm-5.2": "base2-free-glm",
+  "deepseek/deepseek-v4-flash": "base2-free-deepseek-flash",
+  "deepseek/deepseek-v4-flash-fast": "base2-free-deepseek-flash",
+  "deepseek/deepseek-v4-pro": "base2-free-deepseek",
+  "openai/gpt-6-luna": "base2-free-luna-6",
+  "openai/gpt-5.6-luna": "base2-free-luna",
+  "openai/gpt-6.1-sol": "base2-free-gpt-6-1-sol",
+  "openai/gpt-5.6-luna-es": "base2-free-luna-es",
+  "google/gemini-3.8-flash": "base2-free-gemini-3-8-flash",
+  "google/gemini-4-argon": "base2-free-gemini-4-argon",
+  "upstage/solar-mini4": "base2-free-solar-mini4",
+  "upstage/solar-pro4": "base2-free-solar-pro4",
+  "stealth/space-bunny-alpha": "base2-free-space-bunny-alpha",
+  "stealth/ox-alpha": "base2-free-ox-alpha",
+  "minimax/minimax-m3": "base2-free-minimax-m3",
+  "crof/kimi-k3-eco": "base2-free-kimi-k3-eco",
+  "meta/muse-spark-1.2-contributor": "base2-free-muse-spark",
+  "meta/muse-spark-1.3-contributor": "base2-free-muse-spark-1-3",
 };
 
 // Session/agent-run calls get the same 20s budget the official CLI gives them.
@@ -1741,7 +1740,7 @@ export class FreebuffExecutor extends BaseExecutor {
         ctx.admissionModel = resolveModelForAdmission(catalog, modelKey);
 
         session = await getFreebuffSession(token, modelKey, ctx);
-        // Catalog keys ride the base3-free-catalog root agent; legacy ids keep their pinned map entry.
+        // Catalog keys ride the base2-free root agent; legacy ids keep their pinned map entry.
         const agentId = resolveFreebuffAgent(session.resolvedModel);
         startFailed = true;
         lease = await acquireAgentRun(token, agentId, ctx);

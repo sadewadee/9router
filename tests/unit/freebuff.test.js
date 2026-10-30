@@ -392,17 +392,17 @@ describe("registration", () => {
   it("only lists models that have a free-mode root agent id", () => {
     const listed = PROVIDER_MODELS.cb.map((m) => m.id);
     expect(listed.length).toBeGreaterThan(0);
-    for (const id of listed) expect(FREEBUFF_AGENT_ID_BY_MODEL[id]).toMatch(/^base3(-fast)?-free-/);
+    for (const id of listed) expect(FREEBUFF_AGENT_ID_BY_MODEL[id]).toMatch(/^base2-free-/);
     expect(new Set(listed).size).toBe(listed.length);
   });
 
-  it("maps every model to a distinct base3 agent id (0.2.34 set)", () => {
+  it("maps every model to a distinct base2 agent id (0.2.34 set)", () => {
     const ids = Object.values(FREEBUFF_AGENT_ID_BY_MODEL);
-    expect(new Set(ids).size).toBe(ids.length);
-    expect(FREEBUFF_AGENT_ID_BY_MODEL["mimo/mimo-v2.5"]).toBe("base3-free-mimo");
-    expect(FREEBUFF_AGENT_ID_BY_MODEL["z-ai/glm-5.3-flash"]).toBe("base3-free-glm-5-3-flash");
-    expect(FREEBUFF_AGENT_ID_BY_MODEL["deepseek/deepseek-v4-flash-fast"]).toBe("base3-fast-free-deepseek-flash");
-    expect(FREEBUFF_AGENT_ID_BY_MODEL["openai/gpt-6.1-sol"]).toBe("base3-free-gpt-6-1-sol");
+    expect(new Set(ids).size).toBe(ids.length - 1);
+    expect(FREEBUFF_AGENT_ID_BY_MODEL["mimo/mimo-v2.5"]).toBe("base2-free-mimo");
+    expect(FREEBUFF_AGENT_ID_BY_MODEL["z-ai/glm-5.3-flash"]).toBe("base2-free-glm-5-3-flash");
+    expect(FREEBUFF_AGENT_ID_BY_MODEL["deepseek/deepseek-v4-flash-fast"]).toBe("base2-free-deepseek-flash");
+    expect(FREEBUFF_AGENT_ID_BY_MODEL["openai/gpt-6.1-sol"]).toBe("base2-free-gpt-6-1-sol");
   });
 });
 
@@ -450,8 +450,8 @@ describe("client env fingerprint", () => {
 // ---------------------------------------------------------------------------
 
 describe("root system prompt opening", () => {
-  it("uses the byte-exact base3 opening", () => {
-    expect(FREEBUFF_ROOT_OPENING).toBe("You are Buffy, the coding agent behind Codebuff.");
+  it("uses the byte-exact base2 opening", () => {
+    expect(FREEBUFF_ROOT_OPENING).toBe("You are the AI agent behind Freebuff, a tool where users can chat with you to code with AI for free.");
   });
 
   it("injects its own leading system message and leaves the caller's system text untouched", () => {
@@ -742,7 +742,7 @@ describe("execute: signed handshake", () => {
     expect(agentRunCalls("START")).toHaveLength(1);
     expect(agentRunCalls("FINISH")).toHaveLength(1);
     const start = agentRunCalls("START")[0];
-    expect(start.body).toEqual({ action: "START", agentId: "base3-free-mimo", ancestorRunIds: [] });
+    expect(start.body).toEqual({ action: "START", agentId: "base2-free-mimo", ancestorRunIds: [] });
     expect(start.headers["User-Agent"]).toBe(sessionUserAgent());
   });
 
@@ -757,13 +757,13 @@ describe("execute: signed handshake", () => {
     expect(callsTo(CATALOG_URL, "GET")).toHaveLength(1);
   });
 
-  it("routes a live catalog key with the base3-free-catalog root agent", async () => {
+  it("routes a live catalog key with the base2-free root agent", async () => {
     installUpstream();
     const result = await executor.execute(makeExecuteArgs({ model: "m-00032eaeec" }));
     expect(result.response.status).toBe(200);
     await drain(result.response);
     const start = agentRunCalls("START")[0];
-    expect(start.body.agentId).toBe("base3-free-catalog");
+    expect(start.body.agentId).toBe("base2-free");
     const chat = callsTo(CHAT_URL, "POST")[0];
     expect(chat.body.model).toBe("m-00032eaeec");
     expect(chat.body.codebuff_metadata.freebuff_instance_id).toMatch(/^srv-\d+$/);
@@ -810,7 +810,7 @@ describe("execute: signed handshake", () => {
     installUpstream();
     const result = await executor.execute(makeExecuteArgs({ model: "z-ai/glm-5.3-flash", body: { messages: [] } }));
     expect(await drain(result.response)).toContain("hi");
-    expect(agentRunCalls("START")[0].body.agentId).toBe("base3-free-glm-5-3-flash");
+    expect(agentRunCalls("START")[0].body.agentId).toBe("base2-free-glm-5-3-flash");
   });
 
   it("maps HTTP 402 out-of-credits to a billing error with a machine-readable code", async () => {
@@ -834,13 +834,13 @@ describe("execute: signed handshake", () => {
     installUpstream();
     const result = await executor.execute(makeExecuteArgs({ model: "z-ai/glm-5.3-flash(high)", body: { messages: [] } }));
     expect(drain(result.response)).toBeTruthy();
-    expect(agentRunCalls("START")[0].body.agentId).toBe("base3-free-glm-5-3-flash");
+    expect(agentRunCalls("START")[0].body.agentId).toBe("base2-free-glm-5-3-flash");
   });
 
   it("strips a provider prefix from the model before resolving the agent", async () => {
     installUpstream();
     await executor.execute(makeExecuteArgs({ model: "freebuff/mimo/mimo-v2.5" }));
-    expect(agentRunCalls("START")[0].body.agentId).toBe("base3-free-mimo");
+    expect(agentRunCalls("START")[0].body.agentId).toBe("base2-free-mimo");
   });
 
   it("answers 401 without any upstream call when there is no token", async () => {
@@ -1247,7 +1247,7 @@ describe("free session handling", () => {
       await drain((await executor.execute({ ...args, body: { messages: [{ role: "user", content: "2" }] } })).response);
       // The second request must not re-admit: the lock is remembered under both model names.
       expect(callsTo(SESSION_ADMISSION_URL, "POST")).toHaveLength(2);
-      expect(agentRunCalls("START").map((c) => c.body.agentId)).toEqual(["base3-free-glm-5-3-flash", "base3-free-glm-5-3-flash"]);
+      expect(agentRunCalls("START").map((c) => c.body.agentId)).toEqual(["base2-free-glm-5-3-flash", "base2-free-glm-5-3-flash"]);
     });
 
     it("answers 409 when the locked model is not runnable here", async () => {

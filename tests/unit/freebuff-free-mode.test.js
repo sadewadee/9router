@@ -42,14 +42,14 @@ afterEach(() => {
 
 describe("resolveFreebuffAgent", () => {
   it("maps catalog keys and opaque handles to the catalog root agent", () => {
-    expect(resolveFreebuffAgent("m-096e75164d")).toBe("base3-free-catalog");
-    expect(resolveFreebuffAgent("m-7e20df6765")).toBe("base3-free-catalog");
-    expect(resolveFreebuffAgent("fbm1.abc123")).toBe("base3-free-catalog");
+    expect(resolveFreebuffAgent("m-096e75164d")).toBe("base2-free");
+    expect(resolveFreebuffAgent("m-7e20df6765")).toBe("base2-free");
+    expect(resolveFreebuffAgent("fbm1.abc123")).toBe("base2-free");
   });
 
   it("keeps the pinned agent for legacy model ids", () => {
-    expect(resolveFreebuffAgent("deepseek/deepseek-v4-flash")).toBe("base3-free-deepseek-flash");
-    expect(resolveFreebuffAgent("mimo/mimo-v2.5")).toBe("base3-free-mimo");
+    expect(resolveFreebuffAgent("deepseek/deepseek-v4-flash")).toBe("base2-free-deepseek-flash");
+    expect(resolveFreebuffAgent("mimo/mimo-v2.5")).toBe("base2-free-mimo");
   });
 
   it("falls back to codebuff for unknown models", () => {
