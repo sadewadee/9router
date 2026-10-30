@@ -1729,15 +1729,15 @@ export class FreebuffExecutor extends BaseExecutor {
     const targetModel = resolveModel(model);
     const tokenHash = tokenHashOf(token);
     const accountId = accountIdOf(credentials);
-    const deviceKey = getDeviceKeyManager(credentials, { log }, CLIENT_CLI);
+    const deviceKey = getDeviceKeyManager(credentials, { log }, CLIENT_DESKTOP);
 
-    const ctx = { proxyOptions: directEgressOptions(proxyOptions, log), signal, log, deviceKey, accountId, lane: CLIENT_CLI };
-    const catalogCtx = { token, deviceKey, accountId, client: CLIENT_CLI, proxyFetch: proxyAwareFetch, proxyOptions: ctx.proxyOptions, log };
+    const ctx = { proxyOptions: directEgressOptions(proxyOptions, log), signal, log, deviceKey, accountId, lane: CLIENT_DESKTOP, desktopInstanceId: `free-${randomUUID()}`, desktopAttemptId: randomUUID() };
+    const catalogCtx = { token, deviceKey, accountId, client: CLIENT_DESKTOP, proxyFetch: proxyAwareFetch, proxyOptions: ctx.proxyOptions, log };
 
     // Catalog first (cached): its fetchId is bound into the admission and chat signatures, and the
     // live rows decide whether the model is routable at all.
     let catalog = await getFreebuffCatalog(catalogCtx);
-    let fetchId = cachedFetchId(tokenHash, CLIENT_CLI);
+    let fetchId = cachedFetchId(tokenHash, CLIENT_DESKTOP);
 
     for (let attempt = 0; attempt < 2; attempt++) {
       let session;
@@ -1823,7 +1823,7 @@ export class FreebuffExecutor extends BaseExecutor {
           if (retry === "catalog" || retry === "devicekey") {
             invalidateFreebuffCatalog(tokenHash);
             catalog = await getFreebuffCatalog({ ...catalogCtx, force: true });
-            fetchId = cachedFetchId(tokenHash, CLIENT_CLI);
+            fetchId = cachedFetchId(tokenHash, CLIENT_DESKTOP);
           }
           continue;
         }
