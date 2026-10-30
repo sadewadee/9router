@@ -41,14 +41,11 @@ afterEach(() => {
 });
 
 describe("resolveFreebuffAgent", () => {
-  it("maps catalog keys to their model-specific agent via reverse lookup", () => {
-    expect(resolveFreebuffAgent("m-69307952f8")).toBe("base2-free-solar-mini4");
-    expect(resolveFreebuffAgent("m-9a7e098cc1")).toBe("base2-free-solar-pro4");
-    expect(resolveFreebuffAgent("m-096e75164d")).toBe("base2-free-deepseek-flash");
-    expect(resolveFreebuffAgent("m-7e20df6765")).toBe("base2-free-glm-5-3-flash");
-  });
-
-  it("falls back to base2-free for unknown catalog keys and opaque handles", () => {
+  it("returns root base2-free for all catalog keys and opaque handles", () => {
+    expect(resolveFreebuffAgent("m-69307952f8")).toBe("base2-free");
+    expect(resolveFreebuffAgent("m-9a7e098cc1")).toBe("base2-free");
+    expect(resolveFreebuffAgent("m-096e75164d")).toBe("base2-free");
+    expect(resolveFreebuffAgent("m-7e20df6765")).toBe("base2-free");
     expect(resolveFreebuffAgent("m-0000000000")).toBe("base2-free");
     expect(resolveFreebuffAgent("fbm1.abc123")).toBe("base2-free");
   });
