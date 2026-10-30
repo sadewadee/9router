@@ -232,6 +232,14 @@ export const FREEBUFF_AGENT_ID_BY_MODEL = {
   "crof/kimi-k3-eco": "base2-free-kimi-k3-eco",
   "meta/muse-spark-1.2-contributor": "base2-free-muse-spark",
   "meta/muse-spark-1.3-contributor": "base2-free-muse-spark-1-3",
+  "deepseek/deepseek-v4.1-flash": "base2-free-deepseek-v4-1-flash",
+  "deepseek/deepseek-v4.1-flash-fast": "base2-free-deepseek-flash-fast",
+  "deepseek/deepseek-v4.1-flash-slow": "base2-free-deepseek-flash",
+  "mimo/mimo-v2.6-flash": "base2-free-mimo",
+  "mimo/mimo-v2.6-flash-fast": "base2-free-mimo",
+  "mimo/mimo-v2.6-flash-slow": "base2-free-mimo",
+  "nvidia/nemotron-3.5-lightning": "base2-free",
+  "stealth/glyph-cluster": "base2-free",
 };
 
 // Session/agent-run calls get the same 20s budget the official CLI gives them.
@@ -1741,7 +1749,6 @@ export class FreebuffExecutor extends BaseExecutor {
         ctx.admissionModel = resolveModelForAdmission(catalog, modelKey);
 
         session = await getFreebuffSession(token, modelKey, ctx);
-        // Catalog keys ride the base2-free root agent; legacy ids keep their pinned map entry.
         const agentId = resolveFreebuffAgent(session.resolvedModel);
         startFailed = true;
         lease = await acquireAgentRun(token, agentId, ctx);

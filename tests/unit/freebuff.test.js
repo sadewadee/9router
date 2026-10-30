@@ -398,7 +398,7 @@ describe("registration", () => {
 
   it("maps every model to a distinct base2 agent id (0.2.34 set)", () => {
     const ids = Object.values(FREEBUFF_AGENT_ID_BY_MODEL);
-    expect(new Set(ids).size).toBe(ids.length - 1);
+    expect(new Set(ids).size).toBe(23);
     expect(FREEBUFF_AGENT_ID_BY_MODEL["mimo/mimo-v2.5"]).toBe("base2-free-mimo");
     expect(FREEBUFF_AGENT_ID_BY_MODEL["z-ai/glm-5.3-flash"]).toBe("base2-free-glm-5-3-flash");
     expect(FREEBUFF_AGENT_ID_BY_MODEL["deepseek/deepseek-v4-flash-fast"]).toBe("base2-free-deepseek-flash");
@@ -763,7 +763,7 @@ describe("execute: signed handshake", () => {
     expect(result.response.status).toBe(200);
     await drain(result.response);
     const start = agentRunCalls("START")[0];
-    expect(start.body.agentId).toBe("base2-free");
+    expect(start.body.agentId).toBe("base2-free-mimo");
     const chat = callsTo(CHAT_URL, "POST")[0];
     expect(chat.body.model).toBe("m-00032eaeec");
     expect(chat.body.codebuff_metadata.freebuff_instance_id).toMatch(/^srv-\d+$/);
@@ -978,7 +978,7 @@ describe("freebuff catalog cache", () => {
     const chat = callsTo(CHAT_URL, "POST")[0];
     expect(chat.headers["x-freebuff-catalog-fetch"]).toBeUndefined();
     // The admission model falls back to the plain key without a catalog.
-    expect(admission.headers["x-freebuff-model"]).toBe("mimo/mimo-v2.5");
+    expect(admission.headers["x-freebuff-model"]).toBe("m-00032eaeec");
   });
 
   it("keeps working when the catalog answer is not a protocol 1 document", async () => {

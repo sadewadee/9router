@@ -1,5 +1,6 @@
 import { createHash } from "crypto";
 import { FREEBUFF_AGENT_ID_BY_MODEL } from "../executors/freebuff.js";
+import { freebuffHandleFor } from "./freebuffCatalog.js";
 
 export const CARRIER_PLAN_SYMBOL = Symbol("freebuffCarrierPlan");
 
@@ -66,10 +67,21 @@ export const SIGNATURE_TOOL_DEFINITIONS = [
   },
 ];
 
+let catalogKeyAgentIds = null;
+
+function agentIdForCatalogKey(key) {
+  if (!catalogKeyAgentIds) {
+    catalogKeyAgentIds = Object.fromEntries(
+      Object.entries(FREEBUFF_AGENT_ID_BY_MODEL).map(([model, agentId]) => [freebuffHandleFor(model), agentId]),
+    );
+  }
+  return catalogKeyAgentIds[key] ?? "base2-free";
+}
+
 export function resolveFreebuffAgent(model) {
   if (typeof model === "string") {
-    if (CATALOG_KEY_PATTERN.test(model) || model.startsWith("fbm1.")) return "base2-free";
-    if (FREEBUFF_AGENT_ID_BY_MODEL[model]) return "base2-free";
+    if (CATALOG_KEY_PATTERN.test(model) || model.startsWith("fbm1.")) return agentIdForCatalogKey(model);
+    if (FREEBUFF_AGENT_ID_BY_MODEL[model]) return FREEBUFF_AGENT_ID_BY_MODEL[model];
   }
   return "codebuff";
 }
