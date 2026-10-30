@@ -160,7 +160,8 @@ function aiSdkVersion() {
   return process.env.FREEBUFF_AISDK_VERSION || DEFAULT_AISDK_VERSION;
 }
 
-function chatUserAgent() {
+function chatUserAgent(isFreeMode = false) {
+  if (isFreeMode) return `ai-sdk/openai-compatible/${aiSdkVersion()}/freebuff-chatgpt`;
   return process.env.FREEBUFF_USER_AGENT || `ai-sdk/openai-compatible/${aiSdkVersion()}/codebuff`;
 }
 
@@ -1272,11 +1273,11 @@ function buildChatBody(
 
 // Chat headers, mirroring the CLI provider factory + YWA: ai-sdk user agent, gzip recovery,
 // acting user, catalog fetch binding, and the device-key signature over this exact body.
-async function buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, deviceKey }) {
+async function buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, deviceKey, isFreeMode = false }) {
   const headers = {
     "Content-Type": "application/json",
     Authorization: `Bearer ${token}`,
-    "User-Agent": chatUserAgent(),
+    "User-Agent": chatUserAgent(isFreeMode),
     Accept: stream ? "text/event-stream" : "application/json",
     [HEADER_GZIP_RECOVERY]: "1",
   };
@@ -1764,7 +1765,7 @@ export class FreebuffExecutor extends BaseExecutor {
         });
         carrierPlan = transformedBody[CARRIER_PLAN_SYMBOL] || null;
         bodyStr = JSON.stringify(transformedBody);
-        chatHeaders = await buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, deviceKey });
+        chatHeaders = await buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, deviceKey, isFreeMode: true });
       } catch (err) {
         if (err instanceof FreebuffHttpError) {
           // A START that reports a dead session (not our own queued answer) gets one fresh admission.

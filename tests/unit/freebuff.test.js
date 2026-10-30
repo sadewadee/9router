@@ -418,6 +418,11 @@ describe("user agents and versions", () => {
     expect(DEFAULT_CLI_VERSION).toBe("0.2.34");
   });
 
+  it("free-mode chat UA carries the freebuff-chatgpt suffix", () => {
+    expect(chatUserAgent(true)).toBe(`ai-sdk/openai-compatible/${DEFAULT_AISDK_VERSION}/freebuff-chatgpt`);
+    expect(chatUserAgent(false)).toBe(`ai-sdk/openai-compatible/${DEFAULT_AISDK_VERSION}/codebuff`);
+  });
+
   it("env overrides both versions (read at request time)", () => {
     process.env.FREEBUFF_AISDK_VERSION = "9.9.9";
     process.env.FREEBUFF_CLI_VERSION = "1.2.3";
@@ -704,7 +709,7 @@ describe("execute: signed handshake", () => {
     expect(await drain(result.response)).toContain("hi");
 
     const chat = callsTo(CHAT_URL, "POST")[0];
-    expect(chat.headers["User-Agent"]).toBe(chatUserAgent());
+    expect(chat.headers["User-Agent"]).toBe(chatUserAgent(true));
     expect(chat.headers[HEADER_GZIP_RECOVERY]).toBe("1");
     expect(chat.headers["x-freebuff-acting-user-id"]).toBe("user-42");
     expect(chat.headers["x-freebuff-catalog-fetch"]).toBe("fetch-test-1");
