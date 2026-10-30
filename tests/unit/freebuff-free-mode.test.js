@@ -47,9 +47,11 @@ describe("resolveFreebuffAgent", () => {
     expect(resolveFreebuffAgent("fbm1.abc123")).toBe("base2-free");
   });
 
-  it("keeps the pinned agent for legacy model ids", () => {
-    expect(resolveFreebuffAgent("deepseek/deepseek-v4-flash")).toBe("base2-free-deepseek-flash");
-    expect(resolveFreebuffAgent("mimo/mimo-v2.5")).toBe("base2-free-mimo");
+  it("routes all known free models to the root agent", () => {
+    expect(resolveFreebuffAgent("deepseek/deepseek-v4-flash")).toBe("base2-free");
+    expect(resolveFreebuffAgent("mimo/mimo-v2.5")).toBe("base2-free");
+    expect(resolveFreebuffAgent("upstage/solar-mini4")).toBe("base2-free");
+    expect(resolveFreebuffAgent("upstage/solar-pro4")).toBe("base2-free");
   });
 
   it("falls back to codebuff for unknown models", () => {
