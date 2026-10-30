@@ -127,11 +127,14 @@ export function resolveAdmissionModel(catalog, modelKey) {
 
 const MODEL_DISPLAY_HINTS = {
   "mimo/mimo-v2.6-flash": "MiMo v2.6 Flash Fast",
+  "mimo/mimo-v2.6-flash-fast": "MiMo v2.6 Flash Fast",
   "mimo/mimo-v2.6-flash-slow": "MiMo v2.6 Flash Slow",
   "zhipu/glm-5.3-flash": "GLM 5.3 Flash",
   "z-ai/glm-5.3-flash": "GLM 5.3 Flash",
   "deepseek/deepseek-v4-flash": "DeepSeek V4.1 Flash 10/17",
+  "deepseek/deepseek-v4.1-flash": "DeepSeek V4.1 Flash 10/17",
   "deepseek/deepseek-v4-flash-slow": "DeepSeek V4.1 Flash Slow",
+  "deepseek/deepseek-v4.1-flash-slow": "DeepSeek V4.1 Flash Slow",
   "upstage/solar-mini4": "Solar Mini 4",
   "upstage/solar-pro4": "Solar Pro 4",
   "stealth/glyph-cluster": "Glyph Cluster",
