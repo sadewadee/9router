@@ -1757,9 +1757,8 @@ export class FreebuffExecutor extends BaseExecutor {
         lease = await acquireAgentRun(token, agentId, ctx);
         startFailed = false;
 
-        const chatModel = ctx.admissionModel || session.resolvedModel;
         const transformedBody = buildChatBody(body, {
-          model: chatModel,
+          model: session.resolvedModel,
           runId: lease.runId,
           instanceId: session.instanceId,
           reasoningEffort: body?.reasoning_effort ?? null,
