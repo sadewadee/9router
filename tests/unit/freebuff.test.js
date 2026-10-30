@@ -18,6 +18,8 @@ import {
   visibleRows,
   catalogTtlMs,
   resolveAdmissionModel,
+  resolveCatalogKey,
+  freebuffHandleFor,
   invalidateFreebuffCatalog,
 } from "../../open-sse/utils/freebuffCatalog.js";
 import { PROVIDERS } from "../../open-sse/config/providers.js";
@@ -211,6 +213,26 @@ function installUpstream(overrides = {}) {
     throw new Error(`unexpected fetch to ${url}`);
   });
   return { catalogBody };
+}
+
+// Catalog whose rows are keyed like production ("m-<10hex>"); deepseek/deepseek-v4-flash is
+// m-096e75164d (freebuffHandleFor). Admission normalises the sent handle back to the row key.
+const DEEPSEEK_ID = "deepseek/deepseek-v4-flash";
+const DEEPSEEK_KEY = "m-096e75164d";
+const DEEPSEEK_HANDLE = "fbm1.AAEdeepseek";
+function keyedCatalogOverrides() {
+  const rows = [
+    { key: "m-00032eaeec", handle: "fbm1.AAEmimoKey", displayName: "MiMo Free", access: "open", sortOrder: 1 },
+    { key: DEEPSEEK_KEY, handle: DEEPSEEK_HANDLE, displayName: "DeepSeek V4 Flash", access: "open", sortOrder: 2 },
+  ];
+  let instanceSeq = 0;
+  return {
+    catalog: () => json({ protocol: 1, version: "t", issuedAt: Date.now(), refreshAt: Date.now() + 5 * 60_000, rows, fetchId: "fetch-test-1" }),
+    admission: (headers) => {
+      const row = rows.find((candidate) => candidate.handle === headers["x-freebuff-model"]);
+      return json({ status: "active", instanceId: `srv-k${++instanceSeq}`, model: row ? row.key : headers["x-freebuff-model"], remainingMs: 600_000 });
+    },
+  };
 }
 
 async function drain(response) {
@@ -747,6 +769,43 @@ describe("execute: signed handshake", () => {
     expect(chat.body.codebuff_metadata.freebuff_instance_id).toMatch(/^srv-\d+$/);
   });
 
+  it("translates a human model id to its catalog key before admission and chat", async () => {
+    installUpstream(keyedCatalogOverrides());
+    const result = await executor.execute(makeExecuteArgs({ model: `cb/${DEEPSEEK_ID}` }));
+    expect(result.response.status).toBe(200);
+    await drain(result.response);
+    const admission = callsTo(SESSION_ADMISSION_URL, "POST")[0];
+    expect(admission.headers["x-freebuff-model"]).toBe(DEEPSEEK_HANDLE); // row handle, not the key or the human id
+    const chat = callsTo(CHAT_URL, "POST")[0];
+    expect(chat.body.model).toBe(DEEPSEEK_KEY); // catalog key, not the human id
+  });
+
+  it("still accepts the catalog key itself", async () => {
+    installUpstream(keyedCatalogOverrides());
+    const result = await executor.execute(makeExecuteArgs({ model: `cb/${DEEPSEEK_KEY}` }));
+    expect(result.response.status).toBe(200);
+    await drain(result.response);
+    expect(callsTo(SESSION_ADMISSION_URL, "POST")[0].headers["x-freebuff-model"]).toBe(DEEPSEEK_HANDLE);
+    expect(callsTo(CHAT_URL, "POST")[0].body.model).toBe(DEEPSEEK_KEY);
+  });
+
+  it("shares one session between the human id and the key of the same model", async () => {
+    installUpstream(keyedCatalogOverrides());
+    const credentials = { accessToken: newToken(), providerSpecificData: { freebuffDeviceKey: testRecord } };
+    await drain((await executor.execute(makeExecuteArgs({ model: `cb/${DEEPSEEK_ID}`, credentials }))).response);
+    await drain((await executor.execute(makeExecuteArgs({ model: `cb/${DEEPSEEK_KEY}`, credentials }))).response);
+    expect(callsTo(SESSION_ADMISSION_URL, "POST")).toHaveLength(1);
+    expect(releaseCalls()).toHaveLength(0);
+  });
+
+  it("answers 502 invalid_model for an id that is neither a catalog key nor derives to one", async () => {
+    installUpstream(keyedCatalogOverrides());
+    const result = await executor.execute(makeExecuteArgs({ model: "cb/deepseek/not-a-real-model" }));
+    expect(result.response.status).toBe(502);
+    expect((await result.response.json()).error.code).toBe("invalid_model");
+    expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(0);
+  });
+
   it("keeps the static agent map for legacy ids that match", async () => {
     installUpstream();
     const result = await executor.execute(makeExecuteArgs({ model: "z-ai/glm-5.3-flash", body: { messages: [] } }));
@@ -954,6 +1013,40 @@ describe("freebuff catalog cache", () => {
   it("falls back to the row key only when the row carries no handle", () => {
     const catalog = { rows: [{ key: "m-00032eaeec" }] };
     expect(resolveAdmissionModel(catalog, "m-00032eaeec")).toBe("m-00032eaeec");
+  });
+
+  it("derives the catalog key of a human model id (official client formula)", () => {
+    expect(freebuffHandleFor(DEEPSEEK_ID)).toBe(DEEPSEEK_KEY);
+    expect(freebuffHandleFor("z-ai/glm-5.3-flash")).toBe("m-7e20df6765");
+  });
+
+  it("resolves a human id through the derived catalog key", () => {
+    const catalog = { rows: [{ key: "m-00032eaeec", handle: "fbm1.AAEmimo" }, { key: DEEPSEEK_KEY, handle: "fbm1.AAEdeepseek" }] };
+    expect(resolveCatalogKey(catalog, DEEPSEEK_ID)).toBe(DEEPSEEK_KEY);
+    expect(resolveAdmissionModel(catalog, DEEPSEEK_ID)).toBe("fbm1.AAEdeepseek");
+  });
+
+  it("still resolves an exact catalog key", () => {
+    const catalog = { rows: [{ key: DEEPSEEK_KEY, handle: "fbm1.AAEdeepseek" }] };
+    expect(resolveCatalogKey(catalog, DEEPSEEK_KEY)).toBe(DEEPSEEK_KEY);
+    expect(resolveAdmissionModel(catalog, DEEPSEEK_KEY)).toBe("fbm1.AAEdeepseek");
+  });
+
+  it("returns null for an unknown id, a missing catalog and an empty model", () => {
+    const catalog = { rows: [{ key: DEEPSEEK_KEY, handle: "fbm1.AAEdeepseek" }] };
+    expect(resolveCatalogKey(catalog, "who/dis")).toBeNull();
+    expect(resolveAdmissionModel(catalog, "who/dis")).toBeNull();
+    expect(resolveCatalogKey(null, DEEPSEEK_ID)).toBeNull();
+    expect(resolveCatalogKey(catalog, "")).toBeNull();
+    expect(resolveCatalogKey(catalog, undefined)).toBeNull();
+  });
+
+  it("prefers an exact key over the derived one and ignores rows that are not open yet", () => {
+    const glmKey = freebuffHandleFor("z-ai/glm-5.3-flash");
+    const both = { rows: [{ key: glmKey, handle: "h-derived" }, { key: "z-ai/glm-5.3-flash", handle: "h-exact" }] };
+    expect(resolveCatalogKey(both, "z-ai/glm-5.3-flash")).toBe("z-ai/glm-5.3-flash");
+    const future = { rows: [{ key: DEEPSEEK_KEY, handle: "h", opensAt: Date.now() + 60_000 }] };
+    expect(resolveCatalogKey(future, DEEPSEEK_ID)).toBeNull();
   });
 });
 
@@ -1918,6 +2011,15 @@ describe("cloud-run lane (desktop protocol)", () => {
 
     // Polling walked the run's event page (client-minted run id).
     expect(allCalls().some((c) => c.method === "GET" && String(c.url).startsWith(`${CLOUD_RUNS_URL}/`))).toBe(true);
+  });
+
+  it("translates a human model id to its catalog key for the admission and the cloud run", async () => {
+    installUpstream(keyedCatalogOverrides());
+    const result = await executor.execute(makeExecuteArgs({ model: `cb/${DEEPSEEK_ID}`, credentials: desktopCredentials() }));
+    expect(result.response.status).toBe(200);
+    await result.response.text();
+    expect(callsTo(SESSION_ADMISSION_URL, "POST")[0].headers["x-freebuff-model"]).toBe(DEEPSEEK_HANDLE);
+    expect(callsTo(CLOUD_RUNS_URL, "POST")[0].body.model).toBe(DEEPSEEK_KEY);
   });
 
   it("renders a non-streaming cloud run as a chat.completion JSON body", async () => {

@@ -121,8 +121,22 @@ export function invalidateFreebuffCatalog(tokenHash = null) {
 // digest is diagnostic only and never goes out. No row for the model -> null; the caller answers
 // 502 invalid_model instead of guessing. A row without a handle falls back to its key.
 export function resolveAdmissionModel(catalog, modelKey) {
-  const row = visibleRows(catalog).find((candidate) => candidate.key === modelKey);
+  const row = findCatalogRow(catalog, modelKey);
   return row ? row.handle || row.key || null : null;
+}
+
+// Callers name models by their human id ("deepseek/deepseek-v4-flash") while live rows are keyed
+// "m-<10hex>". A visible row matches by exact key first, else by the key the official client
+// derives from the human id (freebuffHandleFor).
+function findCatalogRow(catalog, model) {
+  if (typeof model !== "string" || !model) return null;
+  const rows = visibleRows(catalog);
+  return rows.find((row) => row.key === model) || rows.find((row) => row.key === freebuffHandleFor(model)) || null;
+}
+
+// Catalog row key for a model named by key or by human id; null when no visible row matches.
+export function resolveCatalogKey(catalog, model) {
+  return findCatalogRow(catalog, model)?.key ?? null;
 }
 
 async function fetchOnce({ token, deviceKey, accountId, client, proxyFetch, proxyOptions, signal, log }) {
