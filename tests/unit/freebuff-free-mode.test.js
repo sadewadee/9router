@@ -284,15 +284,15 @@ describe("buildChatBody with freeModeTransforms", () => {
     expect(names).toEqual(["proxy__Bash", "web_search", "lookup_agent_info", "decide"]);
     expect(body.messages.find((m) => m.role === "assistant").tool_calls[0].function.name).toBe("proxy__Bash");
     expect(body.messages.find((m) => m.role === "tool").name).toBe("proxy__Bash");
-    expect(body.codebuff_metadata.cost_mode).toBe("free");
+    expect(body.codebuff.codebuff_metadata.cost_mode).toBe("free");
     expect(body[CARRIER_PLAN_SYMBOL].active).toBe(true);
   });
 
   it("honours the env override and the omit sentinel", () => {
     process.env.FREEBUFF_COST_MODE = "normal";
-    expect(buildChatBody(baseBody(), { model: "m", runId: "r", freeModeTransforms: {} }).codebuff_metadata.cost_mode).toBe("normal");
+    expect(buildChatBody(baseBody(), { model: "m", runId: "r", freeModeTransforms: {} }).codebuff.codebuff_metadata.cost_mode).toBe("normal");
     process.env.FREEBUFF_COST_MODE = "omit";
-    expect(buildChatBody(baseBody(), { model: "m", runId: "r", freeModeTransforms: {} }).codebuff_metadata.cost_mode).toBeUndefined();
+    expect(buildChatBody(baseBody(), { model: "m", runId: "r", freeModeTransforms: {} }).codebuff.codebuff_metadata.cost_mode).toBeUndefined();
   });
 
   it("keeps the old behaviour without freeModeTransforms", () => {
@@ -300,7 +300,7 @@ describe("buildChatBody with freeModeTransforms", () => {
     expect(body.tools.map((t) => t.function.name)).toEqual(["Bash", "web_search"]);
     expect(body.messages[1].content).toContain("You are Claude Code");
     expect(body.messages.find((m) => m.role === "assistant").tool_calls[0].function.name).toBe("Bash");
-    expect(body.codebuff_metadata.cost_mode).toBeUndefined();
+    expect(body.codebuff.codebuff_metadata.cost_mode).toBeUndefined();
     expect(body[CARRIER_PLAN_SYMBOL]).toBeUndefined();
   });
 
