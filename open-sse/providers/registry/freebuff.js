@@ -48,9 +48,10 @@ export default {
     { id: "stealth/space-bunny-alpha", name: "Space Bunny Alpha (Free, Beta)" },
     { id: "meta/muse-spark-1.2-contributor", name: "Muse Spark 1.2 (Free, trains on prompts)" },
   ],
+  // Login follows the official Freebuff Desktop (auth host freebuff.com), not the Codebuff CLI device flow.
   oauth: {
-    deviceCodeUrl: "https://www.codebuff.com/api/auth/cli/code",
-    tokenUrl: "https://www.codebuff.com/api/auth/cli/status",
+    deviceCodeUrl: "https://freebuff.com/api/auth/cli/code",
+    tokenUrl: "https://freebuff.com/api/auth/cli/status",
   },
   // Unknown ids reach the executor, which answers a clean 400 when it has no agent id for them.
   passthroughModels: true,
