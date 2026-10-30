@@ -1767,7 +1767,7 @@ export class FreebuffExecutor extends BaseExecutor {
         });
         carrierPlan = transformedBody[CARRIER_PLAN_SYMBOL] || null;
         bodyStr = JSON.stringify(transformedBody);
-        chatHeaders = await buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, deviceKey });
+        chatHeaders = await buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, deviceKey, lane: CLIENT_DESKTOP });
       } catch (err) {
         if (err instanceof FreebuffHttpError) {
           // A START that reports a dead session (not our own queued answer) gets one fresh admission.
