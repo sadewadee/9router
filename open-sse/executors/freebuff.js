@@ -1272,7 +1272,7 @@ function buildChatBody(
 
 // Chat headers, mirroring the CLI provider factory + YWA: ai-sdk user agent, gzip recovery,
 // acting user, catalog fetch binding, and the device-key signature over this exact body.
-async function buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, deviceKey }) {
+async function buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, deviceKey, lane }) {
   const headers = {
     "Content-Type": "application/json",
     Authorization: `Bearer ${token}`,
@@ -1280,6 +1280,9 @@ async function buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, de
     Accept: stream ? "text/event-stream" : "application/json",
     [HEADER_GZIP_RECOVERY]: "1",
   };
+  if (lane) headers[HEADER_CLIENT] = lane;
+  const version = lane === CLIENT_DESKTOP ? desktopVersion() : cliVersion();
+  if (version) headers[HEADER_CLIENT_VERSION] = version;
   if (accountId) headers[HEADER_ACTING_USER] = accountId;
   if (fetchId) headers[CATALOG_FETCH_HEADER] = fetchId;
   if (deviceKey) {
@@ -1765,7 +1768,7 @@ export class FreebuffExecutor extends BaseExecutor {
         });
         carrierPlan = transformedBody[CARRIER_PLAN_SYMBOL] || null;
         bodyStr = JSON.stringify(transformedBody);
-        chatHeaders = await buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, deviceKey });
+        chatHeaders = await buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, deviceKey, lane: ctx.lane });
       } catch (err) {
         if (err instanceof FreebuffHttpError) {
           // A START that reports a dead session (not our own queued answer) gets one fresh admission.
