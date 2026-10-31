@@ -78,18 +78,41 @@ describe("resolveFreebuffAgent", () => {
     expect(resolveFreebuffAgent("mimo/mimo-v2.6-flash-fast", null)).toBe("base2-free-mimo");
   });
 
-  it("recovers the model slug behind a catalog key from its display name", () => {
+  it("uses the generic base3-free-catalog agent for any model with a catalog row", () => {
     const catalog = {
       protocol: 1,
       rows: [
         { key: "m-096e75164d", handle: "fbm1.AAEdeepseek", displayName: "DeepSeek V4.1 Flash 10/17" },
         { key: "m-0000000001", handle: "fbm1.AAEunknown", displayName: "Unmapped Model" },
+        { key: "m-7e20df6765", handle: "fbm1.AAEglm", displayName: "GLM 5.3 Flash" },
       ],
     };
-    expect(resolveFreebuffAgent("m-096e75164d", "m-096e75164d", catalog)).toBe("base2-free-deepseek-v4-1-flash");
-    expect(resolveFreebuffAgent("m-096e75164d", null, catalog)).toBe("base2-free-deepseek-v4-1-flash");
-    expect(resolveFreebuffAgent("m-0000000001", "m-0000000001", catalog)).toBe("base2-free");
+    expect(resolveFreebuffAgent("m-096e75164d", "m-096e75164d", catalog)).toBe("base3-free-catalog");
+    expect(resolveFreebuffAgent("m-096e75164d", null, catalog)).toBe("base3-free-catalog");
+    expect(resolveFreebuffAgent("m-0000000001", "m-0000000001", catalog)).toBe("base3-free-catalog");
+    expect(resolveFreebuffAgent("z-ai/glm-5.3-flash", "m-7e20df6765", catalog)).toBe("base3-free-catalog");
+    expect(resolveFreebuffAgent("z-ai/glm-5.3-flash", null, catalog)).toBe("base3-free-catalog");
+  });
+
+  it("resolves a catalog key directly to base3-free-catalog", () => {
+    const catalog = { rows: [{ key: "m-096e75164d", handle: "fbm1.AAEdeepseek" }] };
+    expect(resolveFreebuffAgent("m-096e75164d", "m-096e75164d", catalog)).toBe("base3-free-catalog");
+  });
+
+  it("falls back to the model-specific table when the catalog has no matching row", () => {
+    const catalog = { rows: [{ key: "m-0000000001", handle: "fbm1.AAEunknown", displayName: "Unmapped Model" }] };
+    expect(resolveFreebuffAgent("z-ai/glm-5.3-flash", null, catalog)).toBe("base2-free-glm-5-3-flash");
+    expect(resolveFreebuffAgent("z-ai/glm-5.3-flash", null, { rows: [] })).toBe("base2-free-glm-5-3-flash");
+    expect(resolveFreebuffAgent("unknown/model", null, catalog)).toBe("base2-free");
+  });
+
+  it("uses the model-specific table without a catalog (legacy path)", () => {
+    expect(resolveFreebuffAgent("z-ai/glm-5.3-flash", null, null)).toBe("base2-free-glm-5-3-flash");
     expect(resolveFreebuffAgent("m-096e75164d", "m-096e75164d")).toBe("base2-free");
+  });
+
+  it("falls back to base2-free for an unknown model without a catalog", () => {
+    expect(resolveFreebuffAgent("unknown/model", null, null)).toBe("base2-free");
   });
 });
 

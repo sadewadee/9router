@@ -743,7 +743,7 @@ describe("execute: signed handshake", () => {
     expect(agentRunCalls("START")).toHaveLength(1);
     expect(agentRunCalls("FINISH")).toHaveLength(1);
     const start = agentRunCalls("START")[0];
-    expect(start.body).toEqual({ action: "START", agentId: "base2-free-mimo", ancestorRunIds: [] });
+    expect(start.body).toEqual({ action: "START", agentId: "base3-free-catalog", ancestorRunIds: [] });
     expect(start.headers["User-Agent"]).toBe(sessionUserAgent());
   });
 
@@ -807,11 +807,11 @@ describe("execute: signed handshake", () => {
     expect(callsTo(SESSION_ADMISSION_URL)).toHaveLength(0);
   });
 
-  it("keeps the static agent map for legacy ids that match", async () => {
+  it("uses base3-free-catalog for legacy ids that have a live catalog row", async () => {
     installUpstream();
     const result = await executor.execute(makeExecuteArgs({ model: "z-ai/glm-5.3-flash", body: { messages: [] } }));
     expect(await drain(result.response)).toContain("hi");
-    expect(agentRunCalls("START")[0].body.agentId).toBe("base2-free-glm-5-3-flash");
+    expect(agentRunCalls("START")[0].body.agentId).toBe("base3-free-catalog");
   });
 
   it("maps HTTP 402 out-of-credits to a billing error with a machine-readable code", async () => {
@@ -835,13 +835,13 @@ describe("execute: signed handshake", () => {
     installUpstream();
     const result = await executor.execute(makeExecuteArgs({ model: "z-ai/glm-5.3-flash(high)", body: { messages: [] } }));
     expect(drain(result.response)).toBeTruthy();
-    expect(agentRunCalls("START")[0].body.agentId).toBe("base2-free-glm-5-3-flash");
+    expect(agentRunCalls("START")[0].body.agentId).toBe("base3-free-catalog");
   });
 
   it("strips a provider prefix from the model before resolving the agent", async () => {
     installUpstream();
     await executor.execute(makeExecuteArgs({ model: "freebuff/mimo/mimo-v2.5" }));
-    expect(agentRunCalls("START")[0].body.agentId).toBe("base2-free-mimo");
+    expect(agentRunCalls("START")[0].body.agentId).toBe("base3-free-catalog");
   });
 
   it("answers 401 without any upstream call when there is no token", async () => {

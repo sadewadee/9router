@@ -1,6 +1,6 @@
 import { createHash } from "crypto";
 import { FREEBUFF_AGENT_ID_BY_MODEL } from "../executors/freebuff.js";
-import { reverseModelFromCatalog } from "./freebuffCatalog.js";
+import { reverseModelFromCatalog, resolveCatalogKey } from "./freebuffCatalog.js";
 
 export const CARRIER_PLAN_SYMBOL = Symbol("freebuffCarrierPlan");
 
@@ -66,7 +66,15 @@ export const SIGNATURE_TOOL_DEFINITIONS = [
   },
 ];
 
+// Catalog path (binary v0.2.35 lE9): a model that resolves to a catalog row always runs on the
+// generic "base3-free-catalog" agent. Without a catalog (or with no matching row) fall back to the
+// model-specific table, then "base2-free".
 export function resolveFreebuffAgent(model, resolvedModel = null, catalog = null) {
+  if (catalog) {
+    for (const candidate of [model, resolvedModel]) {
+      if (typeof candidate === "string" && resolveCatalogKey(catalog, candidate)) return "base3-free-catalog";
+    }
+  }
   for (const candidate of [model, resolvedModel]) {
     if (typeof candidate === "string" && FREEBUFF_AGENT_ID_BY_MODEL[candidate]) {
       return FREEBUFF_AGENT_ID_BY_MODEL[candidate];
