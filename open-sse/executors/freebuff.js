@@ -1748,6 +1748,7 @@ export class FreebuffExecutor extends BaseExecutor {
       let bodyStr = "";
       let chatHeaders;
       let carrierPlan = null;
+      let agentId;
       try {
         ctx.hasCatalog = Boolean(catalog);
         ctx.fetchId = fetchId;
@@ -1757,7 +1758,7 @@ export class FreebuffExecutor extends BaseExecutor {
         ctx.admissionModel = resolveModelForAdmission(catalog, modelKey);
 
         session = await getFreebuffSession(token, modelKey, ctx);
-        const agentId = resolveFreebuffAgent(targetModel, session.resolvedModel, catalog);
+        agentId = resolveFreebuffAgent(targetModel, session.resolvedModel, catalog);
         startFailed = true;
         lease = await acquireAgentRun(token, agentId, ctx);
         startFailed = false;
