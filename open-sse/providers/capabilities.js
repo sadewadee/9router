@@ -233,6 +233,48 @@ export const PROVIDER_CAPABILITIES = {
   "codebuddy-intl": {
     "deepseek-v4.1-flash": { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: true, contextWindow: 1000000, maxOutput: 128000 },
   },
+  // WorkBuddy (workbuddy.ai) — limits are the global catalog the desktop app
+  // receives: contextWindow=maxInputTokens, maxOutput=maxOutputTokens, every model
+  // takes images. Reasoning goes through OpenAI-style reasoning_effort (registry
+  // thinkingFormat). thinkingCanDisable is the server's reasoning.canDisableThinking
+  // where it publishes one, else the inverse of onlyReasoning. deep-model
+  // publishes no reasoning support.
+  "workbuddy": {
+    "default-model":       { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: true, contextWindow: 176000, maxOutput: 24000 },
+    "fast-model":          { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 200000, maxOutput: 32000 },
+    "balanced-model":      { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 256000, maxOutput: 32000 },
+    "primary-model":       { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 272000, maxOutput: 72000 },
+    "deep-model":          { vision: true, contextWindow: 176000, maxOutput: 24000 },
+    "gpt-6-astra":         { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: true, contextWindow: 1000000, maxOutput: 128000 },
+    "gpt-5.6-sol":         { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: true, contextWindow: 1000000, maxOutput: 128000 },
+    "gpt-5.6-terra":       { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: true, contextWindow: 1000000, maxOutput: 128000 },
+    "gpt-5.6-luna":        { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: true, contextWindow: 1000000, maxOutput: 128000 },
+    "gpt-5.5":             { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 1000000, maxOutput: 128000 },
+    "gpt-5.4":             { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 272000, maxOutput: 72000 },
+    "gpt-5.3-codex":       { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 272000, maxOutput: 72000 },
+    "gemini-3.5-flash":    { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 1000000, maxOutput: 65536 },
+    "glm-5.3":             { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: true, contextWindow: 1000000, maxOutput: 48000 },
+    "glm-5.2":             { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: true, contextWindow: 1000000, maxOutput: 48000 },
+    "kimi-k3":             { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 1000000, maxOutput: 32000 },
+    "kimi-k2.8-preview":   { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: true, contextWindow: 1000000, maxOutput: 32000 },
+    "kimi-k2.6":           { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 256000, maxOutput: 32000 },
+    "hy4-preview":         { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 1000000, maxOutput: 64000 },
+    "hy4-preview-f":       { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 1000000, maxOutput: 64000 },
+    "hy3":                 { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 192000, maxOutput: 64000 },
+    "deepseek-v4.1-flash": { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 1000000, maxOutput: 128000 },
+  },
+  // OpenCode Free — the /inference gateway load-balances GLM across backends and
+  // some are strict decoders that 400 on the unknown field `thinking`
+  // ("[unknown_parameter] ... unknown field \"thinking\""). Without this entry the
+  // generic *glm-5.3* pattern resolves to the z.ai format (thinking +
+  // reasoning_effort); pin it to openai (reasoning_effort only). Verified 2026-10-18.
+  // deepseek-v4.1-flash-free: the backend rejects prompts above ~330k tokens
+  // (decolua/9router#5097) although /v1/models would publish the 1M of the pattern
+  // table. Cap the window so clients compact instead of hard-failing mid-session.
+  "opencode": {
+    "glm-5.3-flash-free": { vision: true, reasoning: true, thinkingFormat: "openai", contextWindow: 1000000, maxOutput: 32000 },
+    "deepseek-v4.1-flash-free": { vision: true, reasoning: true, thinkingFormat: "deepseek", contextWindow: 330000, maxOutput: 128000 },
+  },
   // Qoder — upstream exposes opaque internal ids (dfmodel, kmodel, …); the
   // registry `name` is display-only and capability lookup matches on the raw
   // id, so every qoder model would fall through to DEFAULT_CAPABILITIES

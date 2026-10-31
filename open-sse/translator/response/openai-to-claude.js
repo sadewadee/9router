@@ -197,6 +197,9 @@ export function openaiToClaudeResponse(chunk, state) {
         if (toolName.startsWith(CLAUDE_OAUTH_TOOL_PREFIX)) {
           toolName = toolName.slice(CLAUDE_OAUTH_TOOL_PREFIX.length);
         }
+        if (state?.toolNameMap?.has?.(toolName)) {
+          toolName = state.toolNameMap.get(toolName);
+        }
 
         results.push({
           type: "content_block_start",

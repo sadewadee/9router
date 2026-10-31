@@ -1,0 +1,126 @@
+name: Build and Push Hotfix Image
+
+on:
+  push:
+    branches:
+      - hotfix/prod
+    paths-ignore:
+      - "gitbook/**"
+      - "**/*.md"
+      - "docs/**"
+  workflow_dispatch:
+
+concurrency:
+  group: hotfix-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Hard-coded lowercase so it never depends on repository-name casing.
+  IMAGE: ghcr.io/sadewadee/9router
+  LOCAL_TAG: 9router-hotfix:ci
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute short sha
+        id: vars
+        run: echo "short=${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image (local, not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.hotfix
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.LOCAL_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+      - name: Verify image contents
+        run: |
+          docker run --rm --entrypoint sh "$LOCAL_TAG" -c '
+            set -eu
+
+            old=$(grep -rl "slice(0,128)" /app/.next/server/ | wc -l | tr -d " ")
+            new=$(grep -rl "slice(0,64)" /app/.next/server/ | wc -l | tr -d " ")
+            echo "files containing slice(0,128): $old (must be 0)"
+            echo "files containing slice(0,64):  $new (must be >= 1)"
+
+            if [ "$old" -ne 0 ]; then
+              echo "VERIFY FAILED: slice(0,128) still present in /app/.next/server/" >&2
+              exit 1
+            fi
+            if [ "$new" -lt 1 ]; then
+              echo "VERIFY FAILED: slice(0,64) not found in /app/.next/server/" >&2
+              exit 1
+            fi
+
+            if [ ! -d /app/node_modules/@wreq-js/binding-linux-x64-musl ]; then
+              echo "VERIFY FAILED: /app/node_modules/@wreq-js/binding-linux-x64-musl is missing" >&2
+              exit 1
+            fi
+            echo "ok: /app/node_modules/@wreq-js/binding-linux-x64-musl exists"
+
+            if [ ! -f /app/custom-server.js ]; then
+              echo "VERIFY FAILED: /app/custom-server.js is missing" >&2
+              exit 1
+            fi
+            echo "ok: /app/custom-server.js exists"
+          '
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.hotfix
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:sha-${{ steps.vars.outputs.short }}
+            ${{ env.IMAGE }}:hotfix-prod
+          labels: |
+            org.opencontainers.image.source=https://github.com/sadewadee/9router
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          provenance: false
+          sbom: false
+
+      - name: Job summary
+        env:
+          SHORT_SHA: ${{ steps.vars.outputs.short }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "### Hotfix image pushed"
+            echo
+            echo "- \`${IMAGE}:sha-${SHORT_SHA}\`"
+            echo "- \`${IMAGE}:hotfix-prod\`"
+            echo "- Digest: \`${DIGEST}\`"
+            echo "- Revision: \`${GITHUB_SHA}\`"
+            echo
+            echo "Pin by digest: \`${IMAGE}@${DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

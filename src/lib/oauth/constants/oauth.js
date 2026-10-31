@@ -117,12 +117,19 @@ export const CODEBUDDY_CONFIG = { ...PROVIDER_OAUTH["codebuddy-cn"] };
 // CodeBuddy International — same shape as CN, .ai domain (mirror of codebuddy-cn).
 export const CODEBUDDY_INTL_CONFIG = { ...PROVIDER_OAUTH["codebuddy-intl"] };
 
+// WorkBuddy International — same platform, workbuddy.ai realm (no PKCE, uid + account activation).
+export const WORKBUDDY_CONFIG = { ...PROVIDER_OAUTH["workbuddy"] };
+
 // Kimchi OAuth Configuration (Browser token callback flow)
 export const KIMCHI_CONFIG = { ...PROVIDER_OAUTH["kimchi"] };
 
 // Grok CLI / Grok Build OAuth Configuration (Device Code Flow)
 // Endpoint: cli-chat-proxy.grok.com — same client_id as xai, different flow + scopes
 export const GROK_CLI_CONFIG = { ...PROVIDER_OAUTH["grok-cli"] };
+
+// Freebuff OAuth Configuration (Device Code Flow, signed in the way the official Freebuff Desktop does)
+// POST /api/auth/cli/code -> loginUrl; GET /api/auth/cli/status -> { user: { authToken } }
+export const FREEBUFF_CONFIG = { ...PROVIDER_OAUTH["freebuff"] };
 
 // Trae (ByteDance marscode) OAuth — authorization_code flow with local callback.
 //   1) POST GetLoginGuidance {loginTraceID} → {Result.LoginHost}
@@ -233,8 +240,10 @@ export const PROVIDERS = {
   GITLAB: "gitlab",
   CODEBUDDY: "codebuddy-cn",
   CODEBUDDY_INTL: "codebuddy-intl",
+  WORKBUDDY: "workbuddy",
   KIMCHI: "kimchi",
   GROK_CLI: "grok-cli",
+  FREEBUFF: "freebuff",
   TRAE: "trae",
   WINDSURF: "windsurf",
   ZED: "zed",
