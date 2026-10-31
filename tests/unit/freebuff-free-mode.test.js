@@ -69,6 +69,28 @@ describe("resolveFreebuffAgent", () => {
   it("falls back to base2-free when model not in table but resolvedModel is catalog key", () => {
     expect(resolveFreebuffAgent("unknown/model", "m-69307952f8")).toBe("base2-free");
   });
+
+  it("routes the v4.1, fast and pro DeepSeek and MiMo slugs to their own base2 agents", () => {
+    expect(resolveFreebuffAgent("deepseek/deepseek-v4.1-flash", null)).toBe("base2-free-deepseek-v4-1-flash");
+    expect(resolveFreebuffAgent("deepseek/deepseek-v4-flash-fast", null)).toBe("base2-free-deepseek-flash-fast");
+    expect(resolveFreebuffAgent("deepseek/deepseek-v4-pro", null)).toBe("base2-free-deepseek");
+    expect(resolveFreebuffAgent("mimo/mimo-v2.6-pro", null)).toBe("base2-free-mimo-2-6-pro");
+    expect(resolveFreebuffAgent("mimo/mimo-v2.6-flash-fast", null)).toBe("base2-free-mimo");
+  });
+
+  it("recovers the model slug behind a catalog key from its display name", () => {
+    const catalog = {
+      protocol: 1,
+      rows: [
+        { key: "m-096e75164d", handle: "fbm1.AAEdeepseek", displayName: "DeepSeek V4.1 Flash 10/17" },
+        { key: "m-0000000001", handle: "fbm1.AAEunknown", displayName: "Unmapped Model" },
+      ],
+    };
+    expect(resolveFreebuffAgent("m-096e75164d", "m-096e75164d", catalog)).toBe("base2-free-deepseek-v4-1-flash");
+    expect(resolveFreebuffAgent("m-096e75164d", null, catalog)).toBe("base2-free-deepseek-v4-1-flash");
+    expect(resolveFreebuffAgent("m-0000000001", "m-0000000001", catalog)).toBe("base2-free");
+    expect(resolveFreebuffAgent("m-096e75164d", "m-096e75164d")).toBe("base2-free");
+  });
 });
 
 describe("neutralizeSystemPromptMarkers", () => {

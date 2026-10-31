@@ -1,5 +1,6 @@
 import { createHash } from "crypto";
 import { FREEBUFF_AGENT_ID_BY_MODEL } from "../executors/freebuff.js";
+import { reverseModelFromCatalog } from "./freebuffCatalog.js";
 
 export const CARRIER_PLAN_SYMBOL = Symbol("freebuffCarrierPlan");
 
@@ -7,7 +8,6 @@ const CARRIER_PREFIX = "proxy__";
 const WIRE_NAME_MAX = 64;
 const HASH_SUFFIX_LENGTH = 9;
 const CARRIER_BASE_MAX = WIRE_NAME_MAX - CARRIER_PREFIX.length - HASH_SUFFIX_LENGTH;
-const CATALOG_KEY_PATTERN = /^m-[0-9a-f]{10}$/;
 
 const CLAUDE_CODE_TOOLS = [
   "Agent", "AskUserQuestion", "Bash", "BashOutput", "KillShell", "Edit", "MultiEdit", "Write", "Read",
@@ -66,18 +66,15 @@ export const SIGNATURE_TOOL_DEFINITIONS = [
   },
 ];
 
-export function resolveFreebuffAgent(model, resolvedModel = null) {
-  if (typeof model === "string" && FREEBUFF_AGENT_ID_BY_MODEL[model]) {
-    return FREEBUFF_AGENT_ID_BY_MODEL[model];
+export function resolveFreebuffAgent(model, resolvedModel = null, catalog = null) {
+  for (const candidate of [model, resolvedModel]) {
+    if (typeof candidate === "string" && FREEBUFF_AGENT_ID_BY_MODEL[candidate]) {
+      return FREEBUFF_AGENT_ID_BY_MODEL[candidate];
+    }
   }
-  if (typeof resolvedModel === "string" && FREEBUFF_AGENT_ID_BY_MODEL[resolvedModel]) {
-    return FREEBUFF_AGENT_ID_BY_MODEL[resolvedModel];
-  }
-  if (typeof model === "string" && (CATALOG_KEY_PATTERN.test(model) || model.startsWith("fbm1."))) {
-    return "base2-free";
-  }
-  if (typeof resolvedModel === "string" && (CATALOG_KEY_PATTERN.test(resolvedModel) || resolvedModel.startsWith("fbm1."))) {
-    return "base2-free";
+  for (const candidate of [model, resolvedModel]) {
+    const slug = typeof candidate === "string" ? reverseModelFromCatalog(catalog, candidate) : null;
+    if (slug && FREEBUFF_AGENT_ID_BY_MODEL[slug]) return FREEBUFF_AGENT_ID_BY_MODEL[slug];
   }
   return "base2-free";
 }

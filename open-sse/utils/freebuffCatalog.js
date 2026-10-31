@@ -133,13 +133,24 @@ const MODEL_DISPLAY_HINTS = {
   "z-ai/glm-5.3-flash": "GLM 5.3 Flash",
   "deepseek/deepseek-v4-flash": "DeepSeek V4.1 Flash 10/17",
   "deepseek/deepseek-v4.1-flash": "DeepSeek V4.1 Flash 10/17",
+  "deepseek/deepseek-v4-flash-fast": "DeepSeek V4.1 Flash Fast 10/17",
   "deepseek/deepseek-v4-flash-slow": "DeepSeek V4.1 Flash Slow",
   "deepseek/deepseek-v4.1-flash-slow": "DeepSeek V4.1 Flash Slow",
+  "openai/gpt-6-luna": "GPT-6 Luna",
+  "openai/gpt-6.1-sol": "GPT-6.1 Sol",
+  "openai/gpt-6.1-terra": "GPT-6.1 Terra",
+  "moonshotai/kimi-k3": "Kimi K3",
+  "crof/kimi-k3-eco": "Kimi K3 Eco",
   "upstage/solar-mini4": "Solar Mini 4",
   "upstage/solar-pro4": "Solar Pro 4",
   "stealth/glyph-cluster": "Glyph Cluster",
   "nvidia/nemotron-3.5-lightning": "Nemotron 3.5 Lightning",
 };
+
+// Several slugs share one display name; the later entry wins, so the v4.1 DeepSeek slug is the reverse of its name.
+const MODEL_BY_DISPLAY_NAME = Object.fromEntries(
+  Object.entries(MODEL_DISPLAY_HINTS).map(([model, displayName]) => [displayName, model]),
+);
 
 // Callers name models by their human id ("deepseek/deepseek-v4-flash") while live rows are keyed
 // "m-<10hex>". A visible row matches by exact key first, else by the key the official client
@@ -156,6 +167,12 @@ function findCatalogRow(catalog, model) {
 // Catalog row key for a model named by key or by human id; null when no visible row matches.
 export function resolveCatalogKey(catalog, model) {
   return findCatalogRow(catalog, model)?.key ?? null;
+}
+
+// Human model slug behind a visible catalog row (by key), recovered from the row's displayName.
+export function reverseModelFromCatalog(catalog, catalogKey) {
+  const row = findCatalogRow(catalog, catalogKey);
+  return row ? MODEL_BY_DISPLAY_NAME[row.displayName] ?? null : null;
 }
 
 async function fetchOnce({ token, deviceKey, accountId, client, proxyFetch, proxyOptions, signal, log }) {

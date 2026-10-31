@@ -211,16 +211,28 @@ const ROOT_SYSTEM_PROMPT =
 // Model -> free-mode agent id (all base2 generation). Server accepts base2 IDs only as of 2026-10-31.
 export const FREEBUFF_AGENT_ID_BY_MODEL = {
   "mimo/mimo-v2.5": "base2-free-mimo",
-  "mimo/mimo-v2.6-pro": "base2-free-mimo",
+  "mimo/mimo-v2.6-pro": "base2-free-mimo-2-6-pro",
+  "mimo/mimo-v2.6-flash": "base2-free-mimo",
+  "mimo/mimo-v2.6-flash-fast": "base2-free-mimo",
+  "mimo/mimo-v2.6-flash-slow": "base2-free-mimo",
   "z-ai/glm-5.3-flash": "base2-free-glm-5-3-flash",
   "z-ai/glm-5.2": "base2-free-glm",
+  "z-ai/glm-5.3": "base2-free-glm-5-3",
+  "z-ai/glm-5.3-prime": "base2-free-glm-5-3-prime",
+  "z-ai/glm-5-turbo": "base2-free-glm-5-turbo",
+  "z-ai/glm-5.3-flashx": "base2-free-glm-5-3-flashx",
   "deepseek/deepseek-v4-flash": "base2-free-deepseek-flash",
-  "deepseek/deepseek-v4-flash-fast": "base2-free-deepseek-flash",
+  "deepseek/deepseek-v4-flash-fast": "base2-free-deepseek-flash-fast",
   "deepseek/deepseek-v4-pro": "base2-free-deepseek",
+  "deepseek/deepseek-v4.1-flash": "base2-free-deepseek-v4-1-flash",
+  "deepseek/deepseek-v4.1-flash-fast": "base2-free-deepseek-flash-fast",
+  "deepseek/deepseek-v4.1-flash-slow": "base2-free-deepseek-v4-1-flash",
   "openai/gpt-6-luna": "base2-free-luna-6",
   "openai/gpt-5.6-luna": "base2-free-luna",
-  "openai/gpt-6.1-sol": "base2-free-gpt-6-1-sol",
   "openai/gpt-5.6-luna-es": "base2-free-luna-es",
+  "openai/gpt-6.1-sol": "base2-free-gpt-6-1-sol",
+  "openai/gpt-6.1-terra": "base2-free-gpt-6-1-terra",
+  "openai/gpt-6-sol": "base2-free-gpt-6-sol",
   "google/gemini-3.8-flash": "base2-free-gemini-3-8-flash",
   "google/gemini-4-argon": "base2-free-gemini-4-argon",
   "upstage/solar-mini4": "base2-free-solar-mini4",
@@ -229,14 +241,9 @@ export const FREEBUFF_AGENT_ID_BY_MODEL = {
   "stealth/ox-alpha": "base2-free-ox-alpha",
   "minimax/minimax-m3": "base2-free-minimax-m3",
   "crof/kimi-k3-eco": "base2-free-kimi-k3-eco",
+  "moonshotai/kimi-k3": "base2-free-kimi-k3",
   "meta/muse-spark-1.2-contributor": "base2-free-muse-spark",
   "meta/muse-spark-1.3-contributor": "base2-free-muse-spark-1-3",
-  "deepseek/deepseek-v4.1-flash": "base2-free-deepseek-flash",
-  "deepseek/deepseek-v4.1-flash-fast": "base2-free-deepseek-flash",
-  "deepseek/deepseek-v4.1-flash-slow": "base2-free-deepseek-flash",
-  "mimo/mimo-v2.6-flash": "base2-free-mimo",
-  "mimo/mimo-v2.6-flash-fast": "base2-free-mimo",
-  "mimo/mimo-v2.6-flash-slow": "base2-free-mimo",
 };
 
 // Session/agent-run calls get the same 20s budget the official CLI gives them.
@@ -1749,7 +1756,7 @@ export class FreebuffExecutor extends BaseExecutor {
         ctx.admissionModel = resolveModelForAdmission(catalog, modelKey);
 
         session = await getFreebuffSession(token, modelKey, ctx);
-        const agentId = resolveFreebuffAgent(targetModel, session.resolvedModel);
+        const agentId = resolveFreebuffAgent(targetModel, session.resolvedModel, catalog);
         startFailed = true;
         lease = await acquireAgentRun(token, agentId, ctx);
         startFailed = false;

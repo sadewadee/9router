@@ -396,12 +396,13 @@ describe("registration", () => {
     expect(new Set(listed).size).toBe(listed.length);
   });
 
-  it("maps every model to a distinct base2 agent id (0.2.34 set)", () => {
+  it("maps every model to a base2 agent id (0.2.35 set)", () => {
     const ids = Object.values(FREEBUFF_AGENT_ID_BY_MODEL);
-    expect(new Set(ids).size).toBe(23);
+    expect(new Set(ids).size).toBe(29);
     expect(FREEBUFF_AGENT_ID_BY_MODEL["mimo/mimo-v2.5"]).toBe("base2-free-mimo");
     expect(FREEBUFF_AGENT_ID_BY_MODEL["z-ai/glm-5.3-flash"]).toBe("base2-free-glm-5-3-flash");
-    expect(FREEBUFF_AGENT_ID_BY_MODEL["deepseek/deepseek-v4-flash-fast"]).toBe("base2-free-deepseek-flash");
+    expect(FREEBUFF_AGENT_ID_BY_MODEL["deepseek/deepseek-v4-flash-fast"]).toBe("base2-free-deepseek-flash-fast");
+    expect(FREEBUFF_AGENT_ID_BY_MODEL["deepseek/deepseek-v4.1-flash"]).toBe("base2-free-deepseek-v4-1-flash");
     expect(FREEBUFF_AGENT_ID_BY_MODEL["openai/gpt-6.1-sol"]).toBe("base2-free-gpt-6-1-sol");
   });
 });
