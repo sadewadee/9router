@@ -41,18 +41,18 @@ afterEach(() => {
 });
 
 describe("resolveFreebuffAgent", () => {
-  it("returns base3-free-catalog for all catalog keys and opaque handles", () => {
-    expect(resolveFreebuffAgent("m-69307952f8")).toBe("base3-free-catalog");
-    expect(resolveFreebuffAgent("m-9a7e098cc1")).toBe("base3-free-catalog");
-    expect(resolveFreebuffAgent("m-096e75164d")).toBe("base3-free-catalog");
-    expect(resolveFreebuffAgent("m-7e20df6765")).toBe("base3-free-catalog");
-    expect(resolveFreebuffAgent("m-0000000000")).toBe("base3-free-catalog");
-    expect(resolveFreebuffAgent("fbm1.abc123")).toBe("base3-free-catalog");
+  it("returns base2-free for all catalog keys and opaque handles", () => {
+    expect(resolveFreebuffAgent("m-69307952f8")).toBe("base2-free");
+    expect(resolveFreebuffAgent("m-9a7e098cc1")).toBe("base2-free");
+    expect(resolveFreebuffAgent("m-096e75164d")).toBe("base2-free");
+    expect(resolveFreebuffAgent("m-7e20df6765")).toBe("base2-free");
+    expect(resolveFreebuffAgent("m-0000000000")).toBe("base2-free");
+    expect(resolveFreebuffAgent("fbm1.abc123")).toBe("base2-free");
   });
 
-  it("routes known free models to their specific agent", () => {
-    expect(resolveFreebuffAgent("deepseek/deepseek-v4-flash")).toBe("base3-free-deepseek-flash");
-    expect(resolveFreebuffAgent("mimo/mimo-v2.5")).toBe("base3-free-mimo");
+  it("routes known free models to their specific base2 agent", () => {
+    expect(resolveFreebuffAgent("deepseek/deepseek-v4-flash")).toBe("base2-free-deepseek-flash");
+    expect(resolveFreebuffAgent("mimo/mimo-v2.5")).toBe("base2-free-mimo");
     expect(resolveFreebuffAgent("upstage/solar-mini4")).toBe("base2-free-solar-mini4");
     expect(resolveFreebuffAgent("upstage/solar-pro4")).toBe("base2-free-solar-pro4");
   });
@@ -63,11 +63,11 @@ describe("resolveFreebuffAgent", () => {
 
   it("prefers model-specific agent over catalog key fallback", () => {
     expect(resolveFreebuffAgent("upstage/solar-mini4", "m-69307952f8")).toBe("base2-free-solar-mini4");
-    expect(resolveFreebuffAgent("deepseek/deepseek-v4-flash", "m-096e75164d")).toBe("base3-free-deepseek-flash");
+    expect(resolveFreebuffAgent("deepseek/deepseek-v4-flash", "m-096e75164d")).toBe("base2-free-deepseek-flash");
   });
 
-  it("falls back to base3-free-catalog when model not in table but resolvedModel is catalog key", () => {
-    expect(resolveFreebuffAgent("unknown/model", "m-69307952f8")).toBe("base3-free-catalog");
+  it("falls back to base2-free when model not in table but resolvedModel is catalog key", () => {
+    expect(resolveFreebuffAgent("unknown/model", "m-69307952f8")).toBe("base2-free");
   });
 });
 

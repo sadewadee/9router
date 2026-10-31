@@ -74,10 +74,10 @@ export function resolveFreebuffAgent(model, resolvedModel = null) {
     return FREEBUFF_AGENT_ID_BY_MODEL[resolvedModel];
   }
   if (typeof model === "string" && (CATALOG_KEY_PATTERN.test(model) || model.startsWith("fbm1."))) {
-    return "base3-free-catalog";
+    return "base2-free";
   }
   if (typeof resolvedModel === "string" && (CATALOG_KEY_PATTERN.test(resolvedModel) || resolvedModel.startsWith("fbm1."))) {
-    return "base3-free-catalog";
+    return "base2-free";
   }
   return "base2-free";
 }
