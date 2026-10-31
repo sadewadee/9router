@@ -96,7 +96,7 @@ const CLOUD_RUNS_URL = `${BASE_URL}/api/v1/cloud/runs`;
 
 // Desktop lane identity (REPORT-DESKTOP.md §9). The install id is derived deterministically from
 // the token so it survives restarts without extra persistence.
-const DEFAULT_DESKTOP_VERSION = "0.0.188";
+const DEFAULT_DESKTOP_VERSION = "0.2.35";
 const CLOUD_QUESTIONS_HEADER = "x-freebuff-cloud-questions";
 const PRODUCT_CONTEXT_HEADER = "X-Freebuff-Product-Context";
 const HEADER_INSTALL_ID = "x-freebuff-install-id";
@@ -1271,7 +1271,7 @@ function buildChatBody(
   out.stream = stream !== false;
   if (out.stream && out.stream_options == null) out.stream_options = { include_usage: true };
   out.codebuff_metadata = metadata;
-  out.provider = { order: null, allow_fallbacks: true };
+  out.provider = { allow_fallbacks: true };
   return out;
 }
 
@@ -1285,7 +1285,6 @@ async function buildChatHeaders({ token, accountId, bodyStr, fetchId, stream, de
     Accept: stream ? "text/event-stream" : "application/json",
     [HEADER_GZIP_RECOVERY]: "1",
   };
-  if (lane) headers[HEADER_CLIENT] = lane;
   const version = lane === CLIENT_DESKTOP ? desktopVersion() : cliVersion();
   if (version) headers[HEADER_CLIENT_VERSION] = version;
   if (accountId) headers[HEADER_ACTING_USER] = accountId;
