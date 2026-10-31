@@ -996,6 +996,7 @@ async function startAgentRun(token, agentId, ctx = {}) {
     Accept: "application/json",
   };
   if (ctx.accountId) headers[HEADER_ACTING_USER] = ctx.accountId;
+  ctx.log?.warn?.("DEBUG_AGENT", JSON.stringify({ agentId, action: "START" }));
   const result = await callJson(
     AGENT_RUNS_URL,
     {
@@ -1787,6 +1788,15 @@ export class FreebuffExecutor extends BaseExecutor {
       }
       const runId = lease.runId;
       log?.debug?.("FETCH", `FREEBUFF -> ${url} | model=${session.resolvedModel} runId=${runId} | body=${bodyStr.length}B`);
+      const debugBody = JSON.parse(bodyStr);
+      const safeHeaders = Object.fromEntries(Object.entries(chatHeaders).filter(([k]) => k.toLowerCase() !== "authorization"));
+      log?.warn?.("DEBUG_CHAT", JSON.stringify({
+        model: debugBody.model,
+        codebuff_metadata: debugBody.codebuff_metadata,
+        provider: debugBody.provider,
+        headers: safeHeaders,
+        agentId,
+      }));
 
       // Abort if upstream doesn't return response headers within the connection timeout.
       const connectCtrl = new AbortController();
